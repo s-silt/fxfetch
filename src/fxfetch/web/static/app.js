@@ -149,7 +149,7 @@
     return Array.from(crypto.getRandomValues(new Uint8Array(24)), (value) => value.toString(16).padStart(2,"0")).join("");
   }
   function bytes(value) { if (!Number.isFinite(value)) return ""; return value >= 1048576 ? `${(value/1048576).toFixed(1)} MiB` : `${(value/1024).toFixed(1)} KiB`; }
-  function busy(job) { return !!job && (activeStates.has(job.state) || (job.builds || []).some((build) => activeStates.has(build.state))); }
+  function busy(job) { return !!job && (activeStates.has(job.state) || FxfetchDataPackage.isPending(job) || (job.builds || []).some((build) => activeStates.has(build.state))); }
   function hasActive() { return state.jobs.some((job) => activeStates.has(job.state) || job.active_builds > 0) || busy(state.job) || state.activeBuildJobs.size > 0; }
   function schedule() {
     clearTimeout(state.pollTimer);
@@ -240,7 +240,7 @@
     if (!state.jobs.length) picker.append(new Option("还没有任务", ""));
     for (const job of state.jobs) {
       const date = new Date(job.created * 1000).toLocaleString("zh-CN", {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"});
-      picker.append(new Option(`${date} · ${labels[job.outcome] || labels[job.state] || "任务"}`, job.id));
+      picker.append(new Option(`${date} · ${labels[job.state] || "任务"}`, job.id));
     }
     picker.value = state.current || "";
     rememberJob(state.current);
@@ -367,7 +367,7 @@
     $("job-empty").hidden = !!job;
     if (!job) return;
     const heading = node("div", "job-heading");
-    heading.append(badge(labels[job.outcome] || labels[job.state] || "任务", job.outcome === "downloaded" ? "good" : activeStates.has(job.state) ? "busy" : "warn"));
+    heading.append(badge(labels[job.state] || "任务", activeStates.has(job.state) ? "busy" : ""));
     if (activeStates.has(job.state)) {
       const cancel = node("button", "text-button", "取消采集");
       cancel.type = "button";
@@ -375,14 +375,16 @@
       heading.append(cancel);
     }
     content.append(heading, node("p", "job-url", job.input?.entry_url || ""));
+    content.append(node("p", "", `原包结果：${labels[job.outcome] || "尚未取得结论"}`));
     const artifacts = job.artifacts || [];
     if (artifacts.length) {
       const files = node("section", "details download-files");
-      files.append(node("h3", "", "可下载文件"));
+      files.append(node("h3", "", "应用文件（单独下载）"));
       for (const artifact of artifacts) files.append(downloadFile(job, artifact));
       content.append(files);
     }
     renderProgress(job, content);
+    FxfetchDataPackage.render(job, content, {node, bytes, friendly});
     const result = job.result || {};
     if ((result.network_attempts || []).length) {
       const network = node("section", "details network-attempts");
@@ -561,7 +563,7 @@
     $("dropzone").setAttribute("aria-disabled", String(locked || state.uploading));
     for (const radio of $("qr-candidates").querySelectorAll("input")) radio.disabled = locked || state.uploading || radio.dataset.blocked === "true";
     $("download-button").disabled = state.submitting || state.uploading || state.clearing || !!state.image?.truncated;
-    $("download-button").textContent = state.submitting ? "正在提交…" : state.pendingJob ? "重试提交（同一次任务）" : "解析并保存应用 ↗";
+    $("download-button").textContent = state.submitting ? "正在提交…" : state.pendingJob ? "重试提交（同一次任务）" : "开始采集（含应用下载）";
     if (locked || state.uploading || state.image?.truncated || !state.authenticated) clearDirectLink();
     else scheduleDirectLink();
   }
@@ -609,7 +611,7 @@
         if (valid.length === 1 && candidate.url && !result.truncated) { radio.checked = true; radio.onchange(); }
       }
       if (result.truncated) notice(messages.qr_truncated, true);
-      else notice("图片已离线识别。选择入口后，点击下载才会访问目标。");
+      else notice("图片已离线识别。选择入口后，点击开始采集才会访问目标。");
     } catch (error) { $("qr-status").textContent = "识别未完成"; if (state.authenticated) notice(error.message, true); }
     finally { state.uploading = false; updateInput(); }
   }

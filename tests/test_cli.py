@@ -40,8 +40,10 @@ def test_active_flag_is_required_for_workflow(tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(cli.Workflow, "run", run)
     assert cli.main(["https://synthetic.invalid/", "--out", str(tmp_path)]) == 0
     assert not received
+    assert not (tmp_path / "data-package").exists()
     assert cli.main(["https://synthetic.invalid/", "--out", str(tmp_path), "--authorized-active"]) == 0
     assert received == ["https://synthetic.invalid/"]
+    assert list((tmp_path / "data-package").glob("*.zip"))
 
 
 def test_init_interactive_private_hash_only(
@@ -190,3 +192,63 @@ def test_active_cli_uses_explicit_public_dns_client(tmp_path: Path, monkeypatch:
         == 0
     )
     assert supplied and supplied[0][1] is None
+
+
+def test_capture_web_returns_failure_for_truncated_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from fxfetch.core.web_capture import WebCaptureResult
+
+    result = WebCaptureResult(
+        capture_id="capture-test",
+        entry_url="https://synthetic.invalid/page",
+        collector="http",
+        started_at="2026-01-01T00:00:00Z",
+        outcome="captured",
+        reason_code="passive_visit_material_captured",
+        gaps=["material_provenance_incomplete"],
+        journal_state="truncated",
+    )
+    monkeypatch.setattr("fxfetch.core.web_capture.capture_web", lambda *args, **kwargs: result)
+
+    assert cli.main(
+        [
+            "capture-web",
+            "https://synthetic.invalid/page",
+            "--authorized-active",
+            "--out",
+            str(tmp_path / "capture"),
+        ]
+    ) == 1
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["outcome"] == "captured"
+    assert summary["journal_state"] == "truncated"
+
+
+def test_web_export_and_verify_preserve_blocked_capture_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from fxfetch.core import web_evidence
+
+    manifest = {
+        "capture_id": "blocked-capture",
+        "outcome": "blocked",
+        "coverage": "partial",
+        "gaps": ["http_access_control", "single_passive_visit"],
+        "schema_version": "fxfetch.web-evidence.v1",
+        "files": [],
+    }
+    monkeypatch.setattr(web_evidence, "export_web", lambda *args: (manifest, "a" * 64))
+    monkeypatch.setattr(web_evidence, "verify_web", lambda *args: (manifest, "a" * 64))
+
+    assert cli.main(["export-web", str(tmp_path / "capture"), "--out", str(tmp_path / "bundle")]) == 0
+    exported = json.loads(capsys.readouterr().out)
+    assert exported["capture_outcome"] == "blocked"
+    assert exported["coverage"] == "partial"
+    assert exported["gaps"] == manifest["gaps"]
+
+    assert cli.main(["verify-web", str(tmp_path / "bundle")]) == 0
+    verified = json.loads(capsys.readouterr().out)
+    assert verified["capture_outcome"] == "blocked"
+    assert verified["coverage"] == "partial"
+    assert verified["gaps"] == manifest["gaps"]

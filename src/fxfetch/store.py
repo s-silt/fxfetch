@@ -422,13 +422,15 @@ class Store:
                 f"UPDATE {table} SET progress=?,updated=? WHERE id=?", (json_text(previous), now, identifier)
             )
 
-    def expire_queued(self, collect_timeout: float, build_timeout: float) -> None:
+    def expire_queued(self, collect_timeout: float, build_timeout: float) -> list[dict]:
         now = time.time()
-        for table, timeout in (("jobs", collect_timeout), ("builds", build_timeout)):
-            with self.connect() as db:
+        expired_jobs: list[dict] = []
+        with self.connect() as db:
+            for table, timeout in (("jobs", collect_timeout), ("builds", build_timeout)):
+                columns = "id,progress,input" if table == "jobs" else "id,progress"
                 rows = list(
                     db.execute(
-                        f"SELECT id,progress FROM {table} WHERE state='queued' AND created<=?",
+                        f"SELECT {columns} FROM {table} WHERE state='queued' AND created<=?",
                         (now - timeout,),
                     )
                 )
@@ -444,15 +446,20 @@ class Store:
                     progress["events"] = (progress.get("events", []) + [event])[-128:]
                     result = {"outcome": "failed", "reason_code": "queue_timeout", "coverage": "not_started"}
                     if table == "jobs":
-                        db.execute(
+                        updated = db.execute(
                             "UPDATE jobs SET state='completed',outcome='failed',reason_code='queue_timeout',result=?,progress=?,updated=? WHERE id=? AND state='queued'",
                             (json_text(result), json_text(progress), now, row["id"]),
                         )
+                        if updated.rowcount:
+                            expired_jobs.append({
+                                "id": row["id"], "input": json.loads(row["input"]), "result": result,
+                            })
                     else:
                         db.execute(
                             "UPDATE builds SET state='failed',result=?,progress=?,updated=? WHERE id=? AND state='queued'",
                             (json_text(result), json_text(progress), now, row["id"]),
                         )
+        return expired_jobs
 
     def finish_job(self, identifier: str, state: str, result: dict) -> None:
         if state not in TERMINAL:

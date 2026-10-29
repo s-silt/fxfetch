@@ -1,5 +1,9 @@
 # 开发任务书
 
+## 第一阶段独立网页采集
+
+独立网页能力由 `fxfetch capture-web`、追加式 provenance 与离线 `fxfetch export-web` / `fxfetch verify-web` 提供；既有 `fxfetch.web-evidence.v1` 合同保持不变。普通任务使用现有单次下载工作流，并在结束后另行离线生成 `fxfetch.task-evidence.v1` ZIP。原 APK / IPA 仍单独保存及下载；ZIP 只纳入明确记录的网页材料、有限观察与外部原包引用，不复制原包字节。ZIP 失败不得改变原任务结果。`verify-data` 离线验证 ZIP，不验证外部原包。覆盖始终为 partial；独立网页采集保持被动、有界，不点击、遍历链接、跟随二维码或声称验证整站。fxapk 和 WebView 行为不在此变更范围内。
+
 本文定义范围和验收要求，不代表功能全部完成。当前状态见 [IMPLEMENTATION.md](IMPLEMENTATION.md)，接口合同见 [API.md](API.md)，执行约定见 [AGENTS.md](AGENTS.md)。
 
 ## 产品与流程

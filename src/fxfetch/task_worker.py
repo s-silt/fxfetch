@@ -11,6 +11,7 @@ from pathlib import Path
 from .core.limits import Limits
 from .core.network import AcquisitionPolicy
 from .core.proxy import LocalConnectProxy
+from .core.task_evidence_recorder import TaskEvidenceRecorder
 from .core.web_apk import WebApkBuilder, WebApkSettings
 from .store import Store, json_text
 
@@ -52,6 +53,11 @@ def main() -> int:
         )
     else:
         limits = Limits(**request["limits"])
+        output_dir = Path(request["output_dir"])
+        recorder = TaskEvidenceRecorder(
+            output_dir,
+            Path(request["observation_path"]) if request.get("observation_path") else None,
+        )
         proxy = (
             LocalConnectProxy(request["proxy_host"], request["proxy_port"])
             if request.get("proxy_host")
@@ -60,8 +66,12 @@ def main() -> int:
         workflow = AcquisitionPolicy(
             limits, proxy, browser_root=Path(request["root"]),
             android_lease_id=request.get("android_lease_id"),
+            transport_observer=recorder,
         )
-        result = workflow.run(request["url"], Path(request["output_dir"]), threading.Event(), progress)
+        try:
+            result = workflow.run(request["url"], output_dir, threading.Event(), progress)
+        finally:
+            recorder.close()
     pending = result_path.with_suffix(".pending")
     pending.write_text(json_text(asdict(result)), encoding="utf-8")
     pending.replace(result_path)

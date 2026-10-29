@@ -17,6 +17,7 @@ import time
 import zipfile
 from collections import Counter
 from dataclasses import replace
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -28,6 +29,10 @@ from playwright.async_api import async_playwright
 
 from fxfetch.core.browser_capture import BrowserLaunchProof, capture_browser
 from fxfetch.core.limits import Limits
+from fxfetch.core.web_capture import WebCaptureResult
+from fxfetch.core.web_evidence import export_web, verify_web
+from fxfetch.core.web_journal import EvidenceJournal
+from fxfetch.core.web_materials import collect_browser_materials, save_summary
 
 
 def package() -> bytes:
@@ -121,6 +126,16 @@ class Handler(BaseHTTPRequestHandler):
             "/iframe": b'<iframe src="http://frame.test/frame"></iframe>',
             "/frame": b"<button onclick=\"location.href='/app.apk'\">Download Android</button>",
             "/empty": b"<p>Static synthetic content</p>",
+            "/web-passive": b'''<iframe src="http://frame.test/frame"></iframe>
+                <a href="/app.apk">Never auto-follow this link</a>
+                <button onclick="fetch('/unexpected-action')">Do not click</button>
+                <script>fetch('/web-xhr');setTimeout(()=>location.href='/web-script-next',50)</script>''',
+            "/web-script-next": b'''<p>Passive next document</p>
+                <iframe src="http://frame.test/frame"></iframe><script>fetch('/web-xhr')</script>
+                <a href="/app.apk">Not a navigation request</a>''',
+            "/web-xhr": b'{"observed":true}',
+            "/web-noise": b'''<iframe src="http://frame.test/frame-403"></iframe>
+                <script>fetch('/xhr-403')</script><p>Healthy entry document</p>''',
             "/dom-hang": b"<p>Observed page</p><script>Object.defineProperty(document.documentElement,'outerHTML',{get(){while(true){}}});</script>",
             "/script-hang": b"<script>while(true){}</script>",
             "/element-hang": b"<button id='stuck'>Download</button><script>Object.defineProperty(document.querySelector('#stuck'),'innerText',{get(){while(true){}}});</script>",
@@ -219,6 +234,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, gzip.compress(pages[path]), extra={"Content-Encoding": "gzip"})
             else:
                 self.respond(200, pages[path], extra=headers)
+        elif path in {"/xhr-403", "/frame-403", "/web-main-403"}:
+            self.respond(403, b"Synthetic access control")
         elif path == "/large.js":
             self.respond(
                 200,
@@ -336,7 +353,7 @@ def run_capture(proxy, tmp_path):
                 permit_request=permit_synthetic_request,
             )
 
-    def run(path, *, limits=None, cancel=None):
+    def run(path, *, limits=None, cancel=None, purpose="package", journal=None):
         events = []
         result = asyncio.run(
             capture_browser(
@@ -346,6 +363,8 @@ def run_capture(proxy, tmp_path):
                 lease=LocalSyntheticLease(),
                 limits=limits or Limits(chain_timeout=12, read_timeout=3),
                 on_event=events.append,
+                purpose=purpose,
+                journal=journal,
             )
         )
         assert not list((tmp_path / "profile").rglob("*.crdownload"))
@@ -353,6 +372,88 @@ def run_capture(proxy, tmp_path):
         return result, events
 
     return run
+
+
+def test_web_capture_is_passive_and_journals_browser_context(run_capture, proxy, tmp_path):
+    from fxfetch.core.web_journal import EvidenceJournal
+
+    journal = EvidenceJournal(tmp_path / "web.jsonl", "browser", "attempt-web")
+    try:
+        result, _ = run_capture(
+            "/web-passive",
+            purpose="web",
+            journal=journal,
+            limits=replace(Limits(), chain_timeout=30, read_timeout=8),
+        )
+    finally:
+        journal.close()
+    assert result.outcome == "captured" and result.coverage == "partial", result
+    assert proxy.counts["/web-script-next"] == 1
+    assert proxy.counts["/web-xhr"] >= 1 and proxy.counts["/frame"] >= 1
+    assert proxy.counts["/app.apk"] == proxy.counts["/unexpected-action"] == 0
+    rows = [json.loads(line) for line in (tmp_path / "web.jsonl").read_text().splitlines()]
+    assert any(row["kind"] == "frame_navigated" for row in rows)
+    assert any(row["kind"] == "network_request_observed" for row in rows)
+    bodies = [row for row in rows if row["kind"] == "response_body_saved"]
+    assert bodies and all(row["fields"]["request_ref"].startswith("browser:") for row in bodies)
+
+
+def test_web_capture_retains_challenge_body(run_capture, proxy):
+    result, _ = run_capture("/hidden-file-challenge", purpose="web")
+    assert (result.outcome, result.reason_code) == ("blocked", "challenge_detected"), result
+    assert proxy.counts["/app.apk"] == 0
+    assert any(b"Please verify you are human" in Path(body["path"]).read_bytes()
+               for body in result.bodies if body.get("representation") == "browser_response_decoded")
+
+
+def test_web_capture_keeps_subresource_403_as_noise_and_exports(run_capture, tmp_path):
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir()
+    journal = EvidenceJournal(capture_dir / "capture.jsonl", "browser", "attempt-noise")
+    try:
+        browser_result, _ = run_capture(
+            "/web-noise",
+            purpose="web",
+            journal=journal,
+            limits=replace(Limits(), chain_timeout=30, read_timeout=8),
+        )
+    finally:
+        journal.close()
+    assert browser_result.outcome == "captured", browser_result
+    rows = [json.loads(line) for line in (capture_dir / "capture.jsonl").read_text().splitlines()]
+    errors = [row["fields"] for row in rows if row["kind"] == "subresource_http_error"]
+    assert {row["status"] for row in errors} == {403}
+    assert {row["url"].split("/")[-1] for row in errors} == {"xhr-403", "frame-403"}
+    assert all(row["request_ref"] for row in errors)
+    assert "subresource_http_error" in browser_result.gaps
+
+    stamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    summary = WebCaptureResult(
+        capture_id="synthetic-browser-noise",
+        entry_url="http://capture.test/web-noise",
+        collector="browser",
+        started_at=stamp,
+        finished_at=stamp,
+        outcome=browser_result.outcome,
+        reason_code=browser_result.reason_code,
+        gaps=list(browser_result.gaps),
+    )
+    collect_browser_materials(summary, browser_result, capture_dir, Limits().max_task_bytes)
+    save_summary(capture_dir / "capture.json", summary)
+    bundle = tmp_path / "bundle"
+    export_web(capture_dir, bundle, Limits())
+    manifest, _ = verify_web(bundle, Limits())
+    assert any(row["path"].endswith(".html") for row in manifest["files"])
+
+
+def test_web_capture_keeps_main_403_blocked_with_body(run_capture):
+    result, _ = run_capture("/web-main-403", purpose="web")
+    assert (result.outcome, result.reason_code) == ("blocked", "http_access_control"), result
+    assert any(
+        b"Synthetic access control" in Path(body["path"]).read_bytes()
+        for body in result.bodies
+        if body.get("representation") == "browser_response_decoded"
+    )
 
 
 @pytest.mark.parametrize("path", ["/js", "/click", "/popup", "/iframe", "/redirect"])

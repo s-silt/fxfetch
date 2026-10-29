@@ -43,6 +43,7 @@ class Artifact:
     sha256: str
     size: int
     url: str
+    request_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +216,7 @@ class Workflow:
                         "url": source,
                         "chain": record_chain,
                         "request_id": request_count + max(1, len(partial_hops)),
+                        "request_ref": getattr(error, "request_ref", None),
                         "mode": "http",
                         "user_agent": ANDROID_UA if record_chain == "android" else IPHONE_UA,
                     }
@@ -301,6 +303,7 @@ class Workflow:
                     "purpose": "landing_package" if package else "landing_metadata",
                     "chain": chain,
                     "request_id": request_count,
+                    "request_ref": fetched.request_ref,
                     "mode": "http",
                     "user_agent": ANDROID_UA if chain == "android" else IPHONE_UA,
                 }
@@ -377,7 +380,9 @@ class Workflow:
                     raise FxfetchError("artifact_exists", "Artifact path already exists")
                 fetched.path.replace(target)
                 result.bodies[-1]["path"] = str(target)
-                result.artifacts.append(Artifact(package, target, fetched.sha256, fetched.size, fetched.url))
+                result.artifacts.append(
+                    Artifact(package, target, fetched.sha256, fetched.size, fetched.url, fetched.request_ref)
+                )
                 emit("file_verified", chain, fetched.url, kind=package, size=fetched.size,
                      sha256=fetched.sha256)
                 result.attempts.append(
@@ -467,6 +472,7 @@ class Workflow:
                                 "purpose": "offline_resource",
                                 "chain": chain,
                                 "request_id": request_count,
+                                "request_ref": fetched.request_ref,
                                 "mode": "http",
                                 "user_agent": ANDROID_UA if chain == "android" else IPHONE_UA,
                             }
@@ -620,6 +626,7 @@ class Workflow:
                                 "url": fetched.url,
                                 "chain": chain,
                                 "request_id": request_count,
+                                "request_ref": fetched.request_ref,
                                 "complete": True,
                                 "hash_scope": "wire",
                             }
@@ -785,6 +792,7 @@ class Workflow:
                         "url": fetched.url,
                         "chain": chain,
                         "request_id": request_count,
+                        "request_ref": fetched.request_ref,
                         "mode": "http",
                         "user_agent": ANDROID_UA if chain == "android" else IPHONE_UA,
                     }
@@ -810,7 +818,7 @@ class Workflow:
                         fetched.path.replace(target)
                         body_record["path"] = str(target)
                         result.artifacts.append(
-                            Artifact(package, target, fetched.sha256, fetched.size, fetched.url)
+                            Artifact(package, target, fetched.sha256, fetched.size, fetched.url, fetched.request_ref)
                         )
                         emit("file_verified", chain, fetched.url, kind=package, size=fetched.size,
                              sha256=fetched.sha256)

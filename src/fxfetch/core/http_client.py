@@ -10,14 +10,17 @@ import socket
 import ssl
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial as bind_callback
 from http.cookiejar import CookieJar
 from pathlib import Path
+from typing import Any
 from urllib.parse import urljoin, urlsplit
 from urllib.request import Request
 
+from .download import is_package_prefix
 from .errors import FxfetchError
 from .guard import is_public, resolve_public, validate_url
 from .limits import Limits
@@ -73,6 +76,7 @@ class FetchedResponse:
     size: int
     sha256: str
     hops: tuple[Hop, ...]
+    request_ref: str | None = None
 
 
 class HttpClient:
@@ -83,11 +87,13 @@ class HttpClient:
         resolver: Callable[[str, int], tuple[str, ...]] | None = None,
         proxy: LocalConnectProxy | None = None,
         dns_timeout: float | None = None,
+        transport_observer: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         self.limits = limits
         self.resolver = resolver
         self.proxy = proxy
         self.dns_timeout = limits.connect_timeout if dns_timeout is None else dns_timeout
+        self.transport_observer = transport_observer
 
     def _resolve(self, host: str, port: int) -> tuple[str, ...]:
         try:
@@ -146,6 +152,9 @@ class HttpClient:
         cancel: threading.Event,
         referer: str | None = None,
         on_event: Callable[[dict[str, object]], None] | None = None,
+        on_transport_event: Callable[[dict[str, object]], None] | None = None,
+        package_streaming: bool = True,
+        body_limit_bytes: int | None = None,
     ) -> FetchedResponse:
         current = validate_url(url)
         if any(c in user_agent for c in "\r\n"):
@@ -159,6 +168,31 @@ class HttpClient:
         def emit(event: str, **details: object) -> None:
             if on_event is not None:
                 on_event({"event": event, "url": current, **details})
+
+        def emit_transport(event: str, **details: object) -> None:
+            value: dict[str, object] = {"kind": event, **details}
+            observer = self.transport_observer
+            if observer is not None:
+                try:
+                    observer(value)
+                except Exception:
+                    failed = getattr(observer, "mark_failed", None)
+                    if callable(failed):
+                        try:
+                            failed("transport_observer_failed")
+                        except Exception:
+                            pass
+            if on_transport_event is not None and on_transport_event != observer:
+                try:
+                    on_transport_event(value)
+                except Exception:
+                    failed = getattr(on_transport_event, "mark_failed", None)
+                    if callable(failed):
+                        try:
+                            failed("transport_observer_failed")
+                        except Exception:
+                            pass
+
         partial = destination.with_name(destination.name + ".partial")
         if destination.exists() or partial.exists():
             raise FxfetchError("destination_exists", "Destination or partial already exists")
@@ -201,13 +235,29 @@ class HttpClient:
 
         active_progress: Callable[[], None] | None = None
         transfer_complete = False
+        active_request_ref: str | None = None
+        active_status: int | None = None
+        active_headers: dict[str, str] = {}
+        active_digest: Any = None
+        active_size = 0
+        active_package_stream = False
         try:
             for index in range(min(self.limits.max_redirects + 1, self.limits.max_requests)):
                 check()
                 if current in visited:
                     raise FxfetchError("redirect_cycle", "HTTP redirect loop detected")
                 visited.add(current)
-                emit("request")
+                request_id = f"http-{uuid.uuid4().hex}"
+                active_request_ref = request_id
+                active_status = None
+                active_headers = {}
+                active_digest = None
+                active_size = 0
+                active_package_stream = False
+                emit("request", request_id=request_id)
+                emit_transport(
+                    "request_attempted", request_ref=request_id, url=current, method="GET"
+                )
                 parts = urlsplit(current)
                 host = parts.hostname
                 assert host is not None
@@ -318,6 +368,8 @@ class HttpClient:
                     response_headers = {
                         key.lower(): value for key, value in raw_headers if key.lower() in EVIDENCE_HEADERS
                     }
+                    active_status = response.status
+                    active_headers = response_headers
                     if (
                         sum(len(key) + len(value) + 4 for key, value in response_headers.items())
                         > MAX_EVIDENCE_HEADER_BYTES
@@ -335,17 +387,62 @@ class HttpClient:
                         selected_address,
                         tuple(connection_attempts),
                     )
+                    raw_location = response.getheader("Location")
+                    resolved_location = None
                     emit("response_received", status=response.status,
-                         content_type=response_headers.get("content-type", ""))
+                         content_type=response_headers.get("content-type", ""), request_id=request_id)
+                    if self.transport_observer is not None or on_transport_event is not None:
+                        emit_transport(
+                            "response_observed",
+                            request_ref=request_id,
+                            url=current,
+                            status=response.status,
+                            headers=response_headers,
+                            connection_ip=connection_ip,
+                            requested_ip=selected_address,
+                            tls_der_sha256=hashlib.sha256(certificate).hexdigest() if certificate else None,
+                            location_raw=raw_location,
+                            location_resolved=None,
+                        )
+                        if raw_location is not None:
+                            try:
+                                if len(raw_location) > 8192 or any(ord(char) < 32 for char in raw_location):
+                                    raise ValueError("invalid Location")
+                                resolved_location = urljoin(current, raw_location)
+                            except (TypeError, ValueError):
+                                emit_transport(
+                                    "gap",
+                                    request_ref=request_id,
+                                    code="location_resolution_failed",
+                                    url=current,
+                                    location_raw=raw_location,
+                                )
+                            else:
+                                emit_transport(
+                                    "location_resolved",
+                                    request_ref=request_id,
+                                    url=current,
+                                    location_raw=raw_location,
+                                    location_resolved=resolved_location,
+                                )
                     cookie_jar.extract_cookies(response, request)  # type: ignore[arg-type]
-                    if response.status in (301, 302, 303, 307, 308) and response.getheader("Location"):
+                    if response.status in (301, 302, 303, 307, 308) and raw_location:
                         if index >= self.limits.max_redirects:
                             raise FxfetchError("redirect_limit", "Redirect budget exceeded")
-                        target_url = validate_url(urljoin(current, response.getheader("Location") or ""))
+                        target_url = validate_url(urljoin(current, raw_location))
+                        resolved_location = urljoin(current, raw_location)
+                        emit_transport(
+                            "redirect_observed",
+                            request_ref=request_id,
+                            from_url=current,
+                            location_raw=raw_location,
+                            resolved_target=resolved_location,
+                        )
                         if target_url in visited:
                             raise FxfetchError("redirect_cycle", "HTTP redirect loop detected")
                         emit("redirect", from_url=current, to_url=target_url,
-                             status=response.status, mechanism="http")
+                             status=response.status, mechanism="http", request_id=request_id,
+                             location_raw=raw_location)
                         current = target_url
                         continue
                     encoding = response.getheader("Content-Encoding", "identity").lower()
@@ -360,10 +457,18 @@ class HttpClient:
                     transfer = response.getheader("Transfer-Encoding")
                     if transfer and (transfer.lower() != "chunked" or lengths):
                         raise FxfetchError("invalid_framing", "Unsupported or ambiguous response framing")
-                    if expected is not None and expected > self.limits.max_package_bytes:
+                    body_budget = (
+                        min(self.limits.max_body_bytes, self.limits.max_package_bytes)
+                        if not package_streaming
+                        else self.limits.max_package_bytes
+                    )
+                    if body_limit_bytes is not None:
+                        body_budget = min(body_budget, body_limit_bytes)
+                    if expected is not None and expected > body_budget:
                         raise FxfetchError("download_limit", "Declared response exceeds byte limit")
                     size = 0
                     digest = hashlib.sha256()
+                    active_digest = digest
                     # Sniff actual bytes, never grant the package budget based on MIME or suffix.
                     prefix = bytearray()
                     while len(prefix) < 4:
@@ -372,13 +477,14 @@ class HttpClient:
                         if not block:
                             break
                         prefix.extend(block)
-                    package_prefix = bytes(prefix) in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+                    package_prefix = is_package_prefix(bytes(prefix))
                     body_limit = (
-                        self.limits.max_package_bytes
-                        if package_prefix
-                        else min(self.limits.max_package_bytes, self.limits.max_body_bytes)
+                        body_budget
+                        if package_prefix and package_streaming
+                        else min(body_budget, self.limits.max_body_bytes)
                     )
-                    package_stream = package_prefix and 200 <= response.status < 300
+                    active_package_stream = package_prefix and package_streaming
+                    package_stream = active_package_stream and 200 <= response.status < 300
                     if package_stream:
                         emit("download_started", package_unverified=True,
                              received_bytes=len(prefix), total_bytes=expected)
@@ -410,6 +516,7 @@ class HttpClient:
                         output.write(first)
                         digest.update(first)
                         size += len(first)
+                        active_size = size
                         progress_state["size"] = size
                         progress(force=True)
                         if len(prefix) > body_limit or (expected is not None and expected > body_limit):
@@ -423,6 +530,7 @@ class HttpClient:
                             output.write(allowed)
                             digest.update(allowed)
                             size += len(allowed)
+                            active_size = size
                             progress_state["size"] = size
                             progress()
                             if len(allowed) != len(data):
@@ -437,6 +545,20 @@ class HttpClient:
                     progress(complete=True, force=True)
                     emit("response_complete", status=response.status, size=size,
                          is_package_stream=package_stream)
+                    emit_transport(
+                        "response_body_saved",
+                        request_ref=request_id,
+                        url=current,
+                        source_url=current,
+                        status=response.status,
+                        path=destination,
+                        size=size,
+                        sha256=digest.hexdigest(),
+                        content_type=response_headers.get("content-type", ""),
+                        representation="http_response_decoded",
+                        complete=True,
+                        package_stream=active_package_stream,
+                    )
                     return FetchedResponse(
                         current,
                         response.status,
@@ -445,6 +567,7 @@ class HttpClient:
                         size,
                         digest.hexdigest(),
                         tuple(hops),
+                        request_id,
                     )
                 finally:
                     stopped.set()
@@ -456,15 +579,18 @@ class HttpClient:
             raise FxfetchError("request_limit", "Request budget exceeded")
         except FxfetchError as exc:
             exc.__dict__["hops"] = tuple(hops)
+            exc.__dict__["request_ref"] = active_request_ref
             raise
         except TimeoutError as exc:
             check()
             error = FxfetchError("network_timeout", "Connection or read timed out")
             error.__dict__["hops"] = tuple(hops)
+            error.__dict__["request_ref"] = active_request_ref
             raise error from exc
         except ssl.SSLCertVerificationError as exc:
             error = FxfetchError("tls_verification_failed", "TLS certificate verification failed")
             error.__dict__["hops"] = tuple(hops)
+            error.__dict__["request_ref"] = active_request_ref
             raise error from exc
         except ssl.SSLError as exc:
             error = FxfetchError("tls_handshake_failed", "TLS handshake failed")
@@ -478,5 +604,27 @@ class HttpClient:
             error.__dict__["hops"] = tuple(hops)
             raise error from exc
         finally:
+            if (
+                not transfer_complete
+                and active_request_ref is not None
+                and active_digest is not None
+                and active_size > 0
+                and partial.is_file()
+            ):
+                emit_transport(
+                    "response_prefix_saved",
+                    request_ref=active_request_ref,
+                    url=current,
+                    source_url=current,
+                    status=active_status,
+                    headers=active_headers,
+                    path=partial,
+                    size=active_size,
+                    sha256=active_digest.hexdigest(),
+                    content_type=active_headers.get("content-type", ""),
+                    representation="http_response_prefix",
+                    complete=False,
+                    package_stream=active_package_stream,
+                )
             if active_progress is not None and not transfer_complete:
                 active_progress()

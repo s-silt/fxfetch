@@ -6,6 +6,16 @@
 
 `GET /api/session` 返回 `{authenticated, csrf_token, expires}`。`POST /api/login` 接收 `{password}`，成功设置 HttpOnly / SameSite=Strict 会话 Cookie；写请求必须具有与服务地址一致的 Origin。登录后所有写请求另需 `X-CSRF-Token`。`POST /api/logout` 使会话失效。单会话 8 小时，不因重新登录自动获得其他会话的任务。
 
+## 任务数据包
+
+每个执行中的普通下载任务在原工作流完成后离线封存一个独立 ZIP；采集工作流不会重放。原 APK / IPA 保持为单独的 artifact 下载，ZIP 仅含明确记录的网页材料、有限观察、清单和原包的外部引用，不含 APK / IPA 字节。ZIP 归档失败不会改写原任务结果或移除已保存 artifact。
+
+`GET /api/jobs/{id}` 返回独立的 `data_package` 状态：`pending`、`building`、`ready`、`failed` 或 `unavailable`。就绪时带有 `filename`、`size`、`sha256` 和 `web_materials` 摘要；失败时提供 `reason_code`。旧任务没有该归档时显示 `unavailable`。`web_materials` 总是标注 `coverage: "partial"`。
+
+`GET /api/jobs/{id}/data-package` 使用与任务/artifact 相同的会话认证、所有权和归档可见性规则；仅就绪归档可下载，返回 `application/zip`、附件文件名及 `Cache-Control: no-store`。读取、下载或刷新任务不会触发目标网络访问。
+
+离线 CLI `fxfetch verify-data ARCHIVE.zip` 有界验证 ZIP 路径、清单、观察记录和归档材料哈希；不会解压归档。其成功仅说明 ZIP 内材料通过检查，不说明外部引用的 APK / IPA 字节已被本次验证。
+
 Host 由启动参数明确允许。上传鉴权在 multipart 解析前完成，先有界收取最多 11 MiB 的请求，再交给解析器；文件最多 10 MiB、总上传时间 30 秒、单次解码。支持的静态图片格式在受限进程内验证和扫码，具体格式见下文。
 
 任务和构建提交都需要 `Idempotency-Key`（8–128 个 ASCII 字符）。同会话相同键、相同参数返回原记录；不同参数返回 409。网络中断时重试原键，不要因为刷新生成新任务。

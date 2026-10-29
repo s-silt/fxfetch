@@ -443,6 +443,18 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
         path = contained_path(jobs.store.root, value["path"])
         return FileResponse(path, media_type="application/octet-stream", filename=value["filename"])
 
+    @app.get("/api/jobs/{identifier}/data-package")
+    async def data_package(identifier: str, current: Annotated[dict, Depends(session)]):
+        path, filename = await run_in_threadpool(
+            jobs.data_package_file, current["id"], identifier
+        )
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=filename,
+            headers={"Cache-Control": "no-store"},
+        )
+
     static = Path(__file__).parent / "static"
     if static.is_dir():
         app.mount("/static", StaticFiles(directory=static), name="static")

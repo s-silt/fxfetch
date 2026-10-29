@@ -15,6 +15,9 @@ from .browser_gateway import BrowserGateway
 from .classify import classify_input
 from .errors import FxfetchError
 from .limits import Limits
+from .web_evidence_io import bounded_directory_size
+from .web_evidence_schema import EvidenceError
+from .web_journal import EvidenceJournal
 from .workflow import Artifact, Attempt, Workflow, WorkflowResult
 
 _TERMINATION_REASONS = {"cancelled", "task_timeout", "chain_timeout", "browser_read_timeout"}
@@ -83,10 +86,13 @@ class BrowserWorkflow:
         self, static: Workflow, config: AndroidWorkerConfig, limits: Limits,
         *, lease_id: str | None = None,
         http_first: bool = False,
+        journal: EvidenceJournal | None = None,
     ) -> None:
         self.static, self.config, self.limits = static, config, limits
         self.lease_id = lease_id
         self.http_first = http_first
+        self.journal = journal
+        self._browser_attempts = 0
 
     def run(
         self,
@@ -121,7 +127,10 @@ class BrowserWorkflow:
             )
             if preflight.artifacts or preflight.selection_candidates or not (dynamic or browser_recoverable_response):
                 return preflight
-            used = sum(p.stat().st_size for p in output_dir.rglob("*") if p.is_file()) if output_dir.exists() else 0
+            try:
+                used = bounded_directory_size(output_dir) if output_dir.exists() else 0
+            except EvidenceError as error:
+                raise FxfetchError("browser_budget_invalid", "Existing capture files are unsafe") from error
             limits = replace(self.limits,
                              max_requests=self.limits.max_requests - max(request_count, len(preflight.hops)),
                              max_task_bytes=self.limits.max_task_bytes - used,
@@ -162,6 +171,11 @@ class BrowserWorkflow:
                         raise FxfetchError("task_timeout", "Browser startup exhausted task deadline")
                     if on_event:
                         on_event({"event": "browser_started", "url": url, "chain": "android"})
+                    self._browser_attempts += 1
+                    observer = (
+                        self.static.client.transport_observer if self.static is not None else None
+                    )
+                    parent_attempt = getattr(observer, "context", ("network", "unknown"))[1]
                     capture = asyncio.run(
                         capture_browser(
                             url,
@@ -170,6 +184,11 @@ class BrowserWorkflow:
                             lease=lease,
                             limits=replace(limits, chain_timeout=remaining),
                             on_event=on_event,
+                            journal=self.journal,
+                            observation_context={
+                                "collector_id": "browser",
+                                "attempt_id": f"{parent_attempt}/browser-android-{self._browser_attempts}",
+                            },
                         )
                     )
                     result = project_capture(capture, url)

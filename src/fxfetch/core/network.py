@@ -49,10 +49,20 @@ _SESSION_EVENTS = frozenset(
 )
 
 
-def build_default_client(limits: Limits, proxyconfig: LocalConnectProxy | None = None) -> HttpClient:
+def build_default_client(
+    limits: Limits,
+    proxyconfig: LocalConnectProxy | None = None,
+    transport_observer: Callable[[dict[str, object]], None] | None = None,
+) -> HttpClient:
     """Construct one explicitly selected transport, not the retry policy itself."""
     resolver = DefaultPublicDNSResolver(proxy=proxyconfig)
-    return HttpClient(limits, resolver=resolver.resolve, proxy=proxyconfig, dns_timeout=20.0)
+    return HttpClient(
+        limits,
+        resolver=resolver.resolve,
+        proxy=proxyconfig,
+        dns_timeout=20.0,
+        transport_observer=transport_observer,
+    )
 
 
 class Collector(Protocol):
@@ -74,8 +84,12 @@ class AcquisitionResult(WorkflowResult):
     network_attempts: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _default_collector(limits: Limits, proxy: LocalConnectProxy | None) -> Collector:
-    return Workflow(build_default_client(limits, proxy), limits=limits)
+def _default_collector(
+    limits: Limits,
+    proxy: LocalConnectProxy | None,
+    observer: Callable[[dict[str, object]], None] | None = None,
+) -> Collector:
+    return Workflow(build_default_client(limits, proxy, observer), limits=limits)
 
 
 class AcquisitionPolicy:
@@ -94,11 +108,13 @@ class AcquisitionPolicy:
         collector_factory: CollectorFactory | None = None,
         browser_root: Path | None = None,
         android_lease_id: str | None = None,
+        transport_observer: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         self.limits = limits
         self.proxy = proxy
         self.browser_root = browser_root
         self.android_lease_id = android_lease_id
+        self.transport_observer = transport_observer
         self.collector_factory = collector_factory or self._collector
 
     def _collector(self, limits: Limits, proxy: LocalConnectProxy | None) -> Collector:
@@ -110,11 +126,12 @@ class AcquisitionPolicy:
                 from .browser_workflow import BrowserWorkflow
 
                 return BrowserWorkflow(
-                    Workflow(build_default_client(limits), limits), config, limits,
+                    Workflow(build_default_client(limits, transport_observer=self.transport_observer), limits), config, limits,
                     lease_id=self.android_lease_id,
                     http_first=True,
+                    journal=getattr(self.transport_observer, "journal", None),
                 )
-        return _default_collector(limits, proxy)
+        return _default_collector(limits, proxy, self.transport_observer)
 
     def run(
         self,
@@ -181,6 +198,17 @@ class AcquisitionPolicy:
                     session_observed = True
                 if on_event:
                     on_event({**event, "network_mode": mode, "attempt_id": attempt_id})
+                observe_progress = getattr(self.transport_observer, "observe_progress", None)
+                if callable(observe_progress):
+                    try:
+                        observe_progress({**event, "network_mode": mode, "attempt_id": attempt_id})
+                    except Exception:
+                        mark_failed = getattr(self.transport_observer, "mark_failed", None)
+                        if callable(mark_failed):
+                            try:
+                                mark_failed("progress_observer_failed")
+                            except Exception:
+                                pass
 
             emit(
                 {
@@ -192,9 +220,18 @@ class AcquisitionPolicy:
             )
             attempt_dir = output_dir / "network" / mode
             attempt_dir.mkdir(parents=True, exist_ok=True)
-            last = self.collector_factory(limits, self.proxy if mode == "proxy" else None).run(
-                url, attempt_dir, cancel, emit
+            set_context = getattr(self.transport_observer, "set_context", None)
+            restore_context = getattr(self.transport_observer, "restore_context", None)
+            previous_context = (
+                set_context("http", attempt_id) if callable(set_context) else None
             )
+            try:
+                last = self.collector_factory(limits, self.proxy if mode == "proxy" else None).run(
+                    url, attempt_dir, cancel, emit
+                )
+            finally:
+                if callable(restore_context) and previous_context is not None:
+                    restore_context(previous_context)
             history.append(
                 {
                     "attempt_id": attempt_id,
