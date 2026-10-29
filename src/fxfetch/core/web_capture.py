@@ -10,7 +10,6 @@ from .errors import FxfetchError
 from .guard import validate_url
 from .http_client import HttpClient
 from .limits import Limits
-from .web_browser import collect_browser
 from .web_http import collect_http
 from .web_journal import EvidenceJournal
 from .web_materials import WebCaptureResult, now_utc, save_summary
@@ -53,6 +52,8 @@ def capture_web(
         if collector == "http":
             collect_http(approved_url, output, result, journal, limits, active_cancel, client)
         else:
+            from .web_browser import collect_browser
+
             collect_browser(approved_url, output, result, journal, limits, active_cancel, service_root)
     except (FxfetchError, OSError, RuntimeError, ValueError) as error:
         result.outcome = "failed"

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import sys
 import threading
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -136,6 +138,71 @@ def test_offline_capture_preview_is_socket_free_and_does_not_create_output(
     assert state["mode"] == "offline" and state["network_requests"] == 0
     assert "secret" not in json.dumps(state)
     assert not output.exists()
+
+
+def test_http_capture_fresh_process_does_not_import_playwright(local_site, tmp_path: Path) -> None:
+    base, _ = local_site
+    offline_output = tmp_path / "offline"
+    active_output = tmp_path / "active"
+    script = r"""
+import importlib.abc
+import json
+import sys
+
+blocked = []
+
+
+class RejectPlaywright(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "playwright" or fullname.startswith("playwright."):
+            blocked.append(fullname)
+            raise ModuleNotFoundError("playwright blocked by regression", name=fullname)
+        return None
+
+
+sys.meta_path.insert(0, RejectPlaywright())
+from fxfetch import cli
+from fxfetch.core.http_client import HttpClient
+
+
+def local_resolve(self, host, port):
+    return ("127.0.0.1",)
+
+
+HttpClient._resolve = local_resolve
+base, offline_output, active_output = sys.argv[1:]
+if cli.main(["capture-web", base + "/plain", "--out", offline_output, "--collector", "http"]) != 0:
+    raise AssertionError("offline capture preview failed")
+if cli.main(
+    [
+        "capture-web",
+        base + "/plain",
+        "--out",
+        active_output,
+        "--collector",
+        "http",
+        "--authorized-active",
+    ]
+) != 0:
+    raise AssertionError("authorized HTTP capture failed")
+if blocked:
+    raise AssertionError(f"unexpected Playwright imports: {blocked}")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, base, str(offline_output), str(active_output)],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    states = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+    assert states[0]["mode"] == "offline"
+    assert states[0]["network_requests"] == 0
+    assert states[1]["state"] == "web_capture"
+    assert states[1]["collector"] == "http"
+    assert states[1]["outcome"] == "captured"
 
 
 def test_capture_rejects_non_http_scheme_offline(tmp_path: Path) -> None:
