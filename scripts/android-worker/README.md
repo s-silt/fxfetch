@@ -1,97 +1,20 @@
-# Android worker deployment
+# Android worker 准备
 
-This directory prepares a **separate Ubuntu VM** for the fxfetch Android browser.
-It provides deployment and controlled session helpers. The API must keep
-Android collection disabled until the complete connection, timeout, disk and
-session acceptance checks pass.
+本目录准备独立 Ubuntu / Redroid / Android Chrome 环境与受控会话。当前 Windows 运行入口为 [Docker QEMU/KVM 部署](../../deploy/android-docker/README.md)；下面 VirtualBox 命令仅用于原始环境准备，不是当前 Docker 启动步骤。
 
-## Acceptance snapshot — 2026-10-29
+## 环境与私有文件
 
-The original Windows deployment passed the following synthetic checks with
-Chrome/Trichrome **145.0.7632.218** (version code **763221838**). This fixed Google
-SDK build is not described as the current stable Chrome. These are historical
-acceptance results, not a guarantee of later runtime health or a fresh machine's
-readiness. Use live capability and task results for the current deployment.
+原环境：VirtualBox 7.2.16、Ubuntu 24.04（20261017 官方云镜像）、2 CPU / 4 GiB、16 GiB 独立磁盘、Binder、Redroid Android 14 amd64。Redroid 固定为：
 
-- Real Android CDP controls, same-session JS/Cookie/one-use-ticket acquisition,
-  and a 13,607,818-byte APK through Workflow/JobService and the API attachment
-  route passed; the three critical URLs were requested once each and hashes
-  matched. The APK was synthetic and was not installed.
-- Eight inner-network rejection checks, independent outer INPUT/FORWARD
-  rejection checks, and the explicitly permitted broker path passed. Unpermitted
-  Chrome background traffic was rejected before upstream connection.
-- Cancel/restart used a different lease and container. A 210-second native
-  guest lease expired without an early host `end`; the exact container was gone
-  about four seconds after expiry and expired proof was rejected.
-- The actual Android `/data` backing device was 2,147,483,648 bytes. A write-full
-  probe returned ENOSPC and its own probe file was removed. The disk bound is
-  separate from the API/build scratch soft budget.
-- The original LAN service was enabled only after those checks and a live idle
-  readiness check. Production target collection still validates each new lease;
-  a configured file or a cached capability response does not grant a lease.
+`sha256:11d58a64bfbde2253d1cce81bff409ff58174980222d1bada232d9ef59181191`
 
-The latest source-wide and UI verification scope is recorded in
-[IMPLEMENTATION.md](../../IMPLEMENTATION.md). Runtime receipts, VM identity,
-private SSH keys, Chrome assets, disk images, accepted `/data` baseline and
-machine configuration live under `.runtime/` and are **not part of the source
-release**. A fresh clone must install its prerequisites, prepare its own isolated
-environment, validate the Chrome pair, and establish a new accepted baseline and
-live acceptance before enabling its worker. Copying old status or hashes into a
-new machine's configuration is not an installation procedure.
+Android /data 使用独立 2 GiB ext4 卷。VM 不共享文件夹、USB、剪贴板、拖放或远程桌面。身份、SSH key、known_hosts、磁盘、Chrome 资产、已验收 baseline 与收据只保存在私有 `.runtime/`，不随源码发布。
 
-The guest helpers enforce an Android namespace OUTPUT deny policy, exact
-broker-only allowance, immutable container-ID cleanup, state locks, lease-specific
-staging, source and installed asset checks, environment/helper hashes, and native
-expiry. Chrome's declared static-library version must match the versioned
-Trichrome registration, resolved library path and installed APK hash. The live
-proof cannot be replaced with source-file existence.
+新机器必须重新准备与验收，不能复制旧状态或摘要冒充环境就绪；当前健康以能力与任务检查为准。
 
-`guest_session.py recover-idle` accepts only
-`{"lease_id":"00000000000000000000000000000000"}`. It refuses a live lease,
-cleans only its own expired labelled container, and restores binder/data mounts
-and deny rules without starting Android. The startup wrapper
-`resume_worker.py` also verifies the recorded VM UUID, name and configuration
-path. Do not run recovery, bootstrap or another acceptance runner concurrently
-with an active lease.
+## 原始 VM 准备
 
-Source APK pins for the accepted SDK build:
-
-- Chrome: `e19853ab32bb80fb99e5aa4fa511e75193c690cf2f37922a3e9eb5894e03b6dc`
-- Trichrome: `5266ae77797dc67fd77394e96de2e3e8ad124c58e21cfff91ee46d040680041c`
-
-The API34 image's older Chrome 113 is not the accepted production browser.
-
-## Local environment, 2026-10-28
-
-Verified on this Windows host:
-
-- VirtualBox 7.2.16; new VM `fxfetch-android-worker`, 2 CPUs, 4096 MiB RAM.
-- Official Ubuntu 24.04 cloud image dated 20261017, SHA-256 checked before use.
-- Guest kernel `6.8.0-147-generic`, Python 3.12.3, Docker 29.1.3; cloud-init completed without errors.
-- A dedicated 16 GiB virtual disk, with no shared folders, USB, clipboard,
-  drag-and-drop or remote desktop. VM SSH forwards **127.0.0.1:12222** only.
-- Binder module loaded and binderfs devices allocated in the new VM.
-- Official Redroid Android 14 linux/amd64 image locked to
-  `sha256:11d58a64bfbde2253d1cce81bff409ff58174980222d1bada232d9ef59181191`.
-- A separate 2 GiB ext4 loop volume mounted on Android `/data`. The VM itself
-  supplies a separate upper bound for the rest of the guest disk and memory.
-- The first Android boot is offline: guest nftables rules deny all new traffic
-  arriving from the dedicated `fxfetch-and` bridge. ADB publishes only on
-  **guest 127.0.0.1:15600**. There is no Windows/LAN ADB mapping.
-
-Android boot completion, Chrome operation, session isolation, write-full tests,
-controlled broker access, DNS delegation tests and all production guard tests
-are separate acceptance steps. The existence of the VM or these scripts does
-not establish them. Current runtime receipts are in
-`.runtime/android-worker/`; they must not enter Git.
-
-Unrelated VMs, Docker Desktop containers, WSL distributions,
-`.wslconfig`, host proxy and host DNS configuration were not changed by these
-scripts. The WSL stock kernel is not treated as a dedicated Android VM.
-
-## Explicit deployment steps
-
-Run from the repository root using this project's Python environment:
+从仓库根目录使用项目 Python 环境：
 
 ```powershell
 .venv\Scripts\python.exe scripts\android-worker\prepare_vm.py status
@@ -100,110 +23,62 @@ Run from the repository root using this project's Python environment:
 .venv\Scripts\python.exe scripts\android-worker\prepare_vm.py start
 ```
 
-`download` uses HTTPS without environment/system proxies, verifies pinned
-publisher hashes, retains failed partials and has no automatic retries.
-`prepare` refuses existing VM names/directories, never overwrites an old VM,
-generates a task-specific SSH key and local NoCloud ISO, and creates only the
-named VM. The private key stays in `.runtime`; restrict its ACL to the operator
-before use. `start` uses headless VirtualBox. No Windows service is installed.
+下载使用 HTTPS、校验固定发行摘要、失败保留部分文件且不自动重试。prepare 拒绝已存在的 VM 名称/目录，生成专用 SSH key 和 NoCloud ISO；私钥 ACL 限操作者。start 使用 headless VirtualBox，不安装 Windows 服务。
 
-The original API34 infrastructure download command is retained for provenance:
+复制 `guest_environment.py` 到专用 VM 后运行 `sudo python3 guest_environment.py prepare`。仅做基础设施测试时使用 `start-offline`：先安装 deny 规则，再启动 Android，并安排 600 秒独立停止。`stop` 停止指定容器且保留 deny 规则。
 
-```powershell
-.venv\Scripts\python.exe scripts\android-worker\prepare_vm.py download-chrome-image
-```
+## Chrome 资产
 
-**Do not use this legacy command to prepare the current browser.** It produced
-Chrome 113. For a fresh environment, the public API37 r08 tools are:
+验收使用固定 Chrome/Trichrome **145.0.7632.218**（version code **763221838**），不称为当前最新稳定版。原 API34 `download-chrome-image` 得到 Chrome 113，不能用于当前浏览器准备。
 
 ```powershell
 .venv\Scripts\python.exe scripts\android-worker\download_api37.py
 .venv\Scripts\python.exe scripts\android-worker\extract_api37.py
 ```
 
-The first command explicitly downloads the pinned official archive. The second
-is offline and extracts only the pinned system/product images, using the sibling
-`inspect_google_image.py` parser. Both resolve their output from the repository
-location, not the current working directory, and write only under
-`.runtime/android-worker/downloads/`. Existing outputs must match their expected
-length and digest; retained partials are not silently replaced. Extraction
-should have at least 9 GiB of additional free space after the archive exists.
-The scripts do not mount images, extract/install APKs, launch Android, or enable
-collection. Complete the browser extraction/signature check and installation
-with controlled local tools, then establish and verify the worker baseline.
-An existing verified archive is reused without a network request.
+工具下载固定官方 API37 r08 归档，再离线提取 system/product 镜像到 `.runtime/android-worker/downloads/`。已有输出须匹配大小与摘要；解包另需至少 9 GiB 空间。下载按 64 MiB 范围请求，失败退出；复核后用 `--resume` 续传，最终仍校验整个文件。
 
-The official image size and SHA-1 are pinned from Google's SDK repository metadata;
-the final receipt additionally records SHA-256. The downloader requests bounded
-64 MiB ranges. A failed request exits; after reviewing its failure, `--resume`
-continues at the saved byte offset and still verifies the whole final image.
-Do not execute arbitrary APKs from the image or use third-party Chrome mirrors.
-This helper does not silently accept a different build or turn downloaded bytes
-into a successful installation claim.
+工具不挂载镜像、不提取/安装 APK、不启动 Android，也不启用采集。随后通过受控本地工具完成浏览器提取、签名检查和安装，建立并验证新 baseline；不使用第三方 Chrome 镜像或运行任意 APK。
 
-Copy `guest_environment.py` to the dedicated VM over its SSH connection, then
-run `sudo python3 guest_environment.py prepare` and, only for infrastructure
-tests, `start-offline`. It verifies the VM marker/hostname, creates only the
-dedicated storage/network, installs the deny rules before starting Android,
-and schedules an independent systemd stop after 600 seconds. It installs no
-target applications and exposes no target navigation command. `stop` stops the
-named Android container and preserves the deny rules.
+| 资产 | SHA-256 |
+| --- | --- |
+| Chrome | `e19853ab32bb80fb99e5aa4fa511e75193c690cf2f37922a3e9eb5894e03b6dc` |
+| Trichrome | `5266ae77797dc67fd77394e96de2e3e8ad124c58e21cfff91ee46d040680041c` |
 
-## Runtime boundary
+## 控制与网络边界
 
-Windows Playwright/CDP connects to **127.0.0.1:19222**, forwarded through SSH
-to guest **127.0.0.1:9222**, which is an ADB forwarding socket. That endpoint is
-reserved; do not advertise it as live until a verified Chrome session exists.
+| 端点 | 原始 Windows VM 路线 |
+| --- | --- |
+| SSH | 主机 `127.0.0.1:12222` |
+| ADB | guest `127.0.0.1:15600`，不向主机/LAN 映射 |
+| CDP | 主机 `127.0.0.1:19222` 经 SSH 到 guest `127.0.0.1:9222` |
+| 唯一数据出口 | 主机守卫 `127.0.0.1:18767`，guest 经 `10.0.2.2:18767` 到达 |
 
-The only Android data-plane egress will be the project's direct-connect guard
-at Windows **127.0.0.1:18767**, reached through VirtualBox NAT as
-**10.0.2.2:18767**. This is a local security gateway; it must not forward through
-an upstream proxy. The guest must deny all other new Android TCP/UDP/IPv6
-connections, including host/private addresses and direct DNS. Docker embedded
-DNS needs a specific delegation/leak test; a browser proxy flag alone is not
-an egress boundary.
+Android namespace 禁止其他 TCP/UDP/IPv6、私网、宿主和直接 DNS 出站；Docker DNS 委派另行做泄漏测试。浏览器代理参数本身不是隔离边界，守卫直连目标而不接上游代理。
 
-The production controller uses authenticated fixed `begin`, `status`, `end`
-and expiry operations, per-task data restoration, a guest-enforced deadline,
-fail-closed teardown, and proof tied to the actual running VM/container/Chrome.
-Target URLs are structured input to the capture process, never shell fragments.
-A timer, a successful `about:blank`, or a readable CDP endpoint does not by
-itself authorize collection. Fresh deployments must verify these controls in
-their own environment; the source release includes no ready-to-use private
-worker configuration or baseline.
+固定 begin/status/end、状态锁、lease 专属 staging、每任务数据恢复、不可变容器 ID 清理及 guest 原生期限共同控制会话。实时证明核对 helper/environment、Chrome/Trichrome 安装摘要及静态库版本/路径。目标 URL 只作为结构化数据，不能进入 shell。
 
-For Mac mini, run the API container separately from this privileged Android
-worker. Use a dedicated Linux VM or an independently prepared Android worker;
-ordinary Docker Desktop on macOS is not assumed to provide Binder, a native
-Android kernel, or the same architecture. Android architecture and Chrome
-assets must be validated again. Do not pass Docker sockets, ADB, CDP or case
-directories into the public-facing API container.
+## 放行验收
 
-## Stop and recovery
+启用 API Android 能力前，逐项验证：
+
+1. 浏览器身份、CDP、同会话 Cookie/一次性票据和原响应下载到 API 附件。
+2. 内层 8 项与外层 INPUT/FORWARD 阻断、允许 broker 路径、后台连接和 DNS 隔离。
+3. 实际 /data 为 2,147,483,648 字节，写满返回 ENOSPC，清理测试文件。
+4. 取消后启动不同 lease/容器；guest 原生期限独立到期，拒绝旧证明并关闭隧道/守卫。
+
+这些合成场景已有历史通过记录，见 [IMPLEMENTATION.md](../../IMPLEMENTATION.md)；不是新机器验收，也不代表手机安装或真实网站通过率。about:blank、可读 CDP、配置存在和缓存能力均不足以放行。
+
+## 停止与恢复
 
 ```powershell
 .venv\Scripts\python.exe scripts\android-worker\prepare_vm.py stop
 ```
 
-This sends ACPI shutdown to this VM only. If cleaning up later, first verify the
-registered UUID and configuration path against `vm-prepared.json`, confirm the
-VM is stopped, and unregister that exact UUID **without** `--delete`. Retain the
-project files until their disposition is decided. Never run a wildcard VM
-delete, `wsl --shutdown`, Docker Desktop cleanup, or a global nftables flush.
+仅向登记 VM 发 ACPI。注销前核 UUID/配置路径并确认已停止，使用精确 UUID 且不加 `--delete`；不执行全局 VM/WSL/Docker/nftables 清理。
 
-## References and excluded defaults
+`guest_session.py recover-idle` 只接受 `{"lease_id":"00000000000000000000000000000000"}`，拒绝活动 lease，仅清理本项目过期容器并恢复挂载/deny 规则，不启动 Android。`resume_worker.py` 另核 VM UUID、名称与配置路径。活动 lease 期间不并发运行恢复、bootstrap 或验收。
 
-- [Official Ubuntu cloud image](https://cloud-images.ubuntu.com/noble/20261017/)
-- [Google SDK system-image metadata](https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-3.xml)
-- [Redroid installation and Binder requirements](https://github.com/remote-android/redroid-doc)
-- [NoCloud local seed support](https://docs.cloud-init.io/en/latest/reference/datasources/nocloud.html)
-- [Damru source](https://github.com/akwin1234/damru): inspected for environmental requirements;
-  not imported or copied into this project. Its default random device/Chrome,
-  GPU/TLS modifications, auto-download/setup and network repair routines are
-  not the deployment baseline. Its PolyForm Noncommercial licensing also needs
-  separate review before reuse.
-- [mobilebridge](https://github.com/VulpineOS/mobilebridge): an ADB/CDP bridge,
-  not an Android OS, a network guard, or proof of physical-device equivalence.
+Mac 的 API 与特权 Android 环境须分离，重验内核、架构、Chrome、网络及控制合同；不向 API 暴露 Docker socket、ADB、CDP 或案件目录。
 
-No Damru, mobilebridge or emulator-farm source is vendored here. These scripts
-use ordinary VirtualBox, cloud-init, Linux, Docker, ADB and CDP facilities.
+参考：[Ubuntu 镜像](https://cloud-images.ubuntu.com/noble/20261017/)、[Google SDK 元数据](https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-3.xml)、[Redroid](https://github.com/remote-android/redroid-doc)、[NoCloud](https://docs.cloud-init.io/en/latest/reference/datasources/nocloud.html)。本项目未引入 Damru、Mobilebridge 或模拟器农场源码。
