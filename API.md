@@ -55,42 +55,64 @@ Host 由启动参数明确允许。上传鉴权在 multipart 解析前完成，�
 
 子任务 `input` 保存 `parent_job_id,parent_entry_url,selected_candidate_id,source_url,selected_candidate_kind,continuation_depth`；`session_continuity=independent_request_session,cookies_inherited=false`。不重新访问父入口、不导入父 Cookie，保留父结论；最多 4 层并拒绝去片段后的祖先循环，查询参数仍保留。每个子任务重新使用普通有界采集预算，全部清空时父子一并隐藏及取消。活动冲突 `continuation_active`、重复选择 `candidate_already_selected`、深度/循环错误均明确拒绝。
 
-`flutter_source_download_limit` 表示明确引用的 Flutter 主脚本超过受控读取上限，`flutter_runtime_required` 表示仍需运行页面；两者均不能触发 IPA 回退。`device_verification_required` 的 outcome 为 blocked。`text_charset_conflict,text_charset_unsupported,text_decode_failed` 为编码覆盖缺口，不以乱码快照代替。
+## 下载分流与特殊结果
 
-当前 Flutter 启动脚本上限 256 KiB，主脚本 64 MiB；任务累计网页正文 128 MiB，普通 HTML 8 MiB。大脚本保存后以 64 KiB 分块扫描，跨块 URL/UTF-8 保留；EOF 完整性、编码、取消和绝对链路截止时间检查通过后才发布候选。网络保护与本地静态字面量校验分开，无效的无关 URL 常量不使整份脚本解析失败。
+HTTP 优先；需要动态处理或收到 403/429/502/503 时最多尝试一次独立 Android Chrome 会话。结果 `landing.http_resolution` 保留 HTTP 结果与 `new_browser_session=true,cookies_inherited=false`，两阶段共享预算。客户端直链下载不调用 `/api/jobs`，不产生服务端 `downloaded` 结论。
 
-`challenge_detected` 根据验证提示与控件或专用挑战页面结构判断，不按全源码关键词命中；脚本依赖但未观察到实际门槛时仍为 `browser_required`。这些原因码均不是站点性质或合法性结论。
+| 场景 | 字段 / 原因码 |
+| --- | --- |
+| DOM 文件锚点 | `mechanism=rendered_package_link,same_browser_session=true` |
+| 验证页已下发文件链接 | `verification_passed=false,continuation=explicit_dom_package_link` |
+| 内联脚本字面量 HTML GET 内容页 | `kind=http,action=script_content_link`；跳转 `mechanism=script_content_link,same_browser_session=true`；验证观察 `continuation=explicit_script_content_link` |
+| 内容页循环 / 提取限额 | `browser_content_loop` / `browser_script_limit` |
+| Flutter 超限 / 需要运行 | `flutter_source_download_limit` / `flutter_runtime_required` |
+| 设备验证 | `device_verification_required`，outcome 为 blocked |
+| 编码缺口 | `text_charset_conflict,text_charset_unsupported,text_decode_failed` |
+| 验证结构 / 动态依赖 | `challenge_detected` / `browser_required` |
 
-Android Chrome 可从当前渲染 DOM 的明确文件锚点继续下载，跳转事件使用 `mechanism=rendered_package_link`、`same_browser_session=true`；仍通过原有连接前守卫，不重放已尝试的文件票据。页面存在验证提示但已下发文件链接时，`challenge_detected` 保留 `verification_passed=false` 与 `continuation=explicit_dom_package_link`。文件最终 `downloaded` 只确认原包取得，不能解释为验证通过；文件地址自身拒绝时仍是 `blocked`。无明确链接时维持原有受阻结果。
+只追踪已下发明确地址，不求值动态表达式、不重放 POST。文件取得与验证观察分别记录；这些错误、覆盖缺口或站点验证不表示“没有 APK”，也不判断网站性质。读取预算见 [任务书](TASKBOOK.md)。
 
-验证页面内联脚本中明确的字面量 HTML GET 地址也可作为内容页候选，`kind=http,action=script_content_link`；跳转记录 `mechanism=script_content_link,same_browser_session=true`，验证观察使用 `continuation=explicit_script_content_link`。页面和脚本均不执行额外受保护函数，不求值动态地址，也不复现 POST。多个不同内容地址进入既有候选选择接口；`browser_content_loop` 表示循环已停止，`browser_script_limit` 表示静态提取预算不足，两者都不能解释为没有 APK。
+## 时限与进度
 
-采集优先使用 HTTP；需要动态页面或遇 403/429/502/503 时才尝试一次 Android Chrome。结果 `landing.http_resolution` 保存 HTTP 结果与 `new_browser_session=true,cookies_inherited=false`，HTTP hops 和 bodies 仍保留，两个阶段共享原任务预算。前端通过零目标请求的 `/api/preview` 识别 APK/IPA 输入直链，再提供普通外部下载链接；点击不调用 `/api/jobs`，服务无法确认客户端文件是否完整，因此不会产生 `downloaded` 任务。候选直链按钮也不继承采集会话，不保证跨设备有效。
+`capabilities.task_limits` 返回 `collection_seconds=600,build_seconds=900,queue_budget=separate_same_duration`。排队和执行分别计时，各阶段共享任务期限，不能由客户端放宽。
 
-演示文件接口已移除。右上「刷新」和浏览器整页刷新调用 `DELETE /api/jobs`，同时重置输入和前端待处理状态。已清空记录在列表、任务、构建、附件接口均不可见；工作线程可完成取消写回但不会让记录重新出现。其他会话不受影响，已落盘原始文件保留在后端。
+生产 `execution_limit_method=isolated_process_tree`，并分别返回 `collection_limit_method,build_limit_method`；测试注入标为 `mixed_or_injected` / `injected_test_callable`，HTTP 不能选择该模式。到期或取消终止整个进程树，拒绝迟到成功附件。
 
-## 服务端网络与离线字体配置
+| 超时 | 结果 |
+| --- | --- |
+| 采集执行 | `failed/task_timeout`，覆盖 partial |
+| 构建执行 | `failed/build_timeout` |
+| 排队 | `queue_timeout`，覆盖 not_started |
 
-### 任务时限与动态进度
+任务和 `builds[]` 的 `progress` 字段：
 
-`GET /api/capabilities` 的 `task_limits` 提供 `collection_seconds=600`、`build_seconds=900`、`queue_budget=separate_same_duration`。生产 `execution_limit_method=isolated_process_tree`，并分别提供 `collection_limit_method`、`build_limit_method`；内部注入测试组合标为 `mixed_or_injected`。这些值由服务端决定，网页不能关闭期限。排队各自最多等待 600/900 秒，开始执行后另计相同预算；整项采集共用一个执行期限，不因重定向、APK/IPA 切换或资源解析重置。
+- `event`：最新事件；`events`：最多 128 项，每项有递增 `seq` 和 Unix 秒 `at`，采样合并后序号可不连续。
+- `started_at,deadline_at,timeout_seconds,execution_limit_method`：执行信息；`queue_deadline_at,queue_timeout_seconds`：排队信息。
+- 跳转：`from_url,to_url,mechanism`；传输：`received_bytes,total_bytes,complete`。未知总长为 null；complete 仅表示响应结束，file_verified 才表示文件检查通过。
 
-生产采集和构建在受限独立进程执行，到期/取消终止整个进程树；结果为 `failed/task_timeout`、构建 `failed/build_timeout`，排队到期 `queue_timeout`。排队超时覆盖为 `not_started`，执行超时为 `partial`，均不表示没有 APK。附件与终态在同一事务发布，已超时或取消的任务不发布迟到成功附件。仅内部测试注入路径标记 `injected_test_callable`，HTTP 不提供该选择。
+采集事件：`request,response_received,redirect,page_received,download_candidate,download_started,download_progress,response_progress,response_complete,file_verifying,file_verified,challenge_detected,browser_required,browser_preparing,browser_started,browser_connection_blocked`。
+终态：`task_completed,task_timeout,cancelled,queue_timeout`。
 
-`GET /api/jobs/{id}` 的任务及 `builds[]` 各自包含 `progress`。保留兼容的最新 `event`，增加 `events`（最多 128 项）、`started_at`、`deadline_at`、`timeout_seconds`、`execution_limit_method`；排队时返回 `queue_deadline_at`、`queue_timeout_seconds`。时间戳为 Unix 秒，执行监督使用单调时钟；客户端倒计时只供估计，必须以后端终态确认停止。每个事件有递增 `seq` 和 `at`，中间采样合并后序号可不连续。
+构建阶段：`building,build_preparing,build_resources,build_compiling,build_signing,build_verifying,build_saving`；终态按 `built,failed,disabled,build_timeout,cancelled` 展示。后台传输进度最多每秒更新一次，另保留起止样本；客户端倒计时不能替代后端停止确认。
 
-采集事件包括 `request/response_received/redirect/page_received/download_candidate/download_started/download_progress/response_progress/response_complete/file_verifying/file_verified/challenge_detected/browser_required`，终态包含 `task_completed/task_timeout/cancelled/queue_timeout`。跳转携带 `from_url,to_url,mechanism`；传输携带 `received_bytes,total_bytes,complete`，总长度未知时为 null，不显示百分比。`download_started` 只表示实际收到了未校验包格式字节，`complete=true` 只表示该响应传输结束，`file_verified` 才表示现有文件检查通过；所有候选与验证阻挡仍保留其独立结果。
+## 能力与服务配置
 
-构建阶段包括 `building/build_preparing/build_resources/build_compiling/build_signing/build_verifying/build_saving`，最终按 `built/failed/disabled/build_timeout/cancelled` 展示。UI 每 1.5–5 秒读取现有任务接口，隐藏或结束时停轮询；后台下载进度最多每秒更新一次（另保留起止样本），连续样本合并。接口不会因读取进度而访问目标。
+`capabilities.chrome` 使用后台只读探测，每实例最多一个探测，完成后缓存 30 秒。`checking` 表示检查中，`cached` 表示展示缓存；探测不导航目标，实际任务仍需新 lease 和实时环境证明。`android-worker.json` 是服务端私有配置。
 
-客户端不能覆盖绑定地址、允许网段、DNS、代理或字体文件。服务目录 `server.json` 只接受 `host,port,allowed_networks,proxy_host,proxy_port`，仅允许具体 RFC1918/IPv4 回环绑定和私网/回环子网；HTTP 入口按真实 socket peer 检查，不信任转发头。目标出站 DNS 默认 AliDNS 223.5.5.5，服务/传输失败才回退 DNSPod 119.29.29.29；代理只能由服务端明确指定回环 CONNECT 地址，并仅作为候补：默认直连，仅初始传输失败且未观察到响应/会话推进时尝试一次独立代理，共享采集总时限与预算。访问控制、证书、公网守卫失败及覆盖缺口不会触发切换。`capabilities.network_policy` 声明默认模式和候补是否配置；结果 `network_mode`、`network_attempts` 保存每次完整结果，进度事件 `network_attempt_started/network_fallback/network_attempt_completed` 带模式与独立会话标记，原直连失败不会被成功代理结果删除。
+`server.json` 仅接受 `host,port,allowed_networks,proxy_host,proxy_port`；绑定具体 RFC1918/IPv4 回环地址，按真实 socket peer 校验，不信任转发头。当前部署 `proxy_host=null`，仅直连。DNS 默认 AliDNS 223.5.5.5，服务/传输失败才回退 DNSPod 119.29.29.29。
 
-上传图片的实际格式白名单扩展为 PNG/JPEG/WebP/HEIF/BMP/GIF/TIFF/AVIF，拒绝动画和多帧；仍受上传、像素、内存及子进程超时限制。授权下载流程有界发现网页明确引用图片并本机识别二维码，图片扫码状态、候选和覆盖缺口与原包四态分别记录。图片二维码不是可下载包的证明。
+兼容的代理候补只允许服务端显式配置回环 CONNECT 地址：初始传输失败且无响应/会话推进时，最多一次独立尝试，共享总预算；访问控制、证书、守卫失败或覆盖缺口不触发切换。`capabilities.network_policy` 声明模式；`network_mode,network_attempts` 和 `network_attempt_started,network_fallback,network_attempt_completed` 保留各次结果。兼容字段不表示当前启用代理。
 
-可选 `offline-font.json` 固定字段为 `path,license_path,size,sha256,git_blob_sha1,license_sha256`，仅管理员本机配置；加载器校验固定 Noto Sans CJK SC Sans2.004 官方元数据和实际字体/许可内容，拒绝重解析点和非绝对路径。构建结果 `font_applied` 与 `font_reason` 记录是否实际应用、未配置、无正文、预算不足或校验失败；字体应用不改变原采集 outcome。仅同源固定本地字体路径可加载，离线页仍禁止脚本、表单和网络请求。
+客户端不能修改绑定地址、网段、DNS、代理、worker 或字体路径。
 
-构建成功结果新增 `offline_content_kind`（`site_snapshot` / `connection_page`）、`offline_content_reason`、`resource_bytes` 和 `resource_files`。资源字节数为 APK 内离线 HTML/CSS/图片/字体及其完整许可的未压缩总量，不含 config/DEX/Manifest/签名；成品体积使用 `size`。资源统一上限 28 MiB，生成 APK 最终上限 30,000,000 字节。无有效网站快照时生成普通离线联网指引页，不将其标记为网站快照；原采集失败状态保持不变。
+## 离线内容与字体
 
-`capabilities.chrome` 在后台通过只读控制通道核验已配置的 Android worker，每个服务实例最多一个进行中的探测，完成结果缓存 30 秒。API 不等待慢探测：`checking=true` 表示仍在检查，`cached=true` 表示展示已有结果；这些字段和缓存都不是任务放行凭据。前端有限轮询检查状态，隐藏页面或登出即停止，刷新清空记录不依赖探测成功。探测不导航页面、不启动目标任务；实际采集必须再次取得包含独立期限和实时网络约束的任务 lease。`android-worker.json` 为后端私有配置，不接受 HTTP 客户端修改。动态进度新增 `browser_preparing`、`browser_started`、`browser_connection_blocked` 和实际请求计数；所有数据仍按纯文本展示。
+图片接受 PNG/JPEG/WebP/HEIF/BMP/GIF/TIFF/AVIF 的受支持静态格式，拒绝动画和多帧；扫码候选不证明包存在。具体资源预算见任务书。
 
-当前本机部署按用户最新要求设置 `proxy_host=null`，仅直连；上面的候补字段为兼容协议，不能解释为当前已启用代理。内部 Chrome 连接守卫只将公开目标地址固定后直连，不接上游代理。
+可选 `offline-font.json` 仅含 `path,license_path,size,sha256,git_blob_sha1,license_sha256`。绝对本机路径、固定 Noto Sans CJK SC Sans2.004 字体及许可摘要均需校验，拒绝重解析点。结果 `font_applied,font_reason` 记录实际应用及失败/跳过原因。
+
+构建结果包含 `offline_content_kind`（`site_snapshot` / `connection_page`）、`offline_content_reason,resource_bytes,resource_files,size`。resource_bytes 为离线资源及许可的未压缩总量，size 为成品大小。离线资源上限 28 MiB，APK 上限 30,000,000 字节。无快照时只提供联网指引，不修改原采集结果。
+
+## 刷新与清空
+
+刷新按钮和整页刷新调用 `DELETE /api/jobs`，重置输入并取消当前会话未完成任务。记录在任务、构建、附件接口不可见，迟到写回不恢复显示；其他会话不受影响，后端原文件保留。演示文件接口已移除。
