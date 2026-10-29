@@ -1179,9 +1179,15 @@ async def capture_browser(
                         complete=True,
                     )
             if web_observer is not None and (gate_rejected or challenge_detected):
+                snapshot_session = await controlled(page.context.new_cdp_session(page))
+                try:
+                    target_info = await controlled(snapshot_session.send("Target.getTargetInfo"))
+                finally:
+                    await controlled(snapshot_session.detach())
                 web_observer.challenge_snapshot(
                     source,
                     "device_verification_required" if gate_rejected else "challenge_detected",
+                    target_id=target_info.get("targetInfo", {}).get("targetId"),
                 )
             if gate_rejected and purpose != "web":
                 snapshots.pop(source, None)

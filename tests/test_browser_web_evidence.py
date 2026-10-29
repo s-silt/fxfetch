@@ -211,6 +211,103 @@ def test_main_challenge_preserves_device_verification_reason() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("rendered_html", "reason_code"),
+    [
+        (
+            '<html><body><div class="captcha"><button>Complete the CAPTCHA</button></div></body></html>',
+            "challenge_detected",
+        ),
+        (
+            """<html><body><div id="status">Access denied</div>
+            <script>
+            function deviceScore() {
+                if (knownBrowser()) return false;
+                return score() >= threshold;
+            }
+            window.onload = function() {
+                if (deviceScore()) {
+                    reject();
+                    return;
+                    label.textContent = "Access denied";
+                }
+            };
+            async function reject() {
+                navigator.webdriver;
+                WEBGL_debug_renderer_info;
+                UNMASKED_RENDERER_WEBGL;
+                await fetch("/deny");
+            }
+            </script></body></html>""",
+            "device_verification_required",
+        ),
+    ],
+)
+def test_web_capture_uses_rendered_dom_for_challenge_outcome(
+    tmp_path,
+    monkeypatch,
+    rendered_html: str,
+    reason_code: str,
+) -> None:
+    clean_body = b"<html><body>clean response</body></html>"
+    result, rows, counts, _ = run_browser_capture(
+        tmp_path,
+        monkeypatch,
+        body=clean_body,
+        rendered_html=rendered_html,
+        purpose="web",
+        redirect=False,
+    )
+
+    assert (result.outcome, result.reason_code) == ("blocked", reason_code)
+    response = [
+        fields
+        for kind, fields in rows
+        if kind == "response_observed" and fields["status"] == 200
+    ]
+    saved = [fields for kind, fields in rows if kind == "response_body_saved"]
+    dom = [fields for kind, fields in rows if kind == "terminal_snapshot"]
+    challenges = [fields for kind, fields in rows if kind == "challenge_detected"]
+    assert response and saved and dom and len(challenges) == 1
+    assert (tmp_path / str(saved[0]["path"])).read_bytes() == clean_body
+    assert (tmp_path / str(dom[0]["path"])).read_bytes() == rendered_html.encode()
+    assert challenges[0]["reason_code"] == reason_code
+    assert challenges[0]["target_id"] == "target-1"
+    assert counts["snapshot_session"] == {"count": 1}
+    assert counts["snapshot_target_info"] == {"count": 1}
+    assert counts["snapshot_detach"] == {"count": 1}
+
+
+def test_same_url_popup_challenge_is_journal_only() -> None:
+    journal = _Journal()
+    observer = BrowserWebEvidence(journal=journal)
+    observer.target_attached("main-session", {"targetId": "main-target"})
+    observer.set_entry_identity("main-session", "main-frame")
+    observer.main_status = 200
+    observer.main_body_captured = True
+
+    observer.challenge_snapshot(
+        "https://capture.test/page",
+        "challenge_detected",
+        target_id="popup-target",
+    )
+
+    assert observer.final_outcome("captured", "passive_visit_material_captured") == (
+        "captured",
+        "passive_visit_material_captured",
+    )
+    assert journal.rows[-1] == (
+        "challenge_detected",
+        {
+            "url": "https://capture.test/page",
+            "reason_code": "challenge_detected",
+            "target_id": "popup-target",
+            "representation": "browser_rendered_dom",
+            "request_ref": None,
+        },
+    )
+
+
 def test_package_capture_records_cdp_facts_without_web_policy(tmp_path, monkeypatch) -> None:
     result, rows, _, _ = run_browser_capture(tmp_path, monkeypatch)
 

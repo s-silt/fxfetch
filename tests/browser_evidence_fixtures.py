@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import threading
 from collections.abc import Sequence
 from pathlib import Path
@@ -57,6 +58,7 @@ class _Page:
     def __init__(self, url: str, html: str) -> None:
         self.url = url
         self.frames = [_Frame(url, html)]
+        self.context: _Context
 
     def is_closed(self) -> bool:
         return False
@@ -65,15 +67,50 @@ class _Page:
         pass
 
     async def evaluate(self, expression: str, *_: object) -> str:
-        return self.frames[0].html if "outerHTML" in expression else ""
+        if "outerHTML" in expression:
+            return self.frames[0].html
+        if "innerText" in expression:
+            visible = re.sub(
+                r"(?is)<(?:script|style|noscript)\b[^>]*>.*?</(?:script|style|noscript)>",
+                " ",
+                self.frames[0].html,
+            )
+            return re.sub(r"(?s)<[^>]*>", " ", visible)
+        return ""
+
+
+class _SnapshotCDP:
+    def __init__(self, target_id: str, counters: dict[str, dict[str, int]]) -> None:
+        self.target_id = target_id
+        self.counters = counters
+
+    async def send(self, method: str, *_: object) -> dict[str, object]:
+        if method != "Target.getTargetInfo":
+            raise AssertionError(f"unexpected snapshot CDP method: {method}")
+        values = self.counters["snapshot_target_info"]
+        values["count"] = values.get("count", 0) + 1
+        return {"targetInfo": {"targetId": self.target_id}}
+
+    async def detach(self) -> None:
+        values = self.counters["snapshot_detach"]
+        values["count"] = values.get("count", 0) + 1
 
 
 class _Context:
-    def __init__(self, page: _Page) -> None:
+    def __init__(self, page: _Page, counters: dict[str, dict[str, int]]) -> None:
         self.pages = [page]
+        self.counters = counters
+        page.context = self
 
     def on(self, *_: object) -> None:
         pass
+
+    async def new_cdp_session(self, page: _Page) -> _SnapshotCDP:
+        if page is not self.pages[0]:
+            raise AssertionError("snapshot CDP session requested for unknown page")
+        values = self.counters["snapshot_session"]
+        values["count"] = values.get("count", 0) + 1
+        return _SnapshotCDP("target-1", self.counters)
 
     async def route(self, *_: object) -> None:
         pass
@@ -363,6 +400,7 @@ def run_browser_capture(
     monkeypatch,
     *,
     body: bytes = b"<html>synthetic</html>",
+    rendered_html: str | None = None,
     headers: dict[str, str] | None = None,
     purpose: str = "package",
     redirect: bool = True,
@@ -378,9 +416,7 @@ def run_browser_capture(
     response_headers = dict(headers or {"Content-Type": "text/html"})
     if include_content_length:
         response_headers.setdefault("Content-Length", str(len(body)))
-    html = "<html><body>synthetic</body></html>"
-    page = _Page(final_url, html)
-    browser = _Browser(_Context(page))
+    html = rendered_html or "<html><body>synthetic</body></html>"
     recording_journal = journal or RecordingJournal(tmp_path / "task-observations.jsonl")
     context = observation_context or {
         "collector_id": "browser",
@@ -391,7 +427,12 @@ def run_browser_capture(
         "response_continue": {},
         "stream": {},
         "fulfill": {},
+        "snapshot_session": {},
+        "snapshot_target_info": {},
+        "snapshot_detach": {},
     }
+    page = _Page(final_url, html)
+    browser = _Browser(_Context(page, counters))
 
     async def connect(
         endpoint,

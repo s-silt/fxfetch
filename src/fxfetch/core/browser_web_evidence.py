@@ -31,6 +31,7 @@ class BrowserWebEvidence:
         self.main_body_captured = False
         self.main_package_stream = False
         self.main_challenge = False
+        self.main_challenge_reason: str | None = None
         self.snapshot_counter = 0
         self.gaps: list[str] = []
 
@@ -123,6 +124,7 @@ class BrowserWebEvidence:
             self.main_status = None
             self.main_body_captured = False
             self.main_challenge = False
+            self.main_challenge_reason = None
         return request_ref
 
     def record_unsupported_request(self, session: str, event: dict[str, Any]) -> str:
@@ -421,11 +423,22 @@ class BrowserWebEvidence:
             request_ref=request_ref,
         )
 
-    def challenge_snapshot(self, url: str, reason_code: str) -> None:
+    def challenge_snapshot(
+        self, url: str, reason_code: str, *, target_id: str | None
+    ) -> None:
+        if (
+            target_id is not None
+            and self.entry_session is not None
+            and target_id == self.target_id(self.entry_session)
+        ):
+            self.main_challenge = True
+            if self.main_challenge_reason != "device_verification_required":
+                self.main_challenge_reason = reason_code
         self.journal_event(
             "challenge_detected",
             url=url,
             reason_code=reason_code,
+            target_id=target_id,
             representation="browser_rendered_dom",
             request_ref=None,
         )
@@ -438,7 +451,7 @@ class BrowserWebEvidence:
         if self.main_challenge:
             return "blocked", (
                 "device_verification_required"
-                if reason_code == "device_verification_required"
+                if "device_verification_required" in {reason_code, self.main_challenge_reason}
                 else "challenge_detected"
             )
         if self.main_status in {401, 403, 429}:
