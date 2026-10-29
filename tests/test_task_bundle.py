@@ -394,6 +394,37 @@ def test_verify_data_cli_is_offline_and_reports_external_bytes_unverified(
     assert value["external_packages_verified"] is False
 
 
+@pytest.mark.parametrize(
+    ("member_name", "changed_name", "reason_code"),
+    [
+        ("manifest.json", "MANIFEST.JSON", "task_evidence_manifest_missing"),
+        ("observations.jsonl", "OBSERVATIONS.JSONL", "task_evidence_unlisted_file"),
+        ("web/index.html", "WEB/index.html", "task_evidence_unlisted_file"),
+    ],
+)
+def test_case_changed_archive_members_fail_verifier_and_cli(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    member_name: str,
+    changed_name: str,
+    reason_code: str,
+) -> None:
+    original = _archive(tmp_path)
+    with zipfile.ZipFile(original) as source:
+        members = {item.filename: source.read(item) for item in source.infolist()}
+    damaged = tmp_path / "case-changed.zip"
+    with zipfile.ZipFile(damaged, "w", compression=zipfile.ZIP_DEFLATED) as target:
+        for name, value in members.items():
+            target.writestr(changed_name if name == member_name else name, value)
+
+    with pytest.raises(EvidenceError, match=reason_code):
+        verify_task_archive(damaged, max_bytes=32 * 1024 * 1024)
+
+    assert main(["verify-data", str(damaged)]) == 1
+    value = json.loads(capsys.readouterr().out)
+    assert value == {"state": "failed", "reason_code": reason_code}
+
+
 @pytest.mark.parametrize("damage", ["truncated", "tampered", "unsafe"])
 def test_verifier_rejects_truncated_tampered_and_unsafe_archives(
     tmp_path: Path, damage: str

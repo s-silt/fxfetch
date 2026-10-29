@@ -41,6 +41,7 @@ def verify_task_archive(
             if not infos or len(infos) > MAX_TASK_FILES + 2:
                 raise EvidenceError("task_evidence_entry_count_invalid")
             seen: set[str] = set()
+            archive_names: set[str] = set()
             spellings: dict[str, str] = {}
             total = 0
             for info in infos:
@@ -56,6 +57,7 @@ def verify_task_archive(
                 if folded in seen:
                     raise EvidenceError("task_evidence_path_collision")
                 seen.add(folded)
+                archive_names.add(name)
                 for index in range(1, len(safe.parts) + 1):
                     part = "/".join(safe.parts[:index])
                     key = part.casefold()
@@ -75,7 +77,7 @@ def verify_task_archive(
                 total += info.file_size
                 if total > max_bytes:
                     raise EvidenceError("task_evidence_archive_too_large")
-            if "manifest.json" not in seen:
+            if "manifest.json" not in archive_names:
                 raise EvidenceError("task_evidence_manifest_missing")
             raw = _read_entry(
                 bundle, bundle.getinfo("manifest.json"), MAX_TASK_MANIFEST_BYTES, deadline
@@ -85,7 +87,7 @@ def verify_task_archive(
             if manifest["observations"]["path"] is not None:
                 expected.add("observations.jsonl")
             expected.update(record["path"] for record in manifest["files"])
-            if seen != {item.casefold() for item in expected}:
+            if archive_names != expected:
                 raise EvidenceError("task_evidence_unlisted_file")
             rows: list[dict[str, Any]] = []
             if manifest["observations"]["path"] is not None:
