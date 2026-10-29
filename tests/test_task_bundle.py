@@ -138,6 +138,15 @@ def _classic_eocd(raw: bytes) -> tuple[int, tuple[object, ...]]:
     raise AssertionError("synthetic archive has no EOCD")
 
 
+def _with_eocd_comment(raw: bytes, comment: bytes) -> bytes:
+    eocd_offset, values = _classic_eocd(raw)
+    assert eocd_offset + 22 == len(raw)
+    fields = list(values)
+    fields[-1] = len(comment)
+    header = struct.pack("<4s4H2LH", *fields)
+    return raw[:eocd_offset] + header + comment
+
+
 def _zip64_archive(raw: bytes, *, entries: int, sentinels: bool) -> bytes:
     eocd_offset, values = _classic_eocd(raw)
     (
@@ -266,6 +275,40 @@ def test_valid_small_zip64_archive_is_verified(tmp_path: Path) -> None:
     manifest, _ = verify_task_archive(archive, max_bytes=32 * 1024 * 1024)
 
     assert manifest["schema_version"] == "fxfetch.task-evidence.v1"
+
+
+def test_valid_ordinary_zip_comment_is_verified(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    archive.write_bytes(_with_eocd_comment(archive.read_bytes(), b"synthetic comment"))
+
+    manifest, _ = verify_task_archive(archive, max_bytes=32 * 1024 * 1024)
+
+    assert manifest["schema_version"] == "fxfetch.task-evidence.v1"
+
+
+def test_fake_eocd_in_comment_is_rejected_before_zipfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path)
+    fake_eocd = struct.pack(
+        "<4s4H2LH",
+        b"PK\x05\x06",
+        0,
+        0,
+        1,
+        1,
+        0xFFFFFF00,
+        0xFFFFFF00,
+        1,
+    )
+    archive.write_bytes(_with_eocd_comment(archive.read_bytes(), fake_eocd))
+
+    def forbidden_zipfile(*_: object, **__: object) -> None:
+        raise AssertionError("ZipFile constructed before EOCD preflight")
+
+    monkeypatch.setattr(task_evidence_verify.zipfile, "ZipFile", forbidden_zipfile)
+    with pytest.raises(EvidenceError, match="task_evidence_zip_end_record_invalid"):
+        verify_task_archive(archive, max_bytes=32 * 1024 * 1024)
 
 
 @pytest.mark.parametrize("damage", ["entry_count", "directory_size", "low_count", "expired", "zip64_count"])

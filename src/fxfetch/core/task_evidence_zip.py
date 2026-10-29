@@ -174,20 +174,13 @@ def preflight_task_zip(
 def _find_eocd(
     tail: bytes, file_size: int
 ) -> tuple[int, tuple[bytes, int, int, int, int, int, int, int]]:
-    candidates: list[tuple[int, tuple[bytes, int, int, int, int, int, int, int]]] = []
-    end = len(tail)
-    while end:
-        position = tail.rfind(_EOCD_SIGNATURE, 0, end)
-        if position < 0:
-            break
-        if position + _EOCD.size <= len(tail):
-            values = _EOCD.unpack_from(tail, position)
-            if position + _EOCD.size + values[-1] == len(tail):
-                candidates.append((file_size - len(tail) + position, values))
-        end = position
-    if len(candidates) != 1:
+    position = tail.rfind(_EOCD_SIGNATURE)
+    if position < 0 or position + _EOCD.size > len(tail):
         raise EvidenceError("task_evidence_zip_end_record_invalid")
-    return candidates[0]
+    values = _EOCD.unpack_from(tail, position)
+    if position + _EOCD.size + values[-1] != len(tail):
+        raise EvidenceError("task_evidence_zip_end_record_invalid")
+    return file_size - len(tail) + position, values
 
 
 def _match_classic(

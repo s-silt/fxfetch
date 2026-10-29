@@ -32,6 +32,11 @@
 - 本轮唯一一次全量 pytest：953 passed、22 skipped、0 failed。跳过项为 5 个 Linux 浏览器网关、15 个需 PowerShell 的防火墙和 2 个 POSIX/Linux 进程限制测试。存在一条既有 Starlette/httpx deprecation warning。
 - 未访问真实站点或 DNS，未安装 Chrome，未运行应用服务器。详细输出保存在 `.runtime/review-task-evidence/fix-logs/codex-*.log`。
 
+### ZIP EOCD 复审补充（2026-10-29）
+
+- 归档预检只接受尾部最后一个 EOCD 签名并要求注释长度精确到达 EOF；注释内伪造的、长度不匹配且声明超大目录的 EOCD 在构造 `ZipFile` 前被拒绝。有效普通注释及既有小型 ZIP64 回归仍通过。
+- `tests/test_task_bundle.py`：34 passed。此补充修订未重跑全量；上节 953 passed、22 skipped、0 failed 仍仅记录 `e622e85` 修订的全量结果。
+
 ### 前一轮任务数据包重整的本地验证（2026-10-29，修复前历史）
 
 - 两个定向回归预检：2 passed，1 条既有 Starlette/httpx deprecation warning。
