@@ -1,0 +1,1 @@
+"""Authenticated local HTTP service."""

@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337 AS browser
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= http_proxy= https_proxy= all_proxy= \
+    NO_PROXY=* no_proxy=*
+WORKDIR /opt/fxfetch
+ARG DEBIAN_MIRROR=deb.debian.org
+# OpenSSH controls the already provisioned guest through namespace-local loopback.
+# This image never installs a Chrome binary, Android SDK, or guest image.
+RUN case "$DEBIAN_MIRROR" in deb.debian.org|mirrors.ustc.edu.cn) ;; *) exit 2 ;; esac \
+    && printf 'Acquire::Retries "0";\nAcquire::ForceIPv4 "true";\nAcquire::EnableSrvRecords "false";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::http::Proxy "false";\nAcquire::https::Proxy "false";\nAPT::Update::Error-Mode "any";\n' > /etc/apt/apt.conf.d/99fxfetch-direct \
+    && sed -i "s|http://deb.debian.org|https://${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install --no-install-recommends -y openssh-client \
+    && dpkg-query -W > /usr/local/share/fxfetch-packages.tsv \
+    && rm -rf /var/lib/apt/lists/*
+COPY deploy/docker/requirements-runtime.lock /opt/fxfetch/requirements-runtime.lock
+COPY deploy/android-docker/requirements-browser.lock /opt/fxfetch/requirements-browser.lock
+RUN python -m pip install --no-deps --no-cache-dir --only-binary=:all: --retries 0 --timeout 30 \
+    -r requirements-runtime.lock -r requirements-browser.lock \
+    && python -m pip check
+COPY pyproject.toml /opt/fxfetch/pyproject.toml
+COPY src /opt/fxfetch/src
+COPY deploy/docker/entrypoint.py /opt/fxfetch/container_entrypoint.py
+COPY deploy/android-docker/api_entrypoint.py /opt/fxfetch/api_entrypoint.py
+COPY deploy/android-docker/check_playwright_driver.py /opt/fxfetch/check_playwright_driver.py
+ENV PYTHONPATH=/opt/fxfetch/src
+RUN groupadd --gid 10001 fxfetch && useradd --uid 10001 --gid 10001 --no-create-home fxfetch \
+    && mkdir -p /var/lib/fxfetch && chown 10001:10001 /var/lib/fxfetch \
+    && chmod 700 /var/lib/fxfetch
+USER 10001:10001
+ENTRYPOINT ["python", "/opt/fxfetch/api_entrypoint.py"]
+CMD ["serve"]
+
+# Optional browser + APK builder. Mount a pre-provisioned Linux SDK and fonts;
+# this stage installs only the JDK and never downloads Android packages.
+FROM browser AS builder
+USER root
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y openjdk-17-jdk-headless \
+    && dpkg-query -W > /usr/local/share/fxfetch-packages.tsv \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s "$(dirname "$(dirname "$(readlink -f /usr/bin/javac)")")" /opt/java
+ENV JAVA_HOME=/opt/java
+USER 10001:10001
+
+# Bind only local synthetic test modules and fixtures when running this target.
+# It shares production source/dependencies; fixtures and private data are never COPYed.
+FROM browser AS acceptance
+USER root
+COPY deploy/android-docker/requirements-acceptance.lock /opt/fxfetch/requirements-acceptance.lock
+RUN python -m pip install --no-deps --no-cache-dir --only-binary=:all: --retries 0 --timeout 30 \
+    -r requirements-acceptance.lock && python -m pip check
+USER 10001:10001

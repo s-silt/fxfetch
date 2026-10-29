@@ -1,0 +1,22 @@
+# Allowlist: never send case materials, tools, credentials, runtime state or caches.
+*
+!pyproject.toml
+!src/
+!src/**
+!deploy/
+!deploy/docker/
+!deploy/docker/Dockerfile
+!deploy/docker/entrypoint.py
+!deploy/docker/requirements-runtime.lock
+!deploy/android-docker/
+!deploy/android-docker/Dockerfile
+!deploy/android-docker/Dockerfile.api
+!deploy/android-docker/entrypoint.py
+!deploy/android-docker/kvm_probe.py
+!deploy/android-docker/check_playwright_driver.py
+!deploy/android-docker/api_entrypoint.py
+!deploy/android-docker/requirements-browser.lock
+!deploy/android-docker/requirements-acceptance.lock
+src/**/__pycache__/
+src/**/*.pyc
+src/**/*.egg-info/

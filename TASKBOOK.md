@@ -1,174 +1,380 @@
 # fxfetch 开发任务书
 
-本文件是**给执行 agent（本地 Codex）的实施任务书**。边界见 [AGENTS.md](AGENTS.md)，定位见 [README.md](README.md)。
+## 当前增量：本机 Windows Docker Android Chrome
 
-执行环境：Windows + Python 3.11+，本机已装 Chrome。配套 fxapk 以可编辑方式安装在同一环境。
+用户最新范围限定为本机 Windows Docker，不使用 PVE；Mac mini 部署暂不实施。当前路线由 Docker 管理 QEMU/KVM Ubuntu worker，内部运行固定 Redroid/Android Chrome。它仍包含 Linux 虚拟机，但不依赖 PVE 或 VirtualBox 运行。迁移使用已关机环境的独立磁盘副本，不覆盖原盘。部署前提、私有目录与验收步骤见 [Android Docker](deploy/android-docker/README.md)；是否已通过以最新 IMPLEMENTATION 记录为准。
 
-## 1. 目标
+用户已取消代理，当前服务仅直连；保留 AliDNS / DNSPod 默认配置。先在本机完成网页服务，后续迁往 Mac mini 的容器部署说明见 [Docker 部署](deploy/docker/README.md)。部署路径、密钥和运行记录均在私有目录，不能直接复制 Windows 绝对路径到 Mac。
 
-操作者把一个分发链接粘进窗口、点一次「下载」，后台自动：识别链接形态 → 按 Android 与 iPhone 两种设备身份各走一遍 → 跟完跳转与挑战 → 取回 APK / IPA → 算哈希、留逐跳证据 →（可选）调 fxapk 分析。
+浏览器增量采用本机独立 Ubuntu VM 中的官方 Redroid 与固定配置的 Android Chrome。参考 Damru 的 Android 环境思路和 Mobilebridge 的 ADB/CDP 桥接方式，不引入随机设备指纹、GPU/TLS 修改，也不声称可通用绕过硬件证明、短信验证或验证码。安装 Chrome 是本次明确授权的环境准备，任务执行期间不自动下载浏览器。网页客户端仍只访问 fxfetch 服务；ADB、CDP、SSH 与内部直连守卫均不面向局域网。
 
-卡住时才需要人：自动过不去的挑战弹出可见浏览器窗口，操作者手点一下，程序接着跑完。
+按用户最新要求，普通网页先使用有界 HTTP 解析和下载；明确 APK/IPA/manifest 直链不启动 Android Chrome。只有静态结果要求浏览器，或出现 403/429/502/503 响应时，才尝试一次独立的 Android Chrome 会话，保留 HTTP 结果且不继承 Cookie，共享剩余请求、字节和任务期限；公网防护、普通网络超时和其他终态不自动触发浏览器。浏览器中的包从原响应流读取，不另起 GET 重放一次性地址。前端另提供 APK/IPA 直链的“直接下载到当前设备”，点击才由客户端浏览器访问目标，不创建服务端任务，不声称文件已经取得或校验。未确认取得包的动态页面保留覆盖缺口，不触发假定“无 APK”的 IPA 回退。人工保留会话续接、blob 下载与通用设备验证绕过仍不得标成已经实现。
 
-## 2. 为什么不能只做「取页面 + 正则找 .apk」
+生产放行依赖实时 VM/防火墙/Chrome 身份/独立 2 GiB 数据卷/任务期限检查和本地合成验收。配置文件的 enabled 标志、环境安装完成或桌面 Chrome 测试通过均不足以启用 Android 模式。最新实际状态以 IMPLEMENTATION 中的验收记录为准；下文首版路径与阶段状态是初始设计背景。
 
-这类分发链接普遍挂在**前置过滤层**（俗称「防红」）后面，常见形态如下。设计必须按这些形态来，否则拿到的只是空壳页：
+修订：2026-10-28。本文定义完整路线与验收条件，**不代表全部功能已实现**；当前接口见 [API.md](API.md)，实测与缺口见 [IMPLEMENTATION.md](IMPLEMENTATION.md)。浏览器只使用本机 Chrome、不轮换指纹；未取得原包时点击才构建无工具标识的普通 WebView APK。用户追加：增加实际取得的离线页面和静态资源，不要求固定 20 MB、不填充凑体积。执行边界见 [AGENTS.md](AGENTS.md)，选型依据见 [RESEARCH.md](RESEARCH.md)。
 
-| 形态 | 对下载器的要求 |
+## 1. 产品目标与交付范围
+
+在 Windows 主机运行 Python 后端，局域网中的电脑、手机通过网页使用。保留原下载、留证与人工处理的目标，将原计划中的 Tkinter 桌面界面替换为网页，不增加云端服务或网页远程桌面。
+
+主流程：**粘贴网址，或添加图片识别二维码 → 查看并选择链接 → 点「下载」→ 优先取得 APK → 明确无 APK 才尝试 IPA → 展示结果并下载文件。**
+
+- 添加图片支持文件选择、拖入，以及用户主动在输入区粘贴图片；不后台读取剪贴板。
+- 图片识别完全在本机后端执行。上传、识别、选择链接均不访问二维码指向的网站；点击「下载」才创建采集任务。
+- APK 成功后结束默认流程。APK 被拦截、网络出错、解析不完整时不自动回退 IPA。
+- 可明确识别的 IPA 直链、`itms-services` manifest 入口直接走 IPA，不为寻找 APK 枚举其他路径。扩展名只是线索，下载后仍须校验真实类型。
+- 文件、Chrome 会话和可选 fxapk 分析都在后端主机；网页提供任务进度、状态、证据及产物下载。
+- 人工挑战处理在后端主机的可见 Chrome 中完成。远端网页提示等待，不声称手机浏览器可以接管后端 Chrome。
+- 未取得原始 APK/IPA 时显示「打包 APK」按钮，由操作者点击后构建联网 WebView 应用，不自动打包。打包交付只有一个 APK；不附带网页材料或来源清单，应用内不加工具名称、水印或生成提示。
+
+## 2. 用户界面与二维码输入
+
+### 2.1 单页流程
+
+页面由「粘贴网址 / 添加图片」输入区、候选链接区、下载选项、任务进度与结果区组成。默认策略始终显示为「APK 优先，没有 APK 再下载 IPA」。高级区才提供 Android、iPhone、两者分别执行的诊断选项。
+
+图片上传后显示安全生成的缩略图和识别结果。单个有效链接可预选，但不自动提交；多个二维码逐项显示链接、协议和位置，由操作者选一个再下载。无二维码、二维码不是链接、图片无效、识别超限分别提示，不能统一显示为「没有 APK」。
+
+链接按纯文本显示完整内容，并单独突出协议和主机；默认不做可点击外链或自动预览。允许编辑识别文本，但证据中区分原始二维码内容与人工编辑后的实际入口。
+
+结果按 Android / iPhone 链路展示状态、原因、覆盖范围、跳转和产物。APK/IPA 下载失败与后续分析失败分别呈现。按用户最新要求，右上「刷新」及浏览器整页刷新直接清空当前会话记录、停止其未完成任务，不重新采集；其他会话不受影响。
+
+未取得原包时，结果区保留失败/无包原因，并显示「打包 APK」。点击即提交当前所选网页 URL 的构建任务，不再增加确认步骤；默认沿用完整原始 HTTP/HTTPS 入口，已选择网页落地候选时使用该候选。文件名、应用名和包名按网址生成，长域名按 §6.2 截短。完成后只提供一个 `.apk` 文件，不捆绑网页材料、分析报告或证据压缩包。打包结果与原包下载结果分别显示，不以新生成 APK 覆盖原下载结论。
+
+### 2.2 二维码实现合同
+
+采用 **Pillow + ZXing-C++ 的 Python 绑定 `zxing-cpp`**，只启用 QR Code 解码；不为扫码引入 OCR、云识别或大型图像框架。图片解码在有超时与内存限制的独立进程中执行，避免阻塞 Web 服务。
+
+| 项目 | 首版要求 |
 | --- | --- |
-| 入口 URL 带加密参数，先 302 到一个换取凭据的路径，再回落地页 | 逐跳跟随，保留 Cookie 与会话 |
-| 下发的会话 Cookie 与**客户端出口 IP** 绑定 | 全程同一出口、同一会话；中途换代理或换网络即失效 |
-| 按 UA / 设备类型分流：移动端给真页，桌面端或爬虫给空壳、验证码或错误码 | 用移动端 UA，且 Android 与 iPhone 分别取 |
-| 入口限定在社交 App 内置浏览器中打开 | UA 需覆盖常见移动端浏览器形态；拿不到时如实记 `blocked`，不猜 |
-| 页面靠 JS 渲染，或要点一下按钮才出下载地址 | 需要真浏览器执行 JS，纯 `requests` 取不到 |
-| 字符 / 滑块验证码 | 有限次本地自动识别，失败转人工 |
-| 通过验证后由前置层**反向代理**到真实源站，页面上看不到源站地址 | 逐跳记录实连 IP 与证书，源站与前置层分开记 |
-| 入口参数带时效，过期即失效 | 拿到链接立即走完全程，不隔轮重试 |
+| 输入格式 | PNG、JPEG、静态 WebP、HEIC/HEIF、BMP、单帧 GIF、单页 TIFF、静态 AVIF；验证实际格式，拒绝 SVG、PDF、动画、多帧/多页及伪装格式 |
+| 接收上限 | 每次 1 张，文件实际字节 ≤10 MiB；整个 multipart 请求 ≤11 MiB |
+| 解码上限 | ≤2500 万像素，独立进程 ≤512 MiB、≤5 秒；超限可终止进程并给明确原因 |
+| 一图多码 | 返回候选列表及位置；最多展示 16 个，超过时标记结果被截断并要求裁剪重传，不假装已列全 |
+| 文字处理 | 保存解码原始字节、文本及转换方式；非文本或不可靠转码不自动当网址；URL ≤8192 UTF-8 字节 |
+| URL 协议 | HTTP/HTTPS 可进入采集；严格解析的 `itms-services` 仅提取 HTTP/HTTPS manifest URL；其他协议只显示原因，不执行 |
+| 特殊链接 | App Store / TestFlight 识别为范围外；不跟随 `javascript:`、`data:`、`file:`、`intent:` 或自定义 App 协议 |
+| 原始参数 | 保留原文、查询参数和片段；不自行解密参数、递归拆短链或猜补 URL |
+| 去重 | 相同原始内容可合并展示，保留各自二维码位置；不删除可能影响签名的查询参数来去重 |
 
-**后果铁律**：以上任何一环没过去，结果都是 `blocked`（内容未知），不是 `not_found`。把 `blocked` 报成「没有包」会直接误导侦查方向。
+上传总量限制必须在 multipart 解析和临时文件写入之前生效，不能只靠 `Content-Length` 或 `UploadFile` 的内存转磁盘机制。Pillow 与本地 pillow-heif 使用格式白名单、像素检查，并将解压炸弹警告视为拒绝；校验后重新打开并在受限进程中解码。EXIF 旋转等处理只作用于副本，记录变换与坐标所属图像。
 
-## 3. 架构
+图片证据包括原图 SHA-256、实际类型、尺寸、解码库版本、二维码原始内容、位置、所选候选 ID、编辑记录和实际提交 URL。未提交的图片仅在所属会话暂存，默认 24 小时过期、每会话最多 10 张；提交后将所选原图与识别记录固化到任务证据，不按临时文件过期规则删除。
 
-```
+首版不要求实时摄像头扫码。手机可通过文件选择器选照片；浏览器原生图片粘贴不可用时回退文件选择。摄像头 API 的安全上下文要求与文件上传不同，不能把普通局域网 HTTP 当成摄像头功能已可用。
+
+## 3. 状态与 APK / IPA 选择
+
+任务状态与采集结果分开，避免「任务结束」被误读成「成功拿包」。
+
+- `job_state`：`queued / running / awaiting_selection / awaiting_human / completed / cancelled / interrupted`。
+- 每个 `chain` 按 Android / iPhone 分开；每次 HTTP、浏览器或显式重试有独立 `attempt_id`、模式、时间和覆盖范围。链路最终结果写明由哪次尝试解决了先前缺口，保留失败历史，不把历史失败直接当最终结果。
+- `coverage`：`not_started / partial / complete`，含缺失原因；`complete` 只指本次声明的有限采集范围，不代表全站或真实设备完整覆盖。
+- `outcome` 仅用于已执行的采集尝试；未执行、范围外和策略跳过用独立 `execution_status` 与 `skip_reason`，不得编造 `not_found`。
+
+| outcome | 判定要求 |
+| --- | --- |
+| `downloaded` | 取得策略所求的 APK/IPA 完整字节，大小、传输完整性及包结构检查通过，SHA-256 已落档；只保存描述文件或网页不算取得包 |
+| `not_found` | 本链路预定步骤完成，无未解决的挑战、解析错误、候选或必要页面覆盖缺口；仅表示本次范围内无所求包 |
+| `blocked` | 有证据表明被验证码、挑战或访问控制阻挡，内容仍未知 |
+| `failed` | DNS/连接/超时/解析错误、防护拒绝、能力缺失、超限或其他执行失败，附原因码 |
+
+APK → IPA 自动回退仅由 Android 链路的最终 `not_found` 触发。403 响应被保存、HTTP 500、业务 JSON 字段为空、页面出现 `/undefined`、JS 未执行、没有观察到请求，都不能单独证明没有 APK。401/403 是否为访问控制、挑战或其他错误应记录依据，不凭状态码猜平台原因。
+
+默认任务取到目标包即成功结束；两链路诊断模式下，只要有合格产物可将总体 `outcome` 汇总为 `downloaded`，但必须同时显示另一链路的失败与覆盖缺口。无合格产物时，相关已执行链路有 `blocked` 则汇总 `blocked`，否则有 `failed` 则为 `failed`，只有相关步骤均完成且无包才为 `not_found`。没有执行采集时总体 `outcome=null`。取消或进程重启中断不能变成无包结论。
+
+扫码阶段单独使用 `decoded / no_code / no_supported_url / invalid_image / limit_exceeded / timed_out / failed` 等输入状态，不占用下载结果四态。
+
+网页打包另设 `build_state=queued / building / built / failed / cancelled / interrupted`。`built` 仅表示本地构建、签名和结构验证通过，不能让原采集 `outcome` 变成 `downloaded`；生成包不参与 APK→IPA 回退或原包取得率统计。APK 的运行可用性另记 `runtime_validation=not_run / passed / failed`，不以编译成功代替网页运行验收。
+
+## 4. 架构与依赖
+
+```text
 src/fxfetch/
-  cli.py          # 命令行入口（fxfetch <url>）
+  cli.py                    # 离线预览、显式授权采集、serve
   core/
-    classify.py   # 链接形态识别（纯离线，不发请求）
-    session.py    # 统一会话：Cookie、UA 画像、出口一致性、逐跳记录
-    http_mode.py  # 静态模式：requests 逐跳，不执行 JS
-    browser.py    # 浏览器模式：CDP 驱动本机 Chrome
-    download.py   # 流式下载 + SHA-256 + 大小上限 + 文件名安全
-    guard.py      # SSRF / 实连 peer / 重定向判据（见 3.2）
-    manifest.py   # itms-services / manifest.plist / .mobileconfig 解析
-    evidence.py   # evidence.json 写出（逐跳、哈希、时间、状态）
-    challenge.py  # 挑战识别与自动通过（见 4.3）
-  gui/app.py      # Tkinter 窗口
-tests/
-  range/          # 本地防红靶场（见 7.1）
+    classify.py             # 纯离线 URL / 入口分类
+    qr.py                   # 受限进程图片验证、多码解码与来源记录
+    workflow.py             # APK 优先、回退、状态聚合
+    session.py              # UA、Cookie、会话与尝试边界
+    http_mode.py            # 固定目标 IP、逐跳 HTTP
+    browser.py              # Playwright 控制已安装 Chrome
+    cdp.py                  # 拦截、网络事件、流式取回与证据补充
+    guard.py                # URL / DNS / 连接 / 浏览器出口策略
+    download.py             # 限额流式写盘、类型和完整性检查
+    manifest.py             # plist / mobileconfig 解析
+    web_apk.py              # URL 命名、受控模板、构建与签名
+    evidence.py             # 版本化证据、哈希与原子写入
+    limits.py               # 集中上限
+  web/
+    app.py                  # 鉴权、图片、任务、进度、产物接口
+    jobs.py                 # SQLite 状态、持久队列、单采集 worker
+    static/                 # 随包 HTML / CSS / JavaScript
+templates/android-webview/  # 自有最小 Android 工程，无工具品牌植入
+tests/range/                # 合成本地页面、接口、下载和挑战
 ```
 
-### 3.1 与 fxapk 的关系
+后端 Python 3.11+；Web 为 FastAPI + Uvicorn + `python-multipart`，前端原生 HTML/CSS/JavaScript，不依赖在线 CDN。SQLite 负责任务、会话归属和幂等键，首版单进程 Web 服务加一个串行采集 worker，不引入 Redis/Celery 或多租户平台。
 
-- fxfetch **不** import fxapk 的私有模块。两边都要的 SSRF 判据在 fxapk 侧提升为公开 API 后由 fxfetch 调用；在它提升之前，fxfetch 的 `guard.py` 自带等价实现，并在注释里标明「与 fxapk `config/fetch.py` 同口径，改一处要同步」。
-- 分析调用只走子进程命令行：`fxapk analyze <file> --out <dir>`。不在进程内 import fxapk。
-- fxapk 侧的 `fetch-ipa` 命令是 CLI 用户的最小路径；fxfetch 是带浏览器与界面的完整路径。两者口径（状态四分、留证字段名）必须一致。
+HTTP 使用标准库 `http.client`、`socket`、`ssl` 实现经过测试的固定 IP 传输，保留 Host/SNI/证书校验，避免库内部再次解析地址。浏览器路线使用 Playwright Python 控制本机 Chrome，再用 CDP 补充所需证据；出站保护未验收前明确禁用。使用已安装 Chrome channel，不执行浏览器下载命令。选型依据与被排除方案见 RESEARCH。
 
-### 3.2 安全判据（`guard.py`，每一跳都要重跑）
+采集引擎只使用本机 Chrome，固定已验收的 Android/iPhone 访问配置，不引入指纹池、随机 UA、Canvas/WebGL 扰动或 Camoufox。不同任务隔离 Cookie/profile 以免串案，但隔离会话不宣称更换了设备指纹。Patchright 仅作为同一 Chrome 的兼容性对比候选，未经过取证拦截与下载限额回归前不替换基线；不得在目标挑战过程中偷偷切换驱动、UA 或重新打开入口。
 
-- URL 预解析：host 的**全部**解析地址都须是公网地址，任一落私有 / 回环 / 链路本地 / 保留 / 多播段即拒；IPv6 内嵌的 IPv4（v4-mapped / NAT64 / 6to4 / Teredo）一并按公网判。
-- 连接层：TCP 建连后、TLS 与 HTTP 发出**之前**校验实际 peer IP，堵 DNS rebinding。
-- 不隐式跟随重定向：逐跳显式发起，跳数上限 10。
-- 忽略环境代理与 `.netrc`，确保校验的是目标服务的实连 peer（需要专用出口时由操作者在系统网络层安排，不在程序内配代理）。
-- 浏览器模式下 Chrome 自己会跟随跳转，无法逐跳拦截 → 用 CDP 的 `Network.responseReceived` 取每个响应的 `remoteIPAddress` 与 `securityDetails` **事后**核验，发现非公网地址即中止会话并记录。两种模式的防护强度不同，必须在 `evidence.json` 里标明本次用的是哪种模式。
+二维码使用 `zxing-cpp` + Pillow；plist 使用标准库 `plistlib`；证书/CMS 相关功能按实际 API 选依赖并单独验证。不能因为安装 `cryptography` 就声称所有签名 mobileconfig 均可解析或签名可信。可选验证码 OCR 延后到独立 extra，不影响图片扫码。
 
-### 3.3 依赖
+依赖在 fxfetch 自身锁定。与 fxapk 重叠的依赖先核兼容范围；有冲突则隔离虚拟环境，用配置好的 fxapk 可执行文件调用，不强制同环境。Windows/Python 目标版本上的二进制 wheel、许可和打包兼容均需验证；不把调研时的主干提交当发布版本锁，也不默认拉编译工具链。
 
-- 必需：`requests`、`websocket-client`（CDP）、`cryptography`（CMS 解析 `.mobileconfig` / `embedded.mobileprovision`）。版本与 fxapk 的 `requirements.lock` 对齐。
-- **不用 Playwright / Selenium**：它们要下载自带浏览器二进制，与「用本机 Chrome、独立配置文件」的要求冲突，也把体积和供应链面放大。直接用 `--remote-debugging-port` 启动本机 Chrome + CDP over WebSocket。
-- 可选：`ddddocr`（本地离线字符验证码识别），进 `[ocr]` extra，缺失时自动降级为人工模式，不报错。
-- 打包：PyInstaller 单文件 exe，仅本地构建，不进 CI 产物。
+## 5. 下载核心与浏览器
 
-## 4. 分期
+### 5.1 入口、候选和会话
 
-一期一个 PR。**先做 P1**：它是其余各期的地基，且可完全离线验收。
+离线分类覆盖 APK/IPA 直链、普通页面、`itms-services`、plist、mobileconfig，以及范围外的商店链接。原始输入与实际请求 URL 分别保存。仅在授权后做 DNS 和目标请求。
 
-### 4.1 P1：CLI 核心（静态模式）
+已知文件入口走 HTTP；需要页面交互的入口优先从首次访问就在浏览器内完成。静态模式可以提取链接，但遇到 JS/API 依赖不能据静态无命中判无包。HTTP 升级到浏览器必须显式记录新尝试：可转移的 Cookie 保留 domain/path/expiry/secure 等语义，但不得声称恢复了原 JS 状态或单次令牌。不能保证连续性时停止并记录，不能偷偷重新消费入口。
 
+HTML、响应头、内联脚本、外链脚本与页面实际 API 响应都可能产生候选；支持无 `.apk` 后缀、相对 URL、编码后的 manifest URL、按钮生成和弹窗下载。字符串命中只是候选，不证明包存在。对多个 APK 候选先按明确下载动作及页面语义选择；仍有歧义则展示候选并等待选择，不任意批量下载。
+
+当前实现的候选继续采用独立 HTTP 子任务，记录父入口和所选候选，不继承 Cookie；每候选最多一次，父任务同时最多一个活动子任务，结束后可改选其他候选，最多 4 层且拒绝祖先循环。这不等同下文计划的原 Chrome 会话人工接续。旧结果缺少精确未决候选集时要求重新提交。
+
+允许正常页面链路触发的必要脚本、资源、下载元数据请求和跳转，全部进入守卫与预算；不主动枚举目录、猜接口或抓全站。不得提交账号、支付、注册、聊天等业务数据，也不得上传设备标识。疑似业务页面按实际观察记录，不能硬套分发站成功流程。
+
+Android 与 iPhone 使用独立 Cookie/存储上下文；同一链路保持相同出口和会话。iPhone UA 的 Chromium 仍是 Chromium，不等同真实 Safari；证据记录 engine、版本、UA、viewport、触摸等模拟参数及限制。
+
+### 5.2 每一跳的防护
+
+- 解析 URL 时拒绝 userinfo、异常主机/端口和非允许协议。授权后检查解析结果，任一私有、回环、链路本地、保留、多播或不可确认公网地址均拒绝；IPv4 嵌入 IPv6 等边界有合成用例。
+- HTTP 连接绑定已验证 IP，保留原主机 Host/SNI 与证书主机名校验；在允许的公网目标上建连后、TLS/HTTP 数据发出前复核 peer。不让库再独立解析一次并随意选址。
+- 显式处理每一跳重定向，重新校验目的地址；跨主机不转发 Authorization 等敏感头，Cookie 按标准域/路径规则发送。忽略环境代理与 `.netrc`；TLS 校验失败不得关闭验证重试。
+- 浏览器在首次导航前安装 CDP Fetch 拦截与事件记录，覆盖跳转及子资源；`remoteIPAddress` 的响应后检查仅是证据，不能防止已经发生的内网请求。
+- **浏览器主动采集的放行条件**：在 Windows 目标环境完成可验证的网络出口隔离/固定目标连接方案，证明内网目的地在连接前被拒绝，并覆盖 Chrome 的其他出口及代理行为。仅 URL 路由、预查 DNS、事后 IP 检查不算通过；未通过时浏览器模式报 `browser_guard_unavailable`，不悄悄降级防护。
+- 该连接方案在 P0 做技术验证，不自动改全机防火墙、安装根证书或代理池。受控出口用于防护而非轮换 IP；若不能保留目标连接/证书可验证的来源，相关证据写不可用，不能拿出口代理 IP 冒充目标 IP。
+- 首版关闭 Service Worker 并记录这一干预；影响下载时标覆盖不足。frame、OOPIF、popup、worker 等实际覆盖范围逐项记录，未覆盖目标不能宣称完整。CDP 调试接口只对本机开放。
+
+### 5.3 下载和文件校验
+
+HTTP 流式落盘并增量计算 SHA-256；同时检查声明长度、实际接收字节、传输结束状态和限额。浏览器中的包必须在原会话取回，不另起裸请求重放带时效的下载链接。
+
+浏览器下载先验证 CDP 响应头阶段接管流、顺序读取及结束/取消路径；`Fetch.takeResponseBodyAsStream` 接管后不能原样继续请求，不能同时让 Chrome 再完成同一份下载。若采用原生 download 事件与 `save_as`，必须另有有效的硬磁盘/字节上限，不能下载完成后才检查大小。支持范围要分别验证普通附件、无后缀、内联包、未知长度；blob 等尚未验收路径记录 `candidate_unretrieved`，不能记无包。
+
+包默认最大 512 MiB。截断、取消、磁盘不足或长度错误保留有界部分、原因与部分哈希，写入 `partial/`，不能出现在成功包下载列表。最终文件使用内容哈希与判定扩展名，不使用远端文件名。
+
+ZIP 魔数不足以判包：在压缩大小、条目数、目录大小及有界读取预算内检查 APK 的 `AndroidManifest.xml`、IPA 的 `Payload/*.app/Info.plist` 等结构；避免解压到目录，拒绝损坏、多义或超预算结构。仅结构检查不代表包可安装、签名有效或来源可信。扩展名/MIME 与结构冲突留痕；Android 链路收到 IPA 不能算找到 APK。
+
+manifest 保存原文和哈希，解析 `software-package` URL 与应用元数据；mobileconfig 只保存和有界解析，不安装、不提交 UDID。签名 CMS 解析与签名验证分开标状态；解析器不支持时保留原文并报具体失败，不将其当成没有包。
+
+### 5.4 挑战与人工处理
+
+2026-10-29 后续增量：除文件锚点外，用户授权继续追踪已下发脚本中的明确内容页地址。当前实现对内联 JavaScript 静态识别 `fetch('…html')` / `fetch('…htm')` 的字面量 GET；选项仅接受字面量 GET 方法和 `Accept: text/html`，动态表达式、其他请求方法及业务数据不重放。首次仅在已观察到验证阻挡时启用，随后允许继续这条内容链；文件锚点优先，多地址要求选择，循环停止，共享原有四次交互、请求与 600 秒期限。单脚本 256 KiB、合计 1 MiB、最多 32 段；外部脚本和动态拼接不属于本次实现。
+
+先支持页面自行完成的 JS/Cookie 跳转和明确「继续/下载」操作。字符/滑块自动处理属后续增强：每个挑战最多 3 次、任务总计最多 10 次，超限转人工或 `blocked`，不得循环重试或扩展扫描。
+
+2026-10-29 用户追加授权：页面仍显示验证码或设备拒绝，但已在真实 DOM 锚点下发明确 APK/IPA 地址时，可以提取并在原 Chrome 会话中正常访问该文件链接。只使用当前链对应的文件类型，多地址仍需选择；不猜地址、签名或接口，不直接调用被门禁保护的页面函数。页面验证观察与文件获取分别记录，取得完整包不表示验证码、设备验证或硬件证明已经通过。没有已下发链接，或文件地址本身继续拒绝时，仍保留 `blocked`，不自动推断无 APK。
+
+需要人工兜底的任务从一开始就在后端以可见 Chrome 运行，使用隔离配置和原进程。等待人工时保留页面、Cookie、JS 与网络会话；不能承诺把 headless 重启为 headed 就可无损续接。非交互运行遇到需人工挑战且没有上述可尝试的明确文件链接，保存状态并结束为 `blocked`。
+
+介入记录时间、所处步骤、前后 URL 和继续/取消动作；网页显示等待原因。人工等待预算到期有明确结果，取消时停止正在进行的请求并封存部分证据。
+
+### 5.5 防红页面到实际下载请求
+
+把「防红」按实际机制处理：HTTP/JS 跳转、Cookie 挑战、设备分流、需点击的中转页、验证码和访问控制不能用一套成功判据概括。先保持 Chrome 会话完成正常页面流程，再追踪实际下载动作；挑战标题消失、Cookie 出现、HTTP 200 或停留在某个 URL 都不等于已找到包。
+
+从首个导航开始关联主框架、iframe、popup、下载事件、响应头、脚本/API 候选和最终字节。结果保留 `entry_url`、`landing_url`、`download_request_url`、方法、来源事件、必要请求条件及文件 SHA-256。只有同一次会话实际收到并校验 APK/IPA，才把对应地址标为 `verified_download`；仅从 JS/DOM 提取的地址仍是候选。
+
+最终地址可能有短时令牌、Cookie/Referer 条件或 POST 参数。记录 `requires_session=true / false / unknown`、已观察到的有效期和未知项，不为测试“永久直链”额外重放单次令牌。网页的文件下载按钮提供后端已保存文件，不把仅在服务器会话内有效的 URL 冒充任何设备都能直接下载的链接。
+
+反向代理后的源站可能不可见；实际响应地址、连接端点与真实源站分别表述。blob 下载可能没有可独立复用的 HTTP 下载地址，按实际来源记录。GitHub 项目的自动化兼容声明不保证通过所有防红，真实样本通过率须在后续授权验收中单列。
+
+## 6. 局域网服务合同
+
+当前 CLI 命令（完整用法见 README，服务先执行 `init` 设置本地口令）：
+
+```text
+fxfetch <url> --out <dir> [--authorized-active]
+fxfetch serve --host <本机局域网IP> --port 8765 --out <服务端输出根目录>
 ```
-fxfetch <url> --out <dir> [--authorized-active] [--ua android|ios|both] [--max-bytes N] [--timeout S]
-```
 
-- 默认零流量：只打印形态判定、将访问的主机与解析到的 IP、计划步骤。
-- 形态识别（`classify.py`，纯离线）：直链 `.apk` / `.ipa`；`itms-services://?action=download-manifest&url=`；`.plist`；`.mobileconfig`；App Store / TestFlight（识别后**只记录不访问**）；其余按落地页处理。
-- 静态模式逐跳：`--ua both` 时 Android 与 iPhone 各走一遍同一入口，**两条链路分别留档、不合并**——同一 URL 在不同 UA 下返回不同内容本身就是证据。
-- 落地页抽取：从 HTML 与响应头里抽下载候选（`a[href]`、`meta refresh`、`Location`、内联 JS 里的字符串字面量中的 `.apk` / `.ipa` / `itms-services` / `.mobileconfig`）。抽到的候选不自动下载完事，要全部列进证据。
-- `manifest.plist`：取 `assets[]` 中 `kind=software-package` 的 `url`，连同 `bundle-identifier`、`bundle-version`、`title` 一并留档，原文存盘并记哈希。
-- `.mobileconfig`：只保存与解析（`PayloadOrganization`、`PayloadIdentifier`、`PayloadDisplayName`、签名证书主体与指纹、`PayloadContent` 内的 URL）。**不**据其向任何地址提交设备标识。
-- 下载（`download.py`）：
-  - 流式写盘，边写边算 SHA-256，不整包进内存；
-  - `Content-Length` 预检 + 实际字节数双重判长，不一致要记录；
-  - 默认上限 512 MiB，超限即中断、保留已落盘部分并标 `truncated`，**不**标 `downloaded`；
-  - 落盘文件名用 `sha256` + 判定出的扩展名，**不**用 URL 或 manifest 给的文件名（对手可控：路径穿越、Windows 保留名 `CON`/`NUL`/`AUX`、超长路径都走这条进来）；
-  - 真实类型按文件头判（ZIP 魔数 + 内部结构：含 `AndroidManifest.xml` → apk，含 `Payload/*.app/` → ipa），与扩展名不符要记录。
-- `evidence.json`（`evidence.py`）：
-  - `run`：工具版本、UTC 开始/结束时间、模式（http / browser）、UA 画像、本次是否授权；
-  - `hops[]`：序号、链路标识（android / ios）、请求 URL、方法、UA、状态码、`Location`、响应头（有界）、**实连 peer IP**、TLS 证书指纹与有效期与 SAN、响应体哈希与大小、是否截断；
-  - `artifacts[]`：落盘文件、sha256、大小、判定类型、来源 hop;
-  - `outcome`：`downloaded` / `not_found` / `blocked` / `failed`（四分，见 AGENTS §3），附判定依据。
-- 原始入口 URL **原样保存**（含全部查询参数）。前置层的入口参数往往是加密载荷，将来取得服务端密钥即可离线复原路由，是独立于页面内容的证据。
+CLI 默认仅离线分类和展示主机/步骤，**不解析 DNS、不发 HTTP**。Web 默认绑定 `127.0.0.1`，局域网使用时显式绑定本机 LAN 地址，打印访问地址；不自动改防火墙或发布公网服务。
 
-### 4.2 P2：窗口程序
+| 接口 | 行为与约束 |
+| --- | --- |
+| `POST /api/qr-images` | 鉴权后有界上传、离线解码，返回 image ID、输入状态和候选；无目标网络请求 |
+| `POST /api/jobs` | 接收 URL，或所属会话 image ID + candidate ID（及可选编辑值）；点击下载代表本次授权，返回 job ID |
+| `GET /api/jobs/{id}` | 读取状态/进度；不会重试或访问目标 |
+| `POST /api/jobs/{id}/selection` | 仅对已暂停的包候选选择继续，不扩大任务范围；重复提交不重复下载 |
+| `POST /api/jobs/{id}/cancel` | 幂等取消排队/运行/等待任务，保留已有证据 |
+| `POST /api/jobs/{id}/web-apk-builds` | 仅由「打包 APK」提交；校验所属会话、无原包、当前网页候选 ID；后端按网址生成名称/包名，返回 build ID |
+| `GET /api/jobs/{id}/web-apk-builds/{build_id}` | 构建状态、失败原因、签名核验结果和生成产物 ID；不触发采集 |
+| `POST /api/jobs/{id}/web-apk-builds/{build_id}/cancel` | 幂等取消构建进程树，不发布未完成 APK |
+| `GET /api/jobs/{id}/artifacts/{artifact_id}` | 只读已登记产物，校验会话归属和实际路径；无任意文件路径参数 |
 
-- Tkinter 单窗口：URL 输入框、设备身份选择（Android / iPhone / 两者都要）、输出目录、「下载」按钮、日志区、结果区。
-- 点「下载」=本次授权，程序即在后台线程跑完整流程；UI 不卡死，实时刷新每一跳。
-- 结果区按链路分组展示：形态判定、每一跳、产物哈希、`outcome`。可一键打开输出目录、一键复制 `evidence.json` 路径。
-- 可选「下载后分析」勾选框：勾上则在产物就绪后调 `fxapk analyze`，输出目录与下载同级。失败只提示，不影响已取得的证据。
-- 不做：剪贴板自动监听、启动时预取、历史链接自动重试——任何不经点击就发请求的路径都违反 AGENTS §1。
+任务创建使用会话内持久幂等键及请求内容哈希；相同键相同内容返回原任务，不同内容返回冲突。按最新要求，前端刷新清空当前会话记录和输入；服务重启将遗留运行任务标 `interrupted`，不会自动重新消费链接。候选选择使用 `awaiting_selection`，不与人工验证码混淆。
 
-### 4.3 P3：浏览器模式与自动过挑战
+单采集 worker 串行执行，默认待执行队列最多 20 个。采集/解码/分析不能阻塞 ASGI 事件循环；SQLite 记录状态，文件由任务专属目录原子写入。分析另有超时和进度，失败不修改下载成功事实。
 
-- 启动本机 Chrome：独立 `--user-data-dir`（放输出目录下，与操作者日常浏览器完全隔离，避免把个人 Cookie 带进嫌疑站点）、`--remote-debugging-port`、默认 `--headless=new`。
-- 用 CDP `Emulation.setUserAgentOverride` + `setDeviceMetricsOverride` + `setTouchEmulation` 模拟移动端：UA 字符串与 `navigator.userAgent`、屏幕尺寸、触摸能力必须一致，只改请求头会被页面 JS 识破。
-- 监听 `Network.*` 事件，**覆盖全部 frame**（下载地址常出现在子框架里），按 `classify.py` 的同一套判据识别下载候选。
-- 取回在同一浏览器会话内进行（带上 Cookie，保持与挑战时相同的出口），不另起裸 `requests` 请求——会话一换，IP 绑定的凭据即失效。
-- 挑战处理（`challenge.py`）：
-  1. 纯 JS 挑战（算 Cookie、自动跳转）：浏览器自己执行，等待即可；
-  2. 「继续访问」类按钮：按选择器与可见文本匹配点击；
-  3. 滑块：按轨迹拖动；
-  4. 字符验证码：装了 `[ocr]` extra 时本地识别并填入。
-  每个挑战**至多 3 次**，全局挑战预算 10 次；超限即停，`outcome=blocked` 并记录卡在哪一步（截图 + DOM 快照一并留档）。不爆破、不绕过风控本身。
-- 静态模式判定为挑战页时自动升级到浏览器模式；两种模式的尝试都要留档。
+所有图片、任务、日志和产物接口鉴权。访问凭据在后端配置，不写 URL 或前端源码；建立短期 HttpOnly、SameSite 会话，写操作校验 Origin/CSRF，校验 Host，默认无跨域开放。会话失效后重新登录不得自动赋予其他会话任务权限；首版不承诺跨设备共享任务。普通 LAN HTTP 不提供链路加密，HTTPS 部署时启用 Secure cookie。
 
-### 4.4 P4：人工兜底
+页面只展示受控缩略图和纯文本目标内容，不嵌入目标 HTML、脚本或活动链接。原始图片/包作为附件下载，`nosniff`；所有路径由 ID 查表后限定在任务根内，拒绝越界、符号链接/重解析点穿透。输出根目录只能由服务端配置。
 
-- `--interactive` / GUI 勾选：自动过不去时把 Chrome 从 headless 切为可见窗口（重启浏览器但**保留** `user-data-dir`，Cookie 不丢），提示操作者手动完成挑战。
-- 操作者完成后程序自动继续：仍由 CDP 监听，识别到下载请求即接管下载与留证。
-- 人工介入必须在 `evidence.json` 里留痕（哪一步、何时、介入前后的 URL），不得让人工操作在证据里不可见。
+### 6.1 网页打包为普通 APK
 
-## 5. 上限（常量集中在 `core/limits.py`）
+**采用联网 WebView 加局部离线页面。** 默认加载完整所选网址；已取得的可见页面、可保存的图片与清理后的样式写入 APK，主框架网络失败或菜单选择时使用本地页面。没有可见内容的 JS 空壳不当成网站快照，此时提供普通离线入口及联网指引。默认服务配有实际应用于正文的本地字体，目标成品 10–30 MB，生成 APK 上限 30,000,000 字节；不填充无功能数据。字体、许可和离线资源共用 28 MiB 预算。局部快照不恢复服务器接口或登录后的内容。APK 使用 Android System WebView，与后端 Chrome 是不同会话，不能转移 Chrome 的防红通过状态。
 
-| 项 | 上限 | 理由 |
+| 项目 | 实施要求 |
+| --- | --- |
+| 按钮触发 | 下载任务结束且未取得原始 APK/IPA 时提供按钮；blocked/failed 仍保留原状态，操作者可选择封装未验证入口，但打包不表示解决了拦截 |
+| 网址选择 | HTTP/HTTPS 网页；优先已有可用落地页。已知 APK/IPA、plist、mobileconfig、商店链接和非法协议不可当网页封装 |
+| 可见外观 | 正常桌面图标、由网址生成的应用名、系统启动画面及 WebView 内容；使用无品牌通用图标。不加工具名、水印、Generated by、生成提示或额外取证页面 |
+| APK 内部 | 标准 Manifest、DEX、资源和运行配置；不植入额外来源标签、案件编号或取证清单；标准 applicationId、版本和签名仍保留 |
+| 包名与签名 | 按 §6.2 从域名生成合法 applicationId；使用本地受控签名，不冒用网站运营者证书。模板及签名属于正常构建元数据，不增加工具标识 |
+| 模板 | 自有 Java + Android WebView 最小工程，入口作为结构化配置传入，不用用户输入拼接源码、构建脚本或 shell 命令；不用混淆/加壳隐藏入口来妨碍正常解析 |
+| 页面能力 | 支持普通 JS、DOM storage、页面返回和正常 HTTP/HTTPS 导航；最小 INTERNET 权限。不加遥测、后台保活、设备采集或任意 JS→原生权限桥 |
+| 平台边界 | 保留 TLS 校验，证书错误取消；禁用 file/content 跨域文件访问。HTTP 入口仅对明确配置的域开放明文，混合内容不全局放开；不自动调用其他 App 协议 |
+| 会话边界 | 不将 Chrome Cookie、登录态、localStorage、私有 HAR 或请求头注入 APK。入口 URL 保留完整路径与参数，作为运行所需配置写入包内，不能为命名截短而更改它 |
+| 打包网络 | 构建只使用已选 URL、内置无品牌图标、本地模板和已取得的清理后离线文件；不额外访问目标、不抓 favicon、不重新采集网页。依赖和 SDK 在部署阶段准备并验证，运行期离线构建 |
+| 离线内容 | 授权采集链中，仅补取成功 HTML 明确同源引用的图片/样式；正常重定向仍逐跳公网检查。最多 20 个、单体 2 MiB、总量 16 MiB，不递归 CSS 或抓取脚本。去除表单、脚本、iframe、事件及远程活动链接；离线模式关闭 JS 与网络，包括 Service Worker。APK 只包含普通本地页面资源，不包含来源清单/私有头/Cookie；体积随实际内容变化 |
+
+采用已验收的 JDK 17、Android Platform 35、Build Tools 37.0.0 与自有模板；直接运行 aapt2、javac、D8、zipalign、apksigner，不需要 Gradle/AGP/Kotlin。服务端独立构建 worker（并发 1），执行 release 构建、对齐/签名、`apksigner verify` 和结构检查，最后算 SHA-256 并原子发布。签名密钥不进入仓库、APK 附件、任务证据或日志，不允许网页上传构建脚本、指定任意路径或覆盖密钥。
+
+模板输出关闭调试，保留原生必要元数据；依赖许可必须履行，不把第三方模板的版权/许可删除当作“无标识”方案。构建工具缺失或验证失败时给明确失败，不返回空壳文件假成功。不自动安装或运行生成包。
+
+首版打包失败不阻断原任务证据下载。构建 API 使用独立幂等键；同一键同一参数返回同一构建，不因轮询、刷新或双击重复签名/生成包。
+
+### 6.2 按网址命名
+
+- 从选定 URL 的主机名命名，不把路径、查询参数、端口或片段拼进文件名。APK 内打开的 URL 原样保留完整信息。
+- 域名公共后缀（如 `.com`、`.com.cn`）保留；其余域名标签各取前 **5 个字符**，短标签如 `m` 保持不变。公共后缀使用随包的离线规则，不为命名发网络查询。
+- 下载文件名为截短主机名加 `.apk`，应用显示名为截短主机名，不加工具名、日期、Generated 或取证字样。
+- 包名按截短域名标签倒序生成，小写并转换成 Android 合法字符；标签以数字开头则补 `a`。用于保证合法性的前缀不计入原域名的 5 字符取值。
+- 同一完整主机名保持包名/签名稳定，重新打包递增版本号；不同完整主机名截短碰撞时，包名增加由完整主机名派生的稳定短哈希标签，避免相互覆盖。文件仍按用户指定名称下载，后端用 build ID/内容哈希隔离存储。
+- 国际化域名须有明确显示名与 IDNA 转换规则，非法 Windows 文件字符与保留名需处理；IP 主机单独生成合法名称，不按域名公共后缀推断。均纳入合成用例。
+
+| 命名示例（不作访问目标） | APK 文件名 | Android 包名示例 |
 | --- | --- | --- |
-| 下载总字节 | 512 MiB（`--max-bytes` 可调） | IPA 实际体量 |
-| 单个页面响应体 | 8 MiB | 页面不该这么大；超限只留哈希与前段 |
-| 重定向跳数 | 10 | 跳转环 |
-| 单链路墙钟 | 600 s | 慢速响应拖死进程 |
-| 单挑战尝试 | 3 次；全局 10 次 | 避免变成爆破 |
-| plist / CMS 解析输入 | 16 MiB，嵌套深度 64 | `plistlib` 无内建深度限制 |
-| 落地页抽取候选数 | 200 | 候选炸弹 |
-| CDP 事件缓存 | 20000 条 | 事件洪水 |
+| `m.123456789.com` | `m.12345.com.apk` | `com.a12345.m` |
+| `download.longdomain.com.cn` | `downl.longd.com.cn.apk` | `cn.com.longd.downl` |
 
-被上限挡下的一律**计数并写进证据**，不得静默跳过。
+打包输出清单只能有 APK。构建过程中需要的临时工程、密钥与服务内部数据库是运行设施，不作为额外交付文件。
 
-## 6. 不做（不要再提）
+## 7. 证据与 fxapk 对接
 
-- **Chrome 插件形态**：拿不到服务器 TLS 证书指纹、做不了实连 IP 校验、读不到下载后的文件算哈希、改不了页面 JS 可见的 `navigator.userAgent`（除非挂 `chrome.debugger`，浏览器会常驻「正在调试」提示条）、Windows 版 Chrome 还打不开 `itms-services://`。取证留痕上是硬伤。已有的 LiteDownload 插件后续只加一个「把当前页面链接发给 fxfetch」的按钮即可，不在插件里重做下载与留证。
-- **伪造设备 UDID 换超级签包**：主动欺骗嫌疑服务器、会在对方开发者账号登记假设备、可能打草惊蛇。
-- **内置代理池 / 自动换 IP**：会话凭据与出口 IP 绑定，换 IP 等于主动作废会话；出口选择属于操作者的网络安排，不由程序代劳。
-- **把 App Store / TestFlight 链接也去抓包**：显式排除，只记录链接本身。
+### 7.1 任务目录和字段
 
-## 7. 验收
-
-### 7.1 本地防红靶场（`tests/range/`）
-
-用 `http.server` / `wsgiref` 写一个**自带**的仿真服务，复刻前置过滤层的常见形态，全部用合成值（域名用 `*.synthetic.test`，地址用保留段，令牌用固定假串）：
-
-- `/?token=<串>` → 302 到换凭据路径 → 下发与客户端 IP 绑定的 Cookie → 回落地页；
-- UA 分流：移动端 UA 给真页，桌面 UA 给空壳 + 错误码；
-- 三种挑战页：纯 JS 跳转、「继续访问」按钮、固定字符验证码；
-- 过关后反向代理到「源站」路径提供一个合成 APK / IPA；
-- 失败分支：过期 token、验证码错、直接访问下载路径（无 Cookie）。
-
-### 7.2 必测用例
-
-形态识别（每种一例）/ 静态模式逐跳与 Cookie 保持 / UA 分流下两条链路分别留档且不合并 / manifest.plist 与 .mobileconfig 解析 / 下载上限与截断不标 `downloaded` / SHA-256 与文件头判型 / 路径穿越与 Windows 保留名文件名被拒 / SSRF 预解析与实连 peer 校验与 DNS rebinding（靶场提供解析到保留段的 host）/ 重定向跳数上限 / 挑战自动通过三类各一例 / 挑战超限后 `outcome=blocked` 且不是 `not_found` / 默认零流量（不带 `--authorized-active` 时靶场**收到 0 个请求**，用计数断言）/ 人工介入在证据里留痕。
-
-### 7.3 每期验收命令
-
-```bash
-python -m ruff check src tests
-python -m pyright src
-python -m pytest -q
+```text
+<output>/<job_id>/
+  source/           # 原始输入、所选原图、二维码识别和编辑记录
+  web/              # 有界 HTML / JS / HAR / 响应体及采集元数据
+  artifacts/        # 完整、校验通过的 APK / IPA / 描述文件
+  generated/        # 打包操作唯一交付物：APK
+  partial/          # 失败或截断字节，禁止混入成功包
+  analysis/         # 独立的可选 fxapk 输出
+  diagnostics/      # 本机诊断；常规日志不含 Cookie/完整令牌
+  evidence.json     # 版本化索引、状态、来源和覆盖
 ```
 
-PR 描述必须分开写：**已实测验收 / 仅实现未验收 / 未实现**。没在靶场上跑过的能力不写「已完成」；真实链接上的通过率在拿到真实样本验证前一律不作承诺。
+Chrome profile 放在任务内独立 `runtime/` 目录，不作为网页分析输入，也不由产物接口公开。该目录计入任务磁盘预算。原始证据默认留在私有输出根，仓库、测试、CI 与提交中只用合成值。
+
+| 字段组 | 必须保留的内容 |
+| --- | --- |
+| `schema_version / run` | 工具与依赖版本、UTC 时间、授权动作、策略、配置上限、干预措施；没有单一 mode 掩盖多次尝试 |
+| `input` | 类型（manual_url / qr_image / edited_qr）、原始入口、实际入口、图片及候选来源关系 |
+| `chains[].attempts[]` | UA/引擎、模式、开始结束、outcome、reason_code、coverage、缺失项、人工介入和父尝试 |
+| `hops[]` | chain/attempt/session/request 标识，原始及请求 URL、方法、状态、Location、受限响应头、时间、连接与 TLS 证据来源 |
+| `bodies[]` | 保存路径、大小、SHA-256、哈希覆盖范围（wire / decoded / saved_prefix）、截断和不可用原因 |
+| `candidates[] / artifacts[]` | 候选出处、选取依据、未取回原因；产物类型、SHA-256、大小、完整性、来源 hop 与输入关联 |
+| `summary` | 各链路与总体结果、策略跳过、分析结果；不能覆盖掉失败或 partial |
+
+打包不新增外部证据清单或网页证据导出任务。服务内部 SQLite 只保留必要的构建状态、所选 URL、名称/包名映射、产物哈希与来源类型，用于进度、幂等和防止误将生成包计为下载原包；不将这些记录植入 APK。原下载任务已经有的记录按原流程保存，打包按钮只交付 APK。
+
+重定向由 `requestWillBeSent.redirectResponse` 等实际事件串联，不只监听 `responseReceived`。响应头、证书和 IP 字段可能缺失，按观察来源记录，不补造。CDP `securityDetails` 不直接提供证书 DER 指纹；取得可关联到目标连接的 DER 后才算 SHA-256，否则标 `unavailable`。不额外连一次 TLS 然后冒充原请求证书。
+
+CDN/边缘节点、证书 SAN、CNAME 或脚本出现的其他域名只是观察与候选，不证明源站、经营者或归属。网络请求数为零、只得到 302/403、响应已保存均不等于完成下载链路。
+
+### 7.2 复用 fxapk 的实际能力
+
+| 能力 | 对接方式与范围 |
+| --- | --- |
+| APK 静态分析 | 用户勾选后，以子进程运行 `fxapk analyze <apk> --offline --out <analysis_apk_dir>`；显式离线，不使用默认在线路径 |
+| 已存网页分析 | 单独的可选步骤，调用 `fxapk analyze-web <web_dir> --offline --out <analysis_web_dir>`；只传整理后的本地 web 材料，输入输出及两类分析输出不混目录 |
+| `capture-web` | 借鉴固定 IP、TLS 校验和有界保存的判据；其 HTTP GET 采集不执行 JS，不能替代浏览器下载 |
+| REA / `supplement-web` | 对合规的独立观察 bundle 走专用导入；不把原始 bundle 当任意 analyze-web 目录，也不把网页候选升格为 APK 动态证据 |
+| IPA | 首版保存、类型检查和来源留证；本次未验证 fxapk 的 IPA 分析或 `fetch-ipa` 合同，不把它们列为依赖 |
+
+不导入 fxapk 私有模块，不修改 `E:\fxapk` 或原始案件材料。公共 API 真正发布且验证后再考虑复用。fxapk 能力探测缺失时标 unavailable，已下载的包与证据仍可交付。
+
+### 7.3 生成包的解析能力与质量
+
+生成的标准 APK 可执行 `fxapk analyze <generated_apk> --offline --out <analysis_wrapper_dir>`。当前源码可提取 Manifest、包/权限信息、DEX/资源中的 URL 及 WebView 相关信号；入口写入常规资源或配置，保持可读，不人为制造“难解析”。但新包的代码、签名和模板属于本工具生成内容，不是目标站原生 APK 的证据。
+
+**只解析联网封装 APK，不能等价于解析完整网页证据。** 外链 JS、API 响应、历史跳转与 HAR 不会因一个 URL 被封装就进入 APK。当前 fxapk 的 `web_inline_config`、`web_redirect_chain`、`web_request_recipe`、`web_har` 要求 `web` 平台，在 Android APK 路线会跳过；即使机械塞入 HTML，也不能自动当成 `analyze-web` 的完整替代。
+
+因此打包验收只承诺标准 APK 可被解析、入口及应用结构可提取，不承诺与完整网页材料相同的分析深度。打包按钮不自动启动双路分析，不要求操作者附带 HTML/JS/HAR，不将网页证据塞进 APK 增加所谓解析质量。后续用户如单独选择网页分析，继续使用 §7.2 的既有功能，与单文件打包交付分开。
+
+没有采集到的网页、被拦截内容或服务端代码仍不可得。安装后的 WebView 运行需要单独验证，不能把 Chrome 的观察标成 APK 实测。服务内部知道该包来自构建时，应按此事实解释分析；不把共用模板、签名或 SDK 误归因给目标运营者，不自动混入原始样本家族语料。裸 APK 交给 fxapk 时按普通 APK 分析，能力取决于包内实际材料。
+
+## 8. 集中预算
+
+| 项目 | 默认上限 / 行为 |
+| --- | --- |
+| 单包 | 512 MiB；超限保留有界部分，结果 failed |
+| 页面/脚本/接口响应体 | 普通 HTML/接口每体 8 MiB，已识别 Flutter 启动脚本 256 KiB、主脚本 64 MiB（64 KiB 分块处理），任务累计正文 128 MiB；前段哈希标 saved_prefix，部分体不产出完整候选 |
+| 请求与重定向 | 每链路 300 请求，每条跳转链 10 跳；超限记录覆盖不足 |
+| 采集时间 | 网页采集任务整体执行最多 600 秒，所有链路共享，不因跳转重置；排队另限 600 秒；连接/读等待分别有超时。生产任务使用可终止进程；计划中的人工等待另限 15 分钟，当前尚未启用 |
+| 候选、事件 | 每链路 200 候选、20000 CDP 事件；达到上限不得静默丢失 |
+| plist/CMS | 输入 16 MiB、深度 64、受限进程；解析失败保留原文 |
+| ZIP 结构检查 | 最多 100000 条目、中央目录 32 MiB、有界读取元数据累计 8 MiB，不展开压缩内容到目录 |
+| 图片/队列 | 见 §2；1 个采集 worker，20 个排队任务，解码也限并发 |
+| 任务磁盘 | 预检可用空间，默认任务根 2 GiB 硬限额（含临时下载、profile、日志）；超限停止并封存 |
+| APK 构建 | 独立 scratch 根每次 8 GiB 软预算（空间预检/巡检超限取消，允许采样间超出）、Job Object 进程树内存 2 GiB、整体执行 15 分钟、并发 1、排队 10 且等待最多 15 分钟；生成 APK 最大 30,000,000 字节 |
+
+配置均有允许范围，网页不能任意取消上限。任务硬限额和浏览器临时磁盘限制的实现必须在 Windows 验收；仅最终文件大小检查不算硬限额。
+
+构建 scratch 与任务证据根分开计额；成功 APK 移入任务后仍计入任务根预算。清理只针对已核绝对路径位于 scratch 根内的本次构建目录，不删除原网页或原包证据。
+
+实现复核将固定自有模板的构建 scratch 定义为软预算，不能冒称文件系统硬 quota；不接受外部构建脚本。HTTP 与本地资源保存通过每次写入预算和元数据预留控制任务总量。Chrome 的 profile/下载硬限额及连接前出站保护仍是启用门槛，当前未通过而保持禁用。
+
+## 9. 分期与验收
+
+每期交付可运行增量和验收记录；是否 commit、push、PR 由操作者另行指示。暂未具备某能力就明确禁用，不用假成功填充界面。
+
+| 期次 | 交付 | 放行条件 |
+| --- | --- | --- |
+| P0 技术验证 | Windows 依赖/wheel、已装 Chrome、连接防护与流式下载、二维码、Android 工具链和最小模板 | 完全使用本地合成输入；浏览器防护未通过不可开启主动浏览器模式；生成 APK 经离线签名/结构核验 |
+| P1 核心 | 状态与证据 schema、离线预览、HTTP 下载、APK/IPA 策略、manifest、图片解码模块 | HTTP/扫码/策略/限额单元与本地集成用例通过；不提前声称动态落地页已支持 |
+| P2 浏览器 | Chrome 固定配置、JS/API/按钮/跳转/弹窗、实际下载请求、基础挑战与同进程人工处理 | 防护、会话连续性、下载硬限额和观察覆盖通过；不将挑战消失当取得包 |
+| P3 局域网网页版 | URL/二维码、候选选择、任务/进度/取消/下载、鉴权、fxapk 离线对接 | 浏览器端到端测试 + 第二台局域网设备验收 |
+| P4 网页 APK | 「打包 APK」按钮、联网 WebView 模板、域名命名、受限构建/签名 | 仅输出一个 APK、域名 5 字符规则、无工具标识、普通 APK 解析、构建幂等和失败处理通过；P1–P4 构成首个完整版本 |
+| P5 可选增强 | 有限验证码 OCR、Chrome 驱动对比、更多下载机制、Windows 服务打包 | 逐项补用例；服务打包包含驱动、扫码库及静态资源，不包含私有签名密钥 |
+
+### 9.1 合成场景矩阵
+
+本地 handoff 材料仅用于归纳下面的失败形态，不复制域名、令牌、页面、图片或案件身份。测试服务由项目自建，使用合成 APK/IPA、二维码和 `*.synthetic.test`。测试专用传输注入映射到回环，仅限测试代码；生产不能存在「关闭公网检查」开关。
+
+| 类别 | 必测场景与断言 |
+| --- | --- |
+| 授权 | CLI 预览、输入 URL、上传/识别 QR、轮询：目标 DNS/TCP/HTTP 计数均为 0；提交一次才采集 |
+| APK 优先 | 两平台均有包只取 APK；Android 完整无包才取 IPA；blocked/failed/partial 不回退；仅 IPA 入口正确分流 |
+| 动态候选 | 外链脚本从 API 字段生成无后缀地址；空字段、500、错误 JSON、`/undefined` 均不误报无 APK；同源/跨源必要脚本有来源链 |
+| 挑战与页面 | 302→403 只代表保存响应；Cookie 与出口绑定、过期令牌、JS 跳转、明确继续按钮；业务/login 页不能操作成下载流程 |
+| 会话与覆盖 | Android/iPhone 隔离；popup/iframe/OOPIF 捕获；Service Worker 被关导致影响要 partial；同进程人工继续，不能重复消费单次入口 |
+| 下载 | Content-Disposition、无后缀、分块无长度、长度矛盾、断流、错 MIME、假 ZIP、两义 ZIP、损坏目录、超限和磁盘不足；未完成文件不得 downloaded |
+| QR 正常 | PNG/JPEG/WebP、旋转、反色、压缩截图、一图多码、重复码、含参数 URL、itms-services、编辑后来源一致；只选所选码 |
+| QR 异常 | 无码、纯文字码、二进制码、非法协议、商店链接、伪图片、超字节/像素、动画、解码超时、超候选数；均不触发目标访问 |
+| 请求防护 | 私有/回环/特殊 IP、IPv6、DNS rebinding、跳转到内网、子资源/弹窗/worker 内网请求、跨主机凭据；内网端点 TCP/TLS/HTTP 计数为 0 |
+| Web | 鉴权/CSRF/Host、跨会话 image/job/artifact、双击与刷新幂等、重启中断、取消与候选选择、队列上限、路径/重解析点穿透、XSS 文本 |
+| 证据 | 跳转无漏记、部分体哈希口径、证书不可用不伪造、二维码→链路→产物可追溯、分析失败不改变下载事实 |
+| 防红结果 | 挑战通过但无包、假 HTTP 200、一次性地址、Cookie/Referer 依赖、最终响应地址与源站不同；只将实际验证的下载请求标 verified_download |
+| 固定配置 | 使用本机 Chrome、任务内 UA/设备配置不变；无随机指纹、代理轮换或自动切换浏览器；新任务不继承前案 Cookie |
+| 打包触发 | 没有原包才显示按钮；点击才构建；blocked/failed 可封装合法网页入口但状态不变；只有 IPA manifest 等非网页则不给无效封装 |
+| 打包成品 | 标准可安装 APK、签名核验、release 非调试、正确名称/图标/入口；无工具标识或生成标签，无额外取证资产、Cookie、HAR、密钥和宿主路径泄漏 |
+| 构建边界 | URL 中的命令与路径字符只作数据；越权、重复提交、取消、重启、超时、磁盘不足、工具链缺失；构建不发目标网络请求 |
+| APK 命名 | `m.123456789.com` 得到 `m.12345.com.apk`；数字标签生成合法包名；公共后缀、长子域、碰撞、国际化主机及文件保留名；不截短实际入口 URL |
+| APK 解析 | 普通离线 APK 路线提取入口、Manifest/WebView 结构；只有一个 APK 交付，无附带网页清单；不宣称裸 APK 能重建未保存网页 |
+
+纯 HTTP 防护测试与允许回环的功能靶场分开；浏览器出站负例必须检验连接前拒绝，不能用「没收到 HTTP」掩盖已经建立内网连接。真实网站通过率不能由合成用例推断。
+
+### 9.2 每期检查与最终交付
+
+实现后执行 `python -m ruff check src tests`、`python -m pyright src`、`python -m pytest -q`。Web 追加桌面和手机尺寸的端到端检查，图片上传/拖入/粘贴分别验收。真实局域网访问要用第二台设备验证；只有回环测试时如实写未完成 LAN 验收。
+
+完整版本应交付启动方式、配置说明、依赖锁、合成测试、证据 schema、限制清单及验收记录；每项分成「已实测」「仅实现」「未实现」。本任务书完成不代表程序、真实样本下载或局域网服务已经完成。

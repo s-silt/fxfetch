@@ -1,0 +1,112 @@
+name: fxfetch-android-docker
+services:
+  android-worker:
+    image: fxfetch-android-qemu:local
+    build:
+      context: ../..
+      dockerfile: deploy/android-docker/Dockerfile
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    devices:
+      - /dev/kvm:/dev/kvm:rw
+    # QEMU disk I/O uses host threads as well as the vCPU threads. A limit of
+    # 64 exhausted during baseline hashing and stalled the SSH control plane.
+    pids_limit: 256
+    mem_limit: 6g
+    memswap_limit: 6g
+    cpus: 2.0
+    stop_grace_period: 45s
+    # The sole host publication is the API. SSH/CDP/broker remain namespace-local.
+    ports:
+      - "127.0.0.1:18765:18765/tcp"
+    volumes:
+      - type: bind
+        source: ${FXFETCH_ANDROID_STATE:?Set the private independent QEMU state directory}
+        target: /state
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /run/fxfetch:size=4m,mode=0700,nosuid,nodev,noexec
+      - /tmp:size=16m,mode=1777,nosuid,nodev,noexec
+    networks:
+      private:
+        ipv4_address: 172.30.247.2
+    # An SSH banner means control reachability only, never a verified Android lease.
+    healthcheck:
+      test: [CMD, python, -c, "import socket; s=socket.create_connection(('127.0.0.1',12222),3); s.settimeout(3); assert s.recv(255).startswith(b'SSH-2.0-'); s.close()"]
+      interval: 15s
+      timeout: 4s
+      retries: 20
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "3"
+  api:
+    image: fxfetch-android-api:local
+    build:
+      context: ../..
+      dockerfile: deploy/android-docker/Dockerfile.api
+      target: browser
+    init: true
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 3g
+    memswap_limit: 3g
+    cpus: 2.0
+    stop_grace_period: 45s
+    network_mode: service:android-worker
+    depends_on:
+      android-worker:
+        condition: service_healthy
+    environment:
+      FXFETCH_ROOT: /var/lib/fxfetch
+      FXFETCH_PUBLIC_IP: 127.0.0.1
+      FXFETCH_PORT: "18765"
+      FXFETCH_CONTAINER_IP: 172.30.247.2
+      FXFETCH_CONTAINER_SUBNET: 172.30.247.0/28
+      FXFETCH_TRUSTED_PEERS: 172.30.247.1/32
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      all_proxy: ""
+      NO_PROXY: "*"
+      no_proxy: "*"
+    volumes:
+      - api-state:/var/lib/fxfetch
+      - type: bind
+        source: ${FXFETCH_ANDROID_CONFIG_DIR:?Set the private API worker configuration and SSH directory}
+        target: /run/fxfetch-worker
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=128m,mode=1777,noexec,nosuid,nodev
+    healthcheck:
+      test: [CMD, python, /opt/fxfetch/container_entrypoint.py, healthcheck]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "3"
+networks:
+  private:
+    ipam:
+      config:
+        - subnet: 172.30.247.0/28
+volumes:
+  api-state:

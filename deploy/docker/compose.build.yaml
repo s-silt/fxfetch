@@ -1,0 +1,12 @@
+# Apply only after provisioning Linux tools for this image's architecture.
+services:
+  api:
+    build:
+      target: builder
+    volumes:
+      - type: bind
+        source: ${FXFETCH_LINUX_SDK:?Set an absolute directory containing the Linux Android SDK}
+        target: /opt/android-sdk
+        read_only: true
+        bind:
+          create_host_path: false

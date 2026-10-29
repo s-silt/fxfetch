@@ -1,0 +1,63 @@
+name: fxfetch-portable
+services:
+  api:
+    image: fxfetch-portable:local
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: runtime
+      args:
+        PYTHON_IMAGE: ${FXFETCH_PYTHON_IMAGE:-python:3.12-slim-bookworm}
+    init: true
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 3g
+    memswap_limit: 3g
+    cpus: 2.0
+    stop_grace_period: 30s
+    environment:
+      FXFETCH_ROOT: /var/lib/fxfetch
+      FXFETCH_PUBLIC_IP: ${FXFETCH_PUBLIC_IP:-127.0.0.1}
+      FXFETCH_PORT: ${FXFETCH_PORT:-18765}
+      FXFETCH_CONTAINER_IP: ${FXFETCH_CONTAINER_IP:-172.30.246.2}
+      FXFETCH_CONTAINER_SUBNET: ${FXFETCH_CONTAINER_SUBNET:-172.30.246.0/28}
+      FXFETCH_TRUSTED_PEERS: ${FXFETCH_TRUSTED_PEERS:-172.30.246.1/32}
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      all_proxy: ""
+      NO_PROXY: "*"
+      no_proxy: "*"
+    ports:
+      - "${FXFETCH_PUBLIC_IP:-127.0.0.1}:${FXFETCH_PORT:-18765}:${FXFETCH_PORT:-18765}/tcp"
+    volumes:
+      - state:/var/lib/fxfetch
+    tmpfs:
+      - /tmp:size=128m,mode=1777,noexec,nosuid,nodev
+    networks:
+      private:
+        ipv4_address: ${FXFETCH_CONTAINER_IP:-172.30.246.2}
+    healthcheck:
+      test: [CMD, python, /opt/fxfetch/container_entrypoint.py, healthcheck]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "3"
+networks:
+  private:
+    ipam:
+      config:
+        - subnet: ${FXFETCH_CONTAINER_SUBNET:-172.30.246.0/28}
+volumes:
+  state:

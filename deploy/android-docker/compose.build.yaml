@@ -1,0 +1,20 @@
+# Optional: browser collection plus explicit local WebView APK builds.
+# Provide the Linux SDK and font paths; Windows executables are incompatible.
+services:
+  api:
+    image: fxfetch-android-api-builder:local
+    build:
+      target: builder
+    volumes:
+      - type: bind
+        source: ${FXFETCH_LINUX_SDK:?Set the pre-provisioned Linux Android SDK directory}
+        target: /opt/android-sdk
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${FXFETCH_FONTS:?Set the pre-provisioned font directory}
+        target: /opt/fonts
+        read_only: true
+        bind:
+          create_host_path: false
