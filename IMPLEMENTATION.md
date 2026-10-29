@@ -23,6 +23,15 @@
 - Ruff 通过；最终 Pyright 为 0 errors、0 warnings、0 informations；CRLF-aware diff 检查通过。存在一条既有 Starlette/httpx deprecation warning。
 - 真实 Chrome 合成子集 6 skipped（当前环境未找到已安装 Chrome，未自动下载）。模拟 CDP 不等于真实浏览器验收。没有访问真实站点、DNS、进行 UI/Android worker 测试或 fxapk 联调，也没有再次调用付费模型。
 
+### 后续 Codex 审查三项修复与本地验证（2026-10-29）
+
+- 浏览器网页模式按公开 CDP target ID 关联渲染后的验证码/设备拒绝快照；同 URL 的弹窗挑战仅记日志，不改变主页面结果。模拟浏览器回归分别验证干净 200 正文与渲染 DOM。
+- HTTP 网页采集延迟加载浏览器模块；新进程通过拒绝所有 Playwright 导入的导入钩子验证离线预览和本地合成 HTTP 采集。
+- 在构造 `ZipFile` 前独立有界解析 ZIP/标准 ZIP64 结束记录及中心目录：最多 2002 项、目录不超过 8 MiB，并检查期限、声明数量和目录边界；不解压正文。小型 ZIP64 有效包及超限/伪造计数等输入均有回归覆盖。
+- 定向浏览器、网页采集和任务归档测试：58 passed；Ruff 通过；Pyright 为 0 errors、0 warnings、0 informations。
+- 本轮唯一一次全量 pytest：953 passed、22 skipped、0 failed。跳过项为 5 个 Linux 浏览器网关、15 个需 PowerShell 的防火墙和 2 个 POSIX/Linux 进程限制测试。存在一条既有 Starlette/httpx deprecation warning。
+- 未访问真实站点或 DNS，未安装 Chrome，未运行应用服务器。详细输出保存在 `.runtime/review-task-evidence/fix-logs/codex-*.log`。
+
 ### 前一轮任务数据包重整的本地验证（2026-10-29，修复前历史）
 
 - 两个定向回归预检：2 passed，1 条既有 Starlette/httpx deprecation warning。

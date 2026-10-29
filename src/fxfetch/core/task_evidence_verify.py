@@ -18,6 +18,7 @@ from .task_evidence_schema import (
     strict_json,
     validate_task_manifest,
 )
+from .task_evidence_zip import preflight_task_zip
 from .web_evidence_io import check_ancestors, is_reparse
 from .web_evidence_schema import portable_path
 
@@ -36,6 +37,11 @@ def verify_task_archive(
     if path.stat().st_size > max_bytes:
         raise EvidenceError("task_evidence_archive_too_large")
     try:
+        preflight_task_zip(
+            path,
+            max_entries=MAX_TASK_FILES + 2,
+            deadline=deadline,
+        )
         with zipfile.ZipFile(path, "r") as bundle:
             infos = bundle.infolist()
             if not infos or len(infos) > MAX_TASK_FILES + 2:

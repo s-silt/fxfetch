@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
+import time
 import zipfile
 from pathlib import Path
 
 import pytest
 
 from fxfetch.cli import main
+from fxfetch.core import task_evidence_verify
 from fxfetch.core.task_evidence import finalize_package, package_filename
 from fxfetch.core.task_evidence_io import build_task_archive, verify_task_archive
 from fxfetch.core.task_evidence_recorder import TaskEvidenceRecorder
+from fxfetch.core.task_evidence_schema import MAX_TASK_FILES
+from fxfetch.core.task_evidence_zip import MAX_TASK_ZIP_DIRECTORY_BYTES
 from fxfetch.core.web_evidence_schema import EvidenceError
 
 
@@ -122,6 +127,62 @@ def _archive(
     return tmp_path / "data-package" / metadata["filename"]
 
 
+def _classic_eocd(raw: bytes) -> tuple[int, tuple[object, ...]]:
+    signature = b"PK\x05\x06"
+    for position in range(len(raw) - 22, -1, -1):
+        if raw[position : position + 4] != signature:
+            continue
+        values = struct.unpack_from("<4s4H2LH", raw, position)
+        if position + 22 + values[-1] == len(raw):
+            return position, values
+    raise AssertionError("synthetic archive has no EOCD")
+
+
+def _zip64_archive(raw: bytes, *, entries: int, sentinels: bool) -> bytes:
+    eocd_offset, values = _classic_eocd(raw)
+    (
+        signature,
+        disk_number,
+        central_disk,
+        entries_on_disk,
+        _entries_total,
+        central_size,
+        central_offset,
+        comment_size,
+    ) = values
+    assert signature == b"PK\x05\x06"
+    zip64_end = struct.pack(
+        "<4sQ2H2I4Q",
+        b"PK\x06\x06",
+        44,
+        45,
+        45,
+        0,
+        0,
+        entries,
+        entries,
+        central_size,
+        central_offset,
+    )
+    locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, eocd_offset, 1)
+    classic = bytearray(raw[eocd_offset : eocd_offset + 22])
+    if sentinels:
+        struct.pack_into(
+            "<4s4H2LH",
+            classic,
+            0,
+            b"PK\x05\x06",
+            disk_number,
+            central_disk,
+            0xFFFF,
+            0xFFFF,
+            0xFFFFFFFF,
+            0xFFFFFFFF,
+            comment_size,
+        )
+    return raw[:eocd_offset] + zip64_end + locator + bytes(classic) + raw[eocd_offset + 22 :]
+
+
 def test_archive_keeps_web_material_separate_from_external_package(tmp_path: Path) -> None:
     archive = _archive(tmp_path)
     manifest, _ = verify_task_archive(archive, max_bytes=32 * 1024 * 1024)
@@ -194,6 +255,58 @@ def test_failed_task_still_has_verifiable_failure_archive(tmp_path: Path) -> Non
 
 def test_source_mutation_before_seal_is_rejected(tmp_path: Path) -> None:
     assert not _archive(tmp_path, mutate_source=True).exists()
+
+
+def test_valid_small_zip64_archive_is_verified(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    archive.write_bytes(
+        _zip64_archive(archive.read_bytes(), entries=3, sentinels=False)
+    )
+
+    manifest, _ = verify_task_archive(archive, max_bytes=32 * 1024 * 1024)
+
+    assert manifest["schema_version"] == "fxfetch.task-evidence.v1"
+
+
+@pytest.mark.parametrize("damage", ["entry_count", "directory_size", "low_count", "expired", "zip64_count"])
+def test_zip_preflight_rejects_before_zipfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    archive = _archive(tmp_path)
+    raw = archive.read_bytes()
+    if damage == "zip64_count":
+        damaged_bytes = _zip64_archive(
+            raw,
+            entries=MAX_TASK_FILES + 3,
+            sentinels=True,
+        )
+    else:
+        eocd_offset, values = _classic_eocd(raw)
+        fields = list(values)
+        if damage == "entry_count":
+            fields[3] = MAX_TASK_FILES + 3
+            fields[4] = MAX_TASK_FILES + 3
+        elif damage == "directory_size":
+            fields[5] = MAX_TASK_ZIP_DIRECTORY_BYTES + 1
+        elif damage == "low_count":
+            fields[3] = 1
+            fields[4] = 1
+        elif damage == "expired":
+            pass
+        damaged_raw = bytearray(raw)
+        struct.pack_into("<4s4H2LH", damaged_raw, eocd_offset, *fields)
+        damaged_bytes = bytes(damaged_raw)
+    archive.write_bytes(damaged_bytes)
+
+    def forbidden_zipfile(*_: object, **__: object) -> None:
+        raise AssertionError("ZipFile constructed before ZIP preflight")
+
+    monkeypatch.setattr(task_evidence_verify.zipfile, "ZipFile", forbidden_zipfile)
+    kwargs = {"deadline": time.monotonic() - 1} if damage == "expired" else {}
+    with pytest.raises(EvidenceError):
+        verify_task_archive(archive, max_bytes=32 * 1024 * 1024, **kwargs)
 
 
 def test_manifest_request_association_tampering_is_rejected(tmp_path: Path) -> None:
