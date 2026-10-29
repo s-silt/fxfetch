@@ -3,8 +3,18 @@ import zipfile
 
 import pytest
 
-from fxfetch.core.download import classify_package
+from fxfetch.core.download import classify_package, is_package_prefix
 from fxfetch.core.errors import FxfetchError
+
+
+@pytest.mark.parametrize("signature", [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"])
+def test_package_prefix_sniffing_is_not_package_validation(signature):
+    assert is_package_prefix(signature + b"unvalidated")
+    for length in range(1, 4):
+        assert not is_package_prefix(signature[:length])
+        assert is_package_prefix(signature[:length], incomplete=True)
+    for ordinary in (b"", b"<html", b"PK text", b"plain"):
+        assert not is_package_prefix(ordinary, incomplete=True)
 
 
 def test_packages(tmp_path):

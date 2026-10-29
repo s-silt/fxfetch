@@ -114,8 +114,22 @@ def _server_config(root: Path, options: argparse.Namespace | None = None) -> dic
 
 def _parser(command: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fxfetch" + (f" {command}" if command else ""))
-    parser.add_argument("--out", type=Path, default=_ROOT, help="Private local output/service root")
-    if command == "serve":
+    if command in {"capture-web", "export-web"}:
+        parser.add_argument("--out", type=Path, required=True, help="New private output directory")
+    elif command not in {"verify-web", "verify-data"}:
+        parser.add_argument("--out", type=Path, default=_ROOT, help="Private local output/service root")
+    if command == "capture-web":
+        parser.add_argument("url")
+        parser.add_argument("--authorized-active", action="store_true")
+        parser.add_argument("--collector", choices=("http", "browser"), default="http")
+        parser.add_argument("--service-root", type=Path, default=_ROOT)
+    elif command == "export-web":
+        parser.add_argument("capture_dir", type=Path)
+    elif command == "verify-web":
+        parser.add_argument("bundle_dir", type=Path)
+    elif command == "verify-data":
+        parser.add_argument("archive_path", type=Path)
+    elif command == "serve":
         parser.add_argument("--host")
         parser.add_argument("--port", type=int)
         parser.add_argument("--allowed-network", dest="allowed_networks", action="append")
@@ -132,7 +146,10 @@ def _parser(command: str | None = None) -> argparse.ArgumentParser:
         parser.add_argument(
             "--authorized-active", action="store_true", help="Authorize this invocation to resolve/connect"
         )
-        parser.epilog = "Commands: init, init-build, serve, doctor. Run fxfetch COMMAND --help."
+        parser.epilog = (
+            "Commands: init, init-build, serve, doctor, capture-web, export-web, verify-web, verify-data. "
+            "Run fxfetch COMMAND --help."
+        )
     if command in (None, "serve"):
         proxy = parser.add_mutually_exclusive_group()
         proxy.add_argument(
@@ -147,11 +164,15 @@ def _parser(command: str | None = None) -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     command = (
-        arguments.pop(0) if arguments and arguments[0] in {"init", "serve", "doctor", "init-build"} else None
+        arguments.pop(0)
+        if arguments and arguments[0] in {
+            "init", "serve", "doctor", "init-build", "capture-web", "export-web", "verify-web", "verify-data"
+        }
+        else None
     )
     parser = _parser(command)
     options = parser.parse_args(arguments)
-    root = options.out.resolve()
+    root = options.out.resolve() if hasattr(options, "out") else _ROOT.resolve()
     try:
         if command == "init":
             if (root / "auth.json").exists():
@@ -221,6 +242,102 @@ def main(argv: Sequence[str] | None = None) -> int:
                 server_header=False,
             )
             return 0
+        if command == "capture-web":
+            from .core.guard import validate_url
+            from .core.web_capture import capture_web
+
+            approved_url = validate_url(options.url)
+            classified = classify_input(approved_url)
+            if classified.kind != "http":
+                raise FxfetchError("unsupported_input", "Only HTTP(S) URLs can be captured")
+            if not options.authorized_active:
+                _print(
+                    {
+                        "mode": "offline",
+                        "kind": "web",
+                        "network_requests": 0,
+                        "steps": ["offline_classification", "explicit_authorization_required"],
+                        "outcome": None,
+                    }
+                )
+                return 0
+            result = capture_web(
+                approved_url,
+                root,
+                collector=options.collector,
+                authorized_active=True,
+                service_root=options.service_root.resolve(),
+                limits=Limits(),
+                cancel=Event(),
+            )
+            assert result is not None
+            _print(
+                {
+                    "state": "web_capture",
+                    "capture_id": result.capture_id,
+                    "collector": result.collector,
+                    "outcome": result.outcome,
+                    "reason_code": result.reason_code,
+                    "coverage": result.coverage,
+                    "materials": len(result.materials),
+                    "gaps": result.gaps,
+                    "journal_state": result.journal_state,
+                }
+            )
+            return 0 if result.outcome == "captured" and result.journal_state == "healthy" else 1
+        if command == "export-web":
+            from .core.web_evidence import export_web
+
+            manifest, digest = export_web(options.capture_dir, root, Limits())
+            _print(
+                {
+                    "state": "exported",
+                    "capture_outcome": manifest["outcome"],
+                    "coverage": manifest["coverage"],
+                    "gaps": manifest["gaps"],
+                    "schema_version": manifest["schema_version"],
+                    "capture_id": manifest["capture_id"],
+                    "files": len(manifest["files"]),
+                    "manifest_sha256": digest,
+                    "private_bundle": True,
+                    "authenticity_claimed": False,
+                }
+            )
+            return 0
+        if command == "verify-web":
+            from .core.web_evidence import verify_web
+
+            manifest, digest = verify_web(options.bundle_dir, Limits())
+            _print(
+                {
+                    "state": "verified",
+                    "capture_outcome": manifest["outcome"],
+                    "coverage": manifest["coverage"],
+                    "gaps": manifest["gaps"],
+                    "schema_version": manifest["schema_version"],
+                    "capture_id": manifest["capture_id"],
+                    "files": len(manifest["files"]),
+                    "manifest_sha256": digest,
+                    "private_bundle": True,
+                    "authenticity_claimed": False,
+                }
+            )
+            return 0
+        if command == "verify-data":
+            from .core.task_evidence_io import verify_task_archive
+
+            manifest, digest = verify_task_archive(options.archive_path, max_bytes=Limits().max_task_bytes)
+            _print(
+                {
+                    "state": "verified",
+                    "schema_version": manifest["schema_version"],
+                    "sha256": digest,
+                    "files": len(manifest["files"]),
+                    "web_materials": manifest["web_materials"],
+                    "external_packages_verified": False,
+                }
+            )
+            return 0
         if not options.url:
             parser.print_help()
             return 0
@@ -245,14 +362,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             else None
         )
         limits = Limits()
-        result = AcquisitionPolicy(
-            limits,
-            proxyconfig,
-            collector_factory=lambda attempt_limits, proxy: Workflow(
-                client=build_default_client(attempt_limits, proxy), limits=attempt_limits
-            ),
-        ).run(options.url, root, Event())
-        _print(asdict(result))
+        from .core.task_evidence import finalize_package
+        from .core.task_evidence_recorder import TaskEvidenceRecorder
+
+        recorder = TaskEvidenceRecorder(root)
+        try:
+            result = AcquisitionPolicy(
+                limits,
+                proxyconfig,
+                collector_factory=lambda attempt_limits, proxy: Workflow(
+                    client=build_default_client(attempt_limits, proxy, recorder), limits=attempt_limits
+                ),
+                transport_observer=recorder,
+            ).run(options.url, root, Event())
+        finally:
+            recorder.close()
+        task_result = asdict(result)
+        data_package = finalize_package(
+            root,
+            job_id="cli",
+            entry_url=options.url,
+            terminal_result=task_result,
+            observation_path=root / "task-observations.jsonl",
+            max_bytes=limits.max_task_bytes,
+        )
+        _print({"result": task_result, "data_package": data_package})
         return 0 if result.outcome in {"downloaded", "not_found"} else 1
     except (FxfetchError, OSError, ValueError) as error:
         code = (

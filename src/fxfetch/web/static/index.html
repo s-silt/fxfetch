@@ -4,12 +4,12 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="x-dns-prefetch-control" content="off">
   <meta name="color-scheme" content="light"><title>fxfetch · 本地下载工作台</title>
-  <link rel="stylesheet" href="/static/app.css"><script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/app.css"><script src="/static/data-package.js" defer></script><script src="/static/app.js" defer></script>
 </head>
 <body>
   <header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true">f</span><span>fxfetch <small>本地下载工作台</small></span></div><div class="session-actions"><span class="local-tag">本机处理</span><button id="logout" class="text-button" hidden>退出</button></div></header>
   <main>
-    <section class="intro"><p class="eyebrow">获取 · 留存 · 打包</p><h1>从一个链接开始。</h1><p>粘贴网址或识别图片中的二维码，按需取得应用文件。</p></section>
+    <section class="intro"><p class="eyebrow">获取 · 留存 · 打包</p><h1>从一个链接开始。</h1><p>下载地址和普通网页使用同一个入口；应用文件与网页数据包分别保存、分别下载。</p></section>
     <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
     <section id="login-panel" class="card login-card" hidden>
       <div class="section-heading"><span class="step">01</span><div><h2>连接本地工作台</h2><p>使用后端主机设置的服务密码。</p></div></div>
@@ -18,7 +18,7 @@
     <div id="workspace" hidden>
       <div class="workspace-grid">
         <section class="card input-card">
-          <div class="section-heading"><span class="step">01</span><div><h2>添加入口</h2><p>输入与扫码只在本地处理，点击下载才访问目标。</p></div></div>
+          <div class="section-heading"><span class="step">01</span><div><h2>添加入口</h2><p>输入与扫码只在本地处理，点击开始采集才访问目标。</p></div></div>
           <form id="download-form">
             <label for="url">粘贴网址</label><textarea id="url" rows="3" placeholder="example.com/path 或 https://…" autocomplete="off" spellcheck="false" maxlength="8192" required aria-describedby="host-hint"></textarea>
             <div id="host-hint" class="field-hint">可直接粘贴域名或完整网址；未写协议时默认 HTTPS。</div>
@@ -29,9 +29,9 @@
             <input id="image-file" type="file" accept="image/png,image/jpeg,image/webp,image/heic,image/heif,image/avif,image/bmp,image/gif,image/tiff,.heic,.heif,.avif,.bmp,.gif,.tif,.tiff,.jpg,.jpeg,.png,.webp" hidden>
             <div id="image-result" class="image-result" hidden><img id="image-preview" alt="所选二维码图片的本地预览"><div><strong id="qr-status"></strong><p class="muted">识别图片不会打开其中的网址。</p><button id="clear-image" type="button" class="text-button">移除图片</button></div></div>
             <fieldset id="qr-candidates" class="candidate-list" hidden><legend>选择二维码入口</legend></fieldset>
-            <div class="strategy"><span class="dot"></span><span>APK 优先，明确无 APK 后再尝试 IPA</span></div>
-            <button id="download-button" class="primary wide" type="submit">解析并保存应用 <span aria-hidden="true">↗</span></button>
-            <div id="direct-download" hidden><a id="direct-download-link" class="direct-download-link" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">直接下载到当前设备 ↗</a><p class="field-hint">直链由当前设备的浏览器下载，不启动 Android Chrome，服务不保存或校验文件。</p></div>
+            <div class="strategy"><span class="dot"></span><span>网页材料由后台保存；取包仍按 APK 优先、明确无 APK 后再尝试 IPA</span></div>
+            <button id="download-button" class="primary wide" type="submit">开始采集（含应用下载）</button>
+            <div id="direct-download" hidden><a id="direct-download-link" class="direct-download-link" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">直接下载到当前设备 ↗</a><p class="field-hint">此快捷方式由当前设备的浏览器下载，服务不保存或校验文件，也不生成数据包。需要后台材料时请点击开始采集。</p></div>
             <a class="result-jump" href="#task-panel">查看任务与文件 <span aria-hidden="true">↓</span></a>
           </form>
           <div id="capabilities" class="capabilities" aria-live="polite"></div>
@@ -39,7 +39,7 @@
         <section id="task-panel" class="card result-card">
           <div class="result-top"><div class="section-heading"><span class="step">02</span><div><h2>任务与文件</h2><p>查看进度，保存取得的文件。</p></div></div><button id="refresh" class="text-button" type="button" title="清空当前会话记录并停止未完成任务">刷新</button></div>
           <label for="job-picker" class="small-label">当前会话的任务</label><select id="job-picker"><option value="">还没有任务</option></select>
-          <div id="job-empty" class="empty-state"><div class="empty-icon" aria-hidden="true">↓</div><h3>文件将在这里就绪</h3><p>添加一个入口，点击下载开始。<br>刷新会清空当前会话的记录。</p></div>
+          <div id="job-empty" class="empty-state"><div class="empty-icon" aria-hidden="true">↓</div><h3>文件将在这里就绪</h3><p>添加一个入口，点击开始采集。<br>刷新会清空当前会话的记录，后台材料保留。</p></div>
           <div id="job-content" hidden></div>
         </section>
       </div>

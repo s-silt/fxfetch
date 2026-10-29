@@ -8,6 +8,7 @@ import json
 import socket
 import threading
 import time
+import zipfile
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -247,12 +248,26 @@ def test_cross_session_job_image_and_artifact_are_private(running):
     first_headers = login(client)
     workflow.downloaded = True
     job = wait_job(client, submit(client, first_headers)["id"])
+    for _ in range(100):
+        job = client.get(f"/api/jobs/{job['id']}").json()
+        if job["data_package"]["state"] not in {"pending", "building"}:
+            break
+        time.sleep(0.01)
+    package = client.get(f"/api/jobs/{job['id']}/data-package")
+    assert package.status_code == 200
+    assert package.headers["content-type"] == "application/zip"
+    assert "no-store" in package.headers["cache-control"]
+    assert package.content.startswith(b"PK")
+    previous_calls = list(workflow.calls)
+    assert client.get(f"/api/jobs/{job['id']}/data-package").content == package.content
+    assert workflow.calls == previous_calls
     artifact_id = job["artifacts"][0]["id"]
     owner = service.store.session(token_hash(client.cookies["fxfetch_session"]))["id"]
     image_id = service.store.add_image(owner, "images/synthetic.png", {"candidates": []}, 3600, 10)
     second_headers = login(client)
     assert client.get(f"/api/jobs/{job['id']}").status_code == 404
     assert client.get(f"/api/jobs/{job['id']}/artifacts/{artifact_id}").status_code == 404
+    assert client.get(f"/api/jobs/{job['id']}/data-package").status_code == 404
     result = client.post(
         "/api/jobs",
         json={"image_id": image_id, "candidate_id": "qr-1"},
@@ -260,6 +275,25 @@ def test_cross_session_job_image_and_artifact_are_private(running):
     )
     assert result.status_code == 404
     assert client.get("/api/jobs").json()["jobs"] == []
+
+
+def test_pending_data_package_get_is_private_and_has_no_collection_side_effect(running):
+    client, _, workflow, _ = running
+    headers = login(client)
+    workflow.release.clear()
+    job = submit(client, headers)
+    assert workflow.started.wait(2)
+    endpoint = f"/api/jobs/{job['id']}/data-package"
+    calls = list(workflow.calls)
+    try:
+        assert client.get(endpoint).status_code == 404
+        anonymous = TestClient(client.app, client=("127.0.0.1", 50001))
+        assert anonymous.get(endpoint).status_code == 401
+        anonymous.close()
+        assert workflow.calls == calls
+    finally:
+        workflow.release.set()
+    assert wait_job(client, job["id"])["state"] == "completed"
 
 
 def test_build_click_only_keeps_original_outcome_and_is_idempotent(running):
@@ -323,8 +357,72 @@ def test_cancel_running_and_queued_jobs(running):
     assert client.post(f"/api/jobs/{second['id']}/cancel", headers=headers).status_code == 200
     assert wait_job(client, second["id"], "cancelled")["outcome"] is None
     assert client.post(f"/api/jobs/{first['id']}/cancel", headers=headers).status_code == 200
-    assert wait_job(client, first["id"], "cancelled")["outcome"] != "not_found"
+    completed = wait_job(client, first["id"], "cancelled")
+    assert completed["outcome"] == "failed" and completed["artifacts"] == []
+    for _ in range(100):
+        completed = client.get(f"/api/jobs/{first['id']}").json()
+        if completed["data_package"]["state"] not in {"pending", "building"}:
+            break
+        time.sleep(0.01)
+    assert completed["data_package"]["state"] == "ready"
+    response = client.get(f"/api/jobs/{first['id']}/data-package")
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+    assert manifest["package_result"]["reason_code"] == "cancelled"
+    assert manifest["external_packages"] == []
     assert len(workflow.calls) == 1
+
+
+def test_timeout_discards_late_package_and_seals_failure_archive(running, monkeypatch):
+    client, service, workflow, _ = running
+    workflow.downloaded = True
+    monkeypatch.setattr(
+        service,
+        "_start_progress",
+        lambda *_args, **_kwargs: (time.monotonic() - 1, time.monotonic() - 0.1),
+    )
+    headers = login(client)
+    job = submit(client, headers, key="synthetic-timeout-key")
+    completed = wait_job(client, job["id"])
+    assert completed["outcome"] == "failed" and completed["artifacts"] == []
+    for _ in range(100):
+        completed = client.get(f"/api/jobs/{job['id']}").json()
+        if completed["data_package"]["state"] not in {"pending", "building"}:
+            break
+        time.sleep(0.01)
+    assert completed["data_package"]["state"] == "ready"
+    response = client.get(f"/api/jobs/{job['id']}/data-package")
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+    assert manifest["package_result"]["reason_code"] == "task_timeout"
+    assert manifest["external_packages"] == []
+
+
+def test_queue_timeout_seals_not_started_archive_without_collection(running, monkeypatch):
+    client, service, workflow, _ = running
+    original = service._expired_claim
+    monkeypatch.setattr(
+        service, "_expired_claim", lambda job: original({**job, "created": 0})
+    )
+    headers = login(client)
+    job = wait_job(client, submit(client, headers)["id"])
+    for _ in range(200):
+        job = client.get(f"/api/jobs/{job['id']}").json()
+        if job["data_package"]["state"] not in {"pending", "building"}:
+            break
+        time.sleep(0.01)
+    assert workflow.calls == []
+    assert job["data_package"]["state"] == "ready"
+    response = client.get(f"/api/jobs/{job['id']}/data-package")
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+    assert manifest["package_result"]["reason_code"] == "queue_timeout"
+    assert manifest["package_result"]["coverage"] == "not_started"
+    assert manifest["observations"]["state"] == "unavailable"
+    assert manifest["files"] == manifest["external_packages"] == []
 
 
 def test_artifact_path_guard_rejects_database_traversal(running):
@@ -661,6 +759,65 @@ def test_clear_jobs_requires_auth_origin_and_csrf(running):
     assert client.delete("/api/jobs", headers=headers).json() == {"cleared": 0}
 
 
+def test_active_sealing_stays_building_until_archive_is_ready(running, monkeypatch):
+    import fxfetch.service as service_module
+
+    client, service, workflow, _ = running
+    headers = login(client)
+    entered, release = threading.Event(), threading.Event()
+    original = service_module.finalize_package
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service_module, "finalize_package", blocked)
+    job_id = submit(client, headers)["id"]
+    workflow.release.set()
+    job = wait_job(client, job_id)
+    assert entered.wait(5)
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert job["state"] == "completed"
+    assert job["data_package"]["state"] == "building"
+    assert client.get(f"/api/jobs/{job_id}/data-package").status_code == 404
+    evidence = json.loads(
+        (service.store.root / "jobs" / job_id / "evidence.json").read_text(encoding="utf-8")
+    )
+    assert evidence["terminal_status"] == "committed"
+    assert evidence["summary"]["outcome"] == job["result"]["outcome"]
+    assert evidence["summary"]["reason_code"] == job["result"]["reason_code"]
+    assert evidence["summary"]["coverage"] == job["result"]["coverage"]
+    release.set()
+    for _ in range(200):
+        job = client.get(f"/api/jobs/{job_id}").json()
+        if job["data_package"]["state"] == "ready":
+            break
+        time.sleep(0.01)
+    assert job["data_package"]["state"] == "ready"
+    assert client.get(f"/api/jobs/{job_id}/data-package").status_code == 200
+
+
+def test_stale_building_package_is_failed_after_owner_disappears(running):
+    from fxfetch.core.task_evidence import package_directory, write_package_metadata
+
+    client, service, _, _ = running
+    headers = login(client)
+    job = wait_job(client, submit(client, headers)["id"])
+    job_dir = service.store.root / "jobs" / job["id"]
+    for _ in range(200):
+        if job["id"] not in service._data_package_active:
+            break
+        time.sleep(0.01)
+    assert job["id"] not in service._data_package_active
+    write_package_metadata(package_directory(job_dir), {"state": "building"})
+
+    stale = client.get(f"/api/jobs/{job['id']}").json()
+    assert stale["data_package"]["state"] == "failed"
+    assert stale["data_package"]["reason_code"] == "data_package_interrupted"
+    assert client.get(f"/api/jobs/{job['id']}/data-package").status_code == 404
+
+
 def test_clear_hides_files_and_old_idempotency_without_deleting_private_evidence(running):
     client, service, workflow, _ = running
     headers = login(client)
@@ -669,11 +826,21 @@ def test_clear_hides_files_and_old_idempotency_without_deleting_private_evidence
     artifact = job["artifacts"][0]
     owner = service.store.session(token_hash(client.cookies["fxfetch_session"]))["id"]
     private = service.store.root / service.store.artifact(owner, job["id"], artifact["id"])["path"]
+    for _ in range(100):
+        job = client.get(f"/api/jobs/{job['id']}").json()
+        if job["data_package"]["state"] == "ready":
+            break
+        time.sleep(0.01)
+    package_path = (
+        service.store.root / "jobs" / job["id"] / "data-package" / job["data_package"]["filename"]
+    )
+    assert package_path.is_file()
     assert client.delete("/api/jobs", headers=headers).status_code == 200
     for _ in range(3):
         assert client.get("/api/jobs").json() == {"jobs": []}
         assert client.get(f"/api/jobs/{job['id']}").status_code == 404
         assert client.get(f"/api/jobs/{job['id']}/artifacts/{artifact['id']}").status_code == 404
+        assert client.get(f"/api/jobs/{job['id']}/data-package").status_code == 404
     replay = client.post(
         "/api/jobs",
         json={"url": "https://entry.synthetic.test/open?q=one#fragment"},
@@ -681,6 +848,7 @@ def test_clear_hides_files_and_old_idempotency_without_deleting_private_evidence
     )
     assert replay.status_code == 404
     assert private.is_file()
+    assert package_path.is_file()
     assert len(workflow.calls) == 1
 
 

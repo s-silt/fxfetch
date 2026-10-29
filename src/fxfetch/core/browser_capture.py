@@ -29,10 +29,11 @@ from .browser_response import (
     write_capture_diagnostic,
 )
 from .browser_runtime import RuntimeDiagnostics
+from .browser_web_evidence import BrowserWebEvidence, record_saved_material
 from .cdp_transport import CDPCommandError, CDPMux, resolve_endpoint
 from .classify import classify_input
-from .discovery import Candidate, device_gate_rejected, download_action
-from .download import classify_package
+from .discovery import Candidate, device_gate_rejected, download_action, rendered_challenge
+from .download import classify_package, is_package_prefix
 from .errors import FxfetchError
 from .flutter_adapter import MAX_MAIN_BYTES
 from .guard import validate_url
@@ -40,6 +41,7 @@ from .limits import Limits
 from .offline import MAX_RESOURCE_BYTES, MAX_RESOURCE_TOTAL, MAX_RESOURCES, OfflineBundle
 from .page_qr import MAX_DECODE_SECONDS, MAX_IMAGE_TOTAL, MAX_IMAGES, decode_saved_image, discover_images
 from .script_content import script_content_candidates
+from .web_journal import EvidenceJournal
 
 READ_BYTES = 64 * 1024
 MAX_NO_PROGRESS_SECONDS = 30.0
@@ -109,6 +111,9 @@ async def capture_browser(
     limits: Limits = _DEFAULT_LIMITS,
     on_event: Callable[[dict[str, object]], None] | None = None,
     chain: str = "android",
+    purpose: str = "package",
+    journal: EvidenceJournal | None = None,
+    observation_context: dict[str, str] | None = None,
 ) -> BrowserCaptureResult:
     """Capture without HTTP replay, native file staging or downloaded-code execution.
 
@@ -122,13 +127,22 @@ async def capture_browser(
         raise FxfetchError("browser_guard_unavailable", "Browser request permission callback is unavailable")
     if proof.cdp_endpoint is None and (not proof.executable_path.is_file() or not proof.proxy_server):
         raise FxfetchError("browser_guard_unavailable", "Verified Chrome/proxy launch data missing")
+    if purpose not in {"package", "web"}:
+        raise FxfetchError("unsupported_capture_purpose", "Unsupported browser capture purpose")
     if chain not in {"android", "iphone"} or urlsplit(entry_url).scheme not in {"http", "https"}:
         raise FxfetchError("unsupported_input", "Unsupported browser capture input")
     result = BrowserCaptureResult()
+    if purpose == "web":
+        result.gaps = ["single_passive_visit", "interaction_not_performed"]
     deadline = time.monotonic() + min(600.0, limits.chain_timeout)
     requests = redirects = body_bytes = candidate_number = interactions = web_bytes = 0
     ready: dict[str, str] = {}
     request_numbers: dict[tuple[str, str], int] = {}
+    web_observer = (
+        BrowserWebEvidence(journal=journal, event_context=observation_context)
+        if purpose == "web" or journal is not None else None
+    )
+    policy_observer = web_observer if purpose == "web" else None
     target_ready = asyncio.Event()
     tasks: set[asyncio.Task[None]] = set()
     errors: list[FxfetchError] = []
@@ -213,7 +227,15 @@ async def capture_browser(
         if data["targetInfo"].get("type") in _UNSUPPORTED_TARGETS:
             result.gaps.append("browser_worker_scope_unsupported")
             raise FxfetchError("browser_worker_scope_unsupported", "Worker targets are outside verified capture scope")
+        if web_observer is not None:
+            target = data["targetInfo"]
+            web_observer.target_attached(session, target)
         await send(session, "Page.enable")
+        if purpose == "web":
+            frame_tree = await send(session, "Page.getFrameTree")
+            frame = frame_tree.get("frameTree", {}).get("frame", {})
+            if web_observer is not None:
+                web_observer.initial_frame(session, frame)
         await send(session, "Runtime.enable")
         await send(session, "Network.enable")
         await send(session, "Network.setCacheDisabled", {"cacheDisabled": True})
@@ -397,6 +419,13 @@ async def capture_browser(
         async with receiving:
             check()
             request_id, url = event["requestId"], event["request"]["url"]
+            is_main = policy_observer is not None and policy_observer.is_main_request(session, event)
+            request_ref = (
+                web_observer.request_ref(session, request_id)
+                if web_observer is not None
+                else f"browser:{session}:{request_id}"
+            )
+            journal_root = journal.path.parent if journal is not None else output_dir
             mime = headers.get("content-type", "").lower()
             resource_type = event.get("resourceType", "")
             is_resource = (
@@ -420,6 +449,7 @@ async def capture_browser(
             partial = path.with_suffix(".partial")
             size = 0
             digest = hashlib.sha256()
+            prefix = bytearray()
             try:
                 with partial.open("xb") as output:
                     while True:
@@ -439,6 +469,7 @@ async def capture_browser(
                             if chunk.get("base64Encoded")
                             else chunk.get("data", "").encode("utf-8")
                         )
+                        prefix.extend(raw[:max(0, 4 - len(prefix))])
                         if len(raw) > min(READ_BYTES, remaining + 1):
                             raise FxfetchError(
                                 "browser_stream_protocol", "CDP stream exceeded requested read cap"
@@ -459,6 +490,7 @@ async def capture_browser(
                     raise FxfetchError("length_mismatch", "Browser web response length mismatch")
                 check()
                 partial.replace(path)
+                package_stream = is_package_prefix(bytes(prefix))
                 result.bodies.append(
                     {
                         "url": url,
@@ -468,12 +500,51 @@ async def capture_browser(
                         "content_type": mime,
                         "chain": chain,
                         "purpose": "browser_response",
+                        "package_stream": package_stream,
                         "complete": True,
                         "hash_scope": "browser_response_decoded",
                         "request_id": request_numbers.get((session, request_id)),
                     }
                 )
                 body_record = result.bodies[-1]
+                if web_observer is not None:
+                    body_record.update(
+                        {
+                            **web_observer.session_context(session),
+                            "request_ref": request_ref,
+                            "representation": "browser_response_decoded",
+                        }
+                    )
+                    body_text = None
+                    if is_main and size > 0:
+                        try:
+                            body_text = path.read_bytes().decode("utf-8", errors="replace")
+                        except OSError:
+                            body_text = ""
+                    web_observer.body_saved(
+                        session,
+                        event,
+                        path=path.relative_to(journal_root).as_posix(),
+                        size=size,
+                        sha256=digest.hexdigest(),
+                        representation="browser_response_decoded",
+                        complete=True,
+                        body_text=body_text,
+                        package_stream=package_stream,
+                    )
+                elif journal is not None:
+                    record_saved_material(
+                        journal,
+                        source_url=url,
+                        path=path.relative_to(journal_root).as_posix(),
+                        size=size,
+                        sha256=digest.hexdigest(),
+                        representation="browser_response_decoded",
+                        complete=True,
+                        request_ref=request_ref,
+                        resource_type=resource_type if isinstance(resource_type, str) else None,
+                        package_stream=package_stream,
+                    )
                 if is_resource and 200 <= event["responseStatusCode"] < 300:
                     resource_total = sum(resource.stat().st_size for resource in set(resources.values()))
                     if len(resources) < MAX_RESOURCES and resource_total + size <= MAX_RESOURCE_TOTAL:
@@ -521,14 +592,55 @@ async def capture_browser(
                 progress.content(url, digest.hexdigest())
             except (FxfetchError, OSError, ValueError, asyncio.CancelledError):
                 if partial.is_file():
+                    prefix_path = partial.relative_to(journal_root).as_posix()
+                    package_stream = is_package_prefix(bytes(prefix), incomplete=True)
                     result.partials.append(
                         {
                             "path": str(partial),
                             "size": size,
                             "sha256": digest.hexdigest(),
                             "hash_scope": "saved_prefix",
+                            "package_stream": package_stream,
+                            **(
+                                {
+                                    **web_observer.session_context(session),
+                                    "request_ref": request_ref,
+                                    "url": url,
+                                    "representation": "browser_saved_prefix",
+                                    "complete": False,
+                                }
+                                if web_observer is not None
+                                else {}
+                            ),
                         }
                     )
+                    if web_observer is not None:
+                        web_observer.record_response_prefix(
+                            session,
+                            event,
+                            path=prefix_path,
+                            size=size,
+                            sha256=digest.hexdigest(),
+                            representation="browser_saved_prefix",
+                            package_stream=package_stream,
+                        )
+                    elif journal is not None:
+                        record_saved_material(
+                            journal,
+                            source_url=url,
+                            path=prefix_path,
+                            size=size,
+                            sha256=digest.hexdigest(),
+                            representation="browser_saved_prefix",
+                            complete=False,
+                            request_ref=request_ref,
+                            package_stream=package_stream,
+                            resource_type=(
+                                event.get("resourceType")
+                                if isinstance(event.get("resourceType"), str)
+                                else None
+                            ),
+                        )
                 raise
 
     async def paused(session: str, event: dict[str, Any]) -> None:
@@ -553,13 +665,29 @@ async def capture_browser(
         if "responseStatusCode" not in event and "responseErrorReason" not in event:
             requests += 1
             if requests > limits.max_requests:
+                if web_observer is not None:
+                    web_observer.record_request_denied(
+                        session,
+                        f"browser:{session}:{request_id}",
+                        url=url,
+                        reason="request_limit",
+                    )
                 await send(session, "Fetch.failRequest", {"requestId": request_id, "errorReason": "Aborted"})
                 raise FxfetchError("request_limit", "Browser request budget exhausted before dispatch")
             if urlsplit(url).scheme not in {"http", "https"}:
+                if web_observer is not None:
+                    web_observer.record_unsupported_request(session, event)
                 await send(
                     session, "Fetch.failRequest", {"requestId": request_id, "errorReason": "BlockedByClient"}
                 )
                 raise FxfetchError("unsupported_browser_protocol", "Unsupported browser request protocol")
+            network_id = event.get("networkId")
+            network_id = network_id if isinstance(network_id, str) else None
+            request_ref = (
+                web_observer.begin_request(session, event)
+                if web_observer is not None
+                else f"browser:{session}:{request_id}"
+            )
             if event.get("redirectedRequestId"):
                 redirects += 1
                 if redirects > limits.max_redirects:
@@ -567,9 +695,16 @@ async def capture_browser(
                         session, "Fetch.failRequest", {"requestId": request_id, "errorReason": "Aborted"}
                     )
                     raise FxfetchError("redirect_limit", "Browser redirect budget exhausted before dispatch")
-            approved_url = validate_url(url)
             assert proof.permit_request is not None
-            proof.permit_request(approved_url, event["request"].get("method", "GET"))
+            try:
+                approved_url = validate_url(url)
+                proof.permit_request(approved_url, event["request"].get("method", "GET"))
+            except FxfetchError as error:
+                if web_observer is not None:
+                    web_observer.record_request_denied(session, request_ref, reason=error.code)
+                raise
+            if web_observer is not None:
+                web_observer.record_request_permitted(session, request_ref, network_id)
             emit("request", url, method=event["request"].get("method", "GET"))
             request_numbers[(session, request_id)] = requests
             await send(session, "Fetch.continueRequest", {"requestId": request_id})
@@ -579,38 +714,92 @@ async def capture_browser(
             optional = optional_resource_failure(
                 url, event.get("resourceType", ""), headers, network_error=event["responseErrorReason"],
             )
-            result.responses.append({
-                "url": url, "network_error": event["responseErrorReason"],
-                "resource_type": event.get("resourceType", ""), "optional_resource_failure": optional,
-            })
+            response_error = (
+                web_observer.response_error(session, event, optional)
+                if web_observer is not None
+                else {
+                    "url": url, "network_error": event["responseErrorReason"],
+                    "resource_type": event.get("resourceType", ""), "optional_resource_failure": optional,
+                }
+            )
+            result.responses.append(response_error)
             await send(session, "Fetch.failRequest", {"requestId": request_id, "errorReason": "Aborted"})
             if optional and event["responseErrorReason"] == "Aborted":
                 # Playwright intentionally aborts implicit favicon requests.
                 return
-            if event.get("resourceType", "") != "Document" and not package_response_candidate(url, headers):
+            if (
+                policy_observer is not None and not policy_observer.is_main_request(session, event)
+            ) or (
+                event.get("resourceType", "") != "Document" and not package_response_candidate(url, headers)
+            ):
                 result.responses[-1]["deferred_network_error"] = True
                 result.gaps.append(
                     "browser_optional_resource_network_error" if optional else "browser_subresource_network_error"
                 )
                 deferred_resource_errors.append(FxfetchError("browser_network_error", "Chrome subresource network failed"))
                 return
+            if policy_observer is not None and policy_observer.is_main_request(session, event):
+                result.outcome, result.reason_code = "failed", "browser_network_error"
             raise FxfetchError("browser_network_error", "Chrome network response failed")
         status = event.get("responseStatusCode", 0)
         headers = {item["name"].lower(): item["value"] for item in event.get("responseHeaders", [])}
-        result.responses.append(
-            {
+        if web_observer is not None:
+            response_record, observed_main, _ = web_observer.response_observed(
+                session,
+                event,
+                headers,
+                int(status),
+                request_numbers.get((session, request_id)),
+            )
+        else:
+            observed_main = False
+            response_record = {
                 "url": url,
                 "status": status,
                 "content_type": headers.get("content-type", ""),
                 "request_id": request_numbers.get((session, request_id)),
                 "resource_type": event.get("resourceType", ""),
             }
-        )
+        is_main = purpose == "web" and observed_main
+        result.responses.append(response_record)
+        location_raw = headers.get("location")
         emit("response_received", url, status=status, content_type=headers.get("content-type", ""))
+        if 300 <= status < 400 and location_raw and web_observer is not None:
+            web_observer.record_redirect(session, event, location_raw)
         candidate = package_response_candidate(url, headers)
         if disclosed_html_response(url, headers, event.get("resourceType", ""), url in script_content_targets):
             candidate = False
             result.responses[-1]["disposition_handling"] = "inline_disclosed_html"
+        if purpose == "web":
+            if status in {401, 403, 429} or status >= 400:
+                if event["request"].get("method") != "HEAD" and status not in {204, 205}:
+                    await stream_web(session, event, headers)
+                if is_main:
+                    if status in {401, 403, 429}:
+                        result.outcome, result.reason_code = "blocked", "http_access_control"
+                    else:
+                        result.outcome, result.reason_code = "failed", "http_status"
+                else:
+                    if web_observer is not None:
+                        web_observer.subresource_http_error(session, event, int(status))
+                return
+            if 200 <= status < 300 and candidate:
+                if web_observer is not None:
+                    web_observer.unsupported_download(session, event, int(status))
+                result.responses[-1]["body_captured"] = False
+                await send(session, "Fetch.failRequest", {"requestId": request_id, "errorReason": "Aborted"})
+                if is_main:
+                    result.outcome, result.reason_code = "failed", "unsupported_download_response"
+                return
+            if 200 <= status < 300 and status not in {204, 205} and event["request"].get("method") != "HEAD":
+                await stream_web(session, event, headers)
+            else:
+                if is_main and status in {204, 205}:
+                    result.outcome, result.reason_code = "failed", "http_body_missing"
+                await send(session, "Fetch.continueRequest", {"requestId": request_id})
+            return
+        elif status >= 400 and web_observer is not None and not observed_main:
+            web_observer.subresource_http_error(session, event, int(status))
         if status >= 400 and event.get("resourceType", "") != "Document" and not candidate:
             optional = optional_resource_failure(url, event.get("resourceType", ""), headers)
             result.responses[-1]["optional_resource_failure"] = optional
@@ -658,10 +847,19 @@ async def capture_browser(
             schedule(setup(session, data))
         elif method == "Fetch.requestPaused":
             schedule(paused(session, data))
+        elif method == "Page.frameNavigated" and web_observer is not None:
+            web_observer.frame_navigated(session, data.get("frame", {}))
+        elif method == "Network.requestWillBeSent" and web_observer is not None:
+            web_observer.network_request(session, data)
         elif method == "Runtime.exceptionThrown":
             runtime_diagnostics.observe_exception(data)
         elif method in {"Browser.downloadWillBegin", "Page.downloadWillBegin"}:
-            errors.append(FxfetchError("browser_download_not_intercepted", "Native/blob download was denied"))
+            if purpose == "web":
+                result.outcome, result.reason_code = "failed", "unsupported_download_response"
+                if web_observer is not None:
+                    web_observer.download_not_captured(method)
+            else:
+                errors.append(FxfetchError("browser_download_not_intercepted", "Native/blob download was denied"))
             done.set()
 
     async def navigate(session: str) -> None:
@@ -932,13 +1130,17 @@ async def capture_browser(
                 limits.max_body_bytes,
             ))
             gate_rejected = device_gate_rejected(str(text), str(visible))
+            challenge_detected = purpose == "web" and rendered_challenge(str(text), str(visible))
             digest = hashlib.sha256(data).hexdigest()
             check()
             if source not in snapshots or snapshots[source][1] != digest:
                 if len(snapshots) >= 8 or len(data) > limits.max_task_bytes - body_bytes:
                     result.gaps.append("browser_dom_limit")
                     continue
-                path = output_dir / "web" / f"dom-{digest}.html"
+                if web_observer is not None:
+                    path = web_observer.snapshot_path(output_dir, digest)
+                else:
+                    path = output_dir / "web" / f"dom-{digest}.html"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
                 body_bytes += len(data)
@@ -957,7 +1159,31 @@ async def capture_browser(
                         "content_type": "text/html; charset=utf-8",
                     }
                 )
-            if gate_rejected:
+                if web_observer is not None:
+                    result.bodies[-1]["representation"] = "browser_rendered_dom"
+                    result.bodies[-1]["request_ref"] = None
+                    web_observer.snapshot_saved(
+                        url=source,
+                        path=path.relative_to(journal.path.parent if journal is not None else output_dir).as_posix(),
+                        size=len(data),
+                        sha256=digest,
+                    )
+                elif journal is not None:
+                    record_saved_material(
+                        journal,
+                        source_url=source,
+                        path=path.relative_to(journal.path.parent).as_posix(),
+                        size=len(data),
+                        sha256=digest,
+                        representation="browser_rendered_dom",
+                        complete=True,
+                    )
+            if web_observer is not None and (gate_rejected or challenge_detected):
+                web_observer.challenge_snapshot(
+                    source,
+                    "device_verification_required" if gate_rejected else "challenge_detected",
+                )
+            if gate_rejected and purpose != "web":
                 snapshots.pop(source, None)
                 if source not in (dom_package_sources or set()):
                     raise FxfetchError(
@@ -1252,7 +1478,12 @@ async def capture_browser(
                     except TimeoutError:
                         continue
                     target_ready.clear()
-                schedule(navigate(ready[created["targetId"]]))
+                entry_session = ready[created["targetId"]]
+                entry_tree = await send(entry_session, "Page.getFrameTree")
+                entry_frame = entry_tree.get("frameTree", {}).get("frame", {})
+                if web_observer is not None:
+                    web_observer.set_entry_identity(entry_session, entry_frame.get("id"))
+                schedule(navigate(entry_session))
                 last_scan = time.monotonic()
                 last_snapshot = 0.0
                 while not done.is_set():
@@ -1260,12 +1491,17 @@ async def capture_browser(
                     now = time.monotonic()
                     if not receiving.locked() and now - last_scan >= 0.5 and now - last_activity >= 0.3:
                         try:
-                            followed_package = await follow_disclosed_links(context.pages)
-                            if not followed_package:
-                                await interact(context.pages)
-                            if not followed_package and now - last_snapshot >= 1 and not receiving.locked():
-                                await snapshot_and_qr(context.pages)
-                                last_snapshot = now
+                            if purpose == "web":
+                                if now - last_snapshot >= 1:
+                                    await snapshot_and_qr(context.pages, scan_qr=False)
+                                    last_snapshot = now
+                            else:
+                                followed_package = await follow_disclosed_links(context.pages)
+                                if not followed_package:
+                                    await interact(context.pages)
+                                if not followed_package and now - last_snapshot >= 1 and not receiving.locked():
+                                    await snapshot_and_qr(context.pages)
+                                    last_snapshot = now
                         except PlaywrightError as error:
                             if "destroyed" not in str(error) and "detached" not in str(error):
                                 raise
@@ -1278,18 +1514,18 @@ async def capture_browser(
                     await asyncio.sleep(0.05)
                 if errors and not result.artifacts:
                     raise errors[0]
-                if deferred_resource_errors and not result.artifacts:
+                if purpose != "web" and deferred_resource_errors and not result.artifacts:
                     raise next(
                         (error for error in deferred_resource_errors if error.outcome == "blocked"),
                         deferred_resource_errors[0],
                     )
             finally:
-                if not result.artifacts and not cancel.is_set() and deadline - time.monotonic() > 0.5:
+                if (purpose == "web" or not result.artifacts) and not cancel.is_set() and deadline - time.monotonic() > 0.5:
                     try:
                         await asyncio.wait_for(snapshot_and_qr(context.pages, scan_qr=False), timeout=0.5)
                     except (FxfetchError, PlaywrightError, TimeoutError, OSError):
                         result.gaps.append("browser_final_dom_unavailable")
-                if not result.artifacts and snapshots:
+                if purpose != "web" and not result.artifacts and snapshots:
                     try:
                         build_offline()
                     except (FxfetchError, OSError) as error:
@@ -1311,6 +1547,10 @@ async def capture_browser(
                     await context.close()
                 else:
                     await browser.close()
+        if purpose == "web" and web_observer is not None:
+            result.outcome, result.reason_code = web_observer.final_outcome(
+                result.outcome, result.reason_code
+            )
     except FxfetchError as error:
         if error.code == "browser_cdp_failed":
             write_capture_diagnostic(output_dir, error, "cdp")
@@ -1320,5 +1560,7 @@ async def capture_browser(
         write_capture_diagnostic(output_dir, error, "capture")
         if not result.artifacts:
             result.reason_code = "browser_capture_failed"
+    if web_observer is not None:
+        result.gaps.extend(web_observer.gaps)
     result.gaps = list(dict.fromkeys([*result.gaps, *observed_page_challenges.values()]))
     return result

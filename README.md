@@ -1,6 +1,32 @@
 # fxfetch
 
+## 统一任务与网页材料数据包
+
+服务端每个已执行的普通下载任务只运行现有采集工作流一次，并在任务结束后离线生成独立数据包 ZIP。原 APK / IPA 仍通过原 artifact 接口单独下载；ZIP 只包含明确记录的网页响应材料、有限观察记录和清单，并以外部引用记录原始包的类型、大小、哈希、来源和校验状态，不复制 APK / IPA 字节。失败或没有网页材料的任务也会尽力生成含有结果与缺口的记录。数据包下载不访问目标站点。
+
+`GET /api/jobs/{id}/data-package` 与任务及 artifact 使用相同会话所有权检查。旧任务没有归档时状态为 `unavailable`。离线 `fxfetch verify-data ARCHIVE.zip` 检查 ZIP 结构、清单和列入清单文件的哈希；它不验证外部引用的原始 APK / IPA 字节。数据包保留必要的私有来源 URL 和正文，分享前应按敏感数据处理。
+
+独立的 `capture-web` / `export-web` / `verify-web` 仍保留原有的 `fxfetch.web-evidence.v1` 行为与边界。
+
+`fxfetch capture-web URL --authorized-active --collector http --out NEW_DIR` 只执行一次有界的被动访问。不带 `--authorized-active` 时仅离线分类 HTTP(S) 地址，不创建输出目录；HTTP 模式只执行一次 GET 及受保护的 HTTP 重定向。浏览器模式示例为 `fxfetch capture-web URL --authorized-active --collector browser --service-root .runtime/service --out NEW_DIR`，需要已有的 Android worker 配置，绝不会静默回退到 HTTP。两种模式都不会跟随链接、点击、扫描二维码后继续请求或声称覆盖整个站点。
+
+`fxfetch export-web CAPTURE_DIR --out NEW_BUNDLE_DIR` 与 `fxfetch verify-web BUNDLE_DIR` 都是离线目录操作。该 v1 证据包保留私有 URL 查询参数和响应内容，不会匿名化；哈希只提供完整性校验，不证明真实性。统一任务的独立 ZIP 使用 `fxfetch.task-evidence.v1`，只从已观察到的明确路径构建，不会重放采集。
+
+### 模块边界
+
+- `web_capture` 负责授权后的输出目录、采集生命周期、日志收尾和摘要保存；`web_http` 负责有界 HTTP 访问，`web_browser` 负责既有 Android worker / browser gateway 生命周期。
+- `web_materials` 投影并校验已保存材料；`browser_web_evidence` 只整理浏览器观测，不发送 CDP 命令、不管理预算或权限。
+- `task_evidence_recorder` 记录任务内实际观察；`task_evidence_io` 负责受限 ZIP 构建和离线验证；`task_evidence` 管理归档元数据与状态。统一任务归档不改变原下载结果。
+- `web_evidence` 仅编排离线导出与验证；`web_evidence_schema`、`web_evidence_io`、`web_provenance` 分别负责纯 schema 校验、安全文件操作和日志/材料溯源校验。
+
 局域网网址取包工具：粘贴网址或上传二维码图片，解析并下载 APK / IPA；未取得原包时，可手动将网页打包为 Android WebView 应用。
+
+### 网页材料的结果口径
+
+- `captured` 仅表示取得本次访问的材料，不表示采全网站；跳转正文、脚本或交互未覆盖时会列入 `gaps`。
+- HTTP 收到安装包、ZIP 或通用二进制响应时，保留已接收的有界材料，但标记 `unsupported_download_response`，不当作网页采集成功。
+- 访问控制页即使正文被截断，仍保留 `blocked` 和正文缺口；来源日志写入失败不能报告采集成功。日志截断时 CLI 返回非零退出码，材料仍可离线导出并保留不完整说明。
+- `export-web` / `verify-web` 输出原采集结果、覆盖范围及缺口。校验通过只表示材料包满足校验规则，不把原来的 `blocked` / `failed` 改为成功，也不证明网站内容真实。
 
 ## 功能
 
@@ -53,4 +79,3 @@ python -m venv .venv
 - [Android worker](scripts/android-worker/README.md) · [Docker / Mac 部署说明（Mac 未验证）](deploy/docker/README.md)
 - [API](API.md) · [实现状态与验收](IMPLEMENTATION.md)
 - [开发任务书](TASKBOOK.md) · [选型依据](RESEARCH.md) · [贡献约定](AGENTS.md)
-

@@ -1,6 +1,40 @@
 # 实现状态与验收
 
-更新基准：2026-10-29 的既有记录。本文整理历史结果，不代表本次重新运行测试；实时可用性以 `/api/capabilities` 和实际任务结果为准。
+## 独立网页材料采集（第一阶段）
+
+本阶段实现为独立且有界的 `fxfetch capture-web` 工作流，包含 HTTP/浏览器采集器、每次采集独立的 JSONL provenance ledger，以及基于 `fxfetch.web-evidence.v1` 的离线目录导出/验证（例如 `fxfetch export-web CAPTURE_DIR --out NEW_BUNDLE_DIR`、`fxfetch verify-web BUNDLE_DIR`）。覆盖范围始终为 partial；浏览器命令必须显式提供 `--service-root .runtime/service` 并使用已有受保护的 Android worker。证据包可能包含私有查询参数和正文，不会匿名化；ledger 只适用于独立采集，不升级旧服务下载任务。本阶段没有 HAR、UI 或 fxapk 集成，也不改变既有下载行为。字节预算不包含 JSONL ledger 与元数据开销。验证覆盖合成真实 Chrome，实际 Android wrapper 尚未测试；哈希只保证完整性，不是真实性认证。
+
+网页采集已按职责拆为生命周期编排、HTTP/浏览器采集、材料整理、浏览器观测、schema 校验、安全文件操作及来源关联校验。浏览器观测模块不发送 CDP 命令；传输与权限控制仍由原采集引擎管理。
+
+统一下载任务的数据包采用独立 `fxfetch.task-evidence.v1` schema：传输观察者记录实际保存的正文和有界观察；每个已执行任务在终态后离线封存独立 ZIP，包括失败结果。原始 APK / IPA 继续单独保存在 artifact 路径，不作为 ZIP 材料；`GET /api/jobs/{id}/data-package` 只读取已就绪归档，`verify-data` 离线验证 ZIP。这个新 ZIP 不替代或修改 `fxfetch.web-evidence.v1`。
+
+本轮合并重整增加了包用途浏览器的事实观察、带生命周期收据的有界 JSONL、来源关联校验、包字节排除、API 封存状态和安全封存限制。本地最终验证的失败、修复和限制记录如下；不将这些检查扩展解释为真实网站、DNS 或 Android worker 验证。
+
+以下为此前独立网页模块重构及较早项目验收的历史记录，不代表本轮任务数据包重整的检查结果。此前网页改动曾有全量回归 896 passed、22 skipped；后续小修的定向回归为 64 passed，合成 Chrome 选择为 9 passed、59 deselected，Ruff 与 Pyright 通过。历史记录还包括 869 passed、7 项平台专用跳过等不同范围的结果，不应相互合并。本轮最终聚焦验证结果记录在下方。
+
+### Codex 审查问题修复与本地验证（2026-10-29）
+
+- 网页用途响应处理完成即返回，不再落入取包分支二次消费；模拟 CDP 回归覆盖 302 跳转与两种用途的单次读取。
+- 浏览器按实际字节识别 ZIP/APK/IPA 容器前缀，完整正文及失败/限额截断前缀均记录 `package_stream`；不足四字节但仍可能匹配容器签名的失败前缀也保守排除。标记不代表包结构校验成功，不凭该标记创建 artifact。回归贯穿响应分发、来源日志、ZIP 封存及离线校验。
+- 维护线程直接终结排队超时任务后走统一离线封存，记录 `queue_timeout` / `not_started`；封存期间保持 `building`，结束前不可下载。实测覆盖已有运行任务、真实维护循环、暂停封存、ZIP 内容及归档所有权清理。
+- 数据库终态提交后先落盘最终证据摘要，再封存独立 ZIP；封存阻塞期间摘要已提交，原始结果不等待 ZIP。数据库与文件仍是两个提交步骤，读取测试按 `terminal_status=committed` 有界等待，而非固定延迟。
+- 定向集成测试：101 passed。最后的证据落盘顺序修复后，相关 API/维护线程回归：15 passed。浏览器回归最后定向运行：模式/正常正文归档 1 passed，包正文及失败前缀归档 4 passed；各组有重叠，不相加当总数。
+- 本轮唯一一次全量：938 passed、22 skipped、2 failed。证据摘要时序失败已修复；取消测试单项复测通过，但首次失败根因未确认。两项之后均定向通过，最后修改后未再跑全量，不能宣称最终全量全绿。
+- Ruff 通过；最终 Pyright 为 0 errors、0 warnings、0 informations；CRLF-aware diff 检查通过。存在一条既有 Starlette/httpx deprecation warning。
+- 真实 Chrome 合成子集 6 skipped（当前环境未找到已安装 Chrome，未自动下载）。模拟 CDP 不等于真实浏览器验收。没有访问真实站点、DNS、进行 UI/Android worker 测试或 fxapk 联调，也没有再次调用付费模型。
+
+### 前一轮任务数据包重整的本地验证（2026-10-29，修复前历史）
+
+- 两个定向回归预检：2 passed，1 条既有 Starlette/httpx deprecation warning。
+- 唯一一次全量 pytest（修复前）：928 passed、22 skipped、4 failed，1 条既有 Starlette/httpx deprecation warning。4 个失败分别是浏览器清理异常保留挑战结果、两个构建任务缺少任务目录、HTTP 保存正文的日志路径字段被省略。
+- 修复后仅重跑受影响测试：4 passed；因遵守单次全量运行要求，未在修复后重跑全量套件。全量结果因此不能表述为修复后全绿。
+- 已恢复原有独立 WebView 构建磁盘计量；两个 task supervision 回归复测为 2 passed。
+- 22 个跳过项：5 个 Linux 浏览器网关行为、15 个需 PowerShell 的防火墙测试、2 个 POSIX/Linux 进程限制测试。未启用 live-site、Chrome UI 或 Android worker 测试。
+- Ruff `check src tests`：通过；Pyright `src`：0 errors、0 warnings、0 informations；Node `--check`：`app.js` 与 `data-package.js` 均通过。
+- `git diff --check` 因 Windows `core.autocrlf=true` 将 CRLF 报为新增行尾空白而退出 2；`git -c core.whitespace=cr-at-eol diff --check` 通过，未见其他空白问题。
+- 本轮没有进行真实目标、DNS、浏览器 UI 或 Android worker 测试。
+
+以下为 2026-10-29 的既有能力及历史记录，不代表本轮重新运行所有历史验收；实时可用性以 `/api/capabilities` 和实际任务结果为准。
 
 ## 当前能力
 
@@ -19,9 +53,9 @@
 
 “直接下载到当前设备”由客户端浏览器访问明确 APK/IPA 链接，不创建后端任务，也不表示服务端已校验文件。候选子任务另起请求会话，不继承父任务 Cookie。
 
-## 已有验证
+## 历史验收记录（不代表本轮重整已重跑）
 
-以下为不同范围的历史验收，数量不能相加为同一次测试结果。
+以下为不同范围的历史验收，数量不能相加为同一次测试结果；它们不验证本轮任务数据包改动。
 
 | 范围 | 记录结果 |
 | --- | --- |

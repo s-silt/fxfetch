@@ -25,6 +25,14 @@ from .core.errors import FxfetchError
 from .core.network import AcquisitionPolicy
 from .core.process_limits import run_limited
 from .core.proxy import LocalConnectProxy
+from .core.task_evidence import (
+    finalize_package,
+    package_directory,
+    package_file,
+    package_metadata,
+    write_package_metadata,
+)
+from .core.task_evidence_recorder import TaskEvidenceRecorder
 from .core.web_apk import WebApkBuilder, derive_names
 from .core.workflow import Workflow
 from .security import contained_path
@@ -55,6 +63,7 @@ class JobService:
         self._wake = threading.Event()
         self._mutex = threading.RLock()
         self._cancels: dict[str, threading.Event] = {}
+        self._data_package_active: set[str] = set()
         self._threads: list[threading.Thread] = []
         self._instance_lock = FileLock(self.store.root / "service.lock", thread_local=False)
         self._next_cleanup = 0.0
@@ -206,6 +215,13 @@ class JobService:
             )
             if created:
                 try:
+                    try:
+                        write_package_metadata(
+                            package_directory(self.store.root / "jobs" / job["id"]),
+                            {"state": "pending"},
+                        )
+                    except OSError:
+                        log.error("data_package_pending_write_failed id=%s", job["id"])
                     directory = self.store.root / "jobs" / job["id"] / "source"
                     directory.mkdir(parents=True, exist_ok=True)
                     if image:
@@ -287,7 +303,26 @@ class JobService:
         for candidate in job["download_candidates"]:
             candidate["child_job_id"] = child_map.get(candidate["id"])
         job["web_candidates"] = self.web_candidates(job)
+        with self._mutex:
+            job["data_package"] = package_metadata(
+                self.store.root / "jobs" / identifier,
+                job["state"],
+                active=identifier in self._data_package_active,
+            )
         return job
+
+    def data_package_file(self, owner: str, identifier: str) -> tuple[Path, str]:
+        job = self.store.get_job(owner, identifier)
+        folder = self.store.root / "jobs" / identifier
+        with self._mutex:
+            metadata = package_metadata(
+                folder, job["state"], active=identifier in self._data_package_active
+            )
+        try:
+            path = package_file(folder, metadata, self.settings.limits.max_task_bytes)
+        except Exception as error:
+            raise FxfetchError("not_found", "Data package is unavailable") from error
+        return path, metadata["filename"]
 
     @staticmethod
     def download_candidates(job: dict) -> list[dict]:
@@ -466,9 +501,7 @@ class JobService:
         if kind == "maintenance":
             while not self._stop.wait(1):
                 try:
-                    self.store.expire_queued(
-                        self.settings.limits.chain_timeout, self.settings.limits.build_timeout
-                    )
+                    self._expire_queued()
                 except (sqlite3.Error, OSError) as error:
                     log.error("queue_expiry_failed exception_type=%s", type(error).__name__)
             return
@@ -625,6 +658,44 @@ class JobService:
             }
         return value
 
+    def _expire_queued(self) -> None:
+        with self._mutex:
+            expired = self.store.expire_queued(
+                self.settings.limits.chain_timeout, self.settings.limits.build_timeout
+            )
+            identifiers = {job["id"] for job in expired}
+            self._data_package_active.update(identifiers)
+        try:
+            for job in expired:
+                self._seal_data_package(job, job["result"])
+        finally:
+            with self._mutex:
+                self._data_package_active.difference_update(identifiers)
+
+    def _seal_data_package(self, job: dict, result: dict) -> None:
+        folder = self.store.root / "jobs" / job["id"]
+        try:
+            write_package_metadata(package_directory(folder), {"state": "building"})
+        except OSError:
+            log.error("data_package_state_write_failed id=%s", job["id"])
+        try:
+            package_result = finalize_package(
+                folder,
+                job_id=job["id"],
+                entry_url=job["input"]["entry_url"],
+                terminal_result=result,
+                observation_path=folder / "task-observations.jsonl",
+                max_bytes=self.settings.limits.max_task_bytes,
+            )
+            if package_result.get("state") == "failed":
+                log.error(
+                    "data_package_finalize_failed id=%s reason_code=%s",
+                    job["id"], package_result.get("reason_code"),
+                )
+        except Exception as error:
+            log.error("data_package_finalize_failed id=%s exception_type=%s",
+                      job["id"], type(error).__name__)
+
     def _expired_claim(self, item: dict, *, build: bool = False) -> bool:
         timeout = self.settings.limits.build_timeout if build else self.settings.limits.chain_timeout
         if time.time() < item["created"] + timeout:
@@ -637,12 +708,27 @@ class JobService:
             self.store.finish_build(item["id"], "failed", result)
         else:
             self.store.finish_job(item["id"], "completed", result)
+            self._seal_data_package(item, result)
         return True
 
     def _collect(self, job: dict, cancel: threading.Event) -> None:
+        with self._mutex:
+            self._data_package_active.add(job["id"])
+        try:
+            self._collect_claimed(job, cancel)
+        finally:
+            with self._mutex:
+                self._data_package_active.discard(job["id"])
+
+    def _collect_claimed(self, job: dict, cancel: threading.Event) -> None:
         if self._expired_claim(job):
             return
         folder = self.store.root / "jobs" / job["id"]
+        try:
+            write_package_metadata(package_directory(folder), {"state": "pending"})
+        except OSError:
+            log.error("data_package_state_write_failed id=%s", job["id"])
+        recorder = None if self._isolated_collect else TaskEvidenceRecorder(folder)
         started, deadline = self._start_progress(job["id"], self.settings.limits.chain_timeout)
         value: dict[str, Any]
         if self._isolated_collect:
@@ -653,6 +739,7 @@ class JobService:
                     "identifier": job["id"],
                     "url": job["input"]["entry_url"],
                     "output_dir": str(folder),
+                    "observation_path": str(folder / "task-observations.jsonl"),
                     "limits": asdict(self.settings.limits),
                     "proxy_host": self.settings.proxy_host,
                     "proxy_port": self.settings.proxy_port,
@@ -662,14 +749,23 @@ class JobService:
                 cancel,
             )
         else:
-            value = asdict(
-                self.workflow.run(
+            def progress(event: dict) -> None:
+                self.store.progress(job["id"], event)
+                if recorder is not None:
+                    recorder.observe_progress(event)
+
+            try:
+                value = asdict(
+                    self.workflow.run(
                     job["input"]["entry_url"],
                     folder,
                     cancel,
-                    lambda event: self.store.progress(job["id"], event),
+                    progress,
+                    )
                 )
-            )
+            finally:
+                if recorder is not None:
+                    recorder.close()
         if cancel.is_set() or time.monotonic() >= deadline:
             value = {
                 "outcome": "failed",
@@ -726,6 +822,7 @@ class JobService:
         except OSError as error:
             # The committed SQLite result stays authoritative if the final evidence write fails.
             log.error("final_evidence_write_failed id=%s exception_type=%s", job["id"], type(error).__name__)
+        self._seal_data_package(job, terminal["result"])
 
     def _build(self, build: dict, cancel: threading.Event) -> None:
         if self._expired_claim(build, build=True):

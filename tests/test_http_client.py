@@ -54,6 +54,20 @@ def server():
             pass
 
         def do_GET(self):
+            if self.path == "/bad-location-200":
+                body = b"body retained despite malformed Location"
+                self.send_response(200)
+                self.send_header("Location", "http://[")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/bad-redirect":
+                self.send_response(302)
+                self.send_header("Location", "http://[")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.path in ("/redirect-page", "/back-to-page"):
                 self.send_response(302)
                 self.send_header("Location", "/download-page" if self.path == "/redirect-page" else "/loop-page")
@@ -401,14 +415,20 @@ def test_http_package_progress_is_throttled_and_requires_actual_zip(server, tmp_
 
 def test_http_truncated_zip_progress_never_claims_complete_or_verified(server, tmp_path):
     events = []
+    observations = []
     with pytest.raises(FxfetchError) as error:
         LocalClient().fetch(server + "/zip-short", tmp_path / "response", user_agent="Synthetic",
-                            cookie_jar=CookieJar(), cancel=threading.Event(), on_event=events.append)
+                            cookie_jar=CookieJar(), cancel=threading.Event(), on_event=events.append,
+                            on_transport_event=observations.append)
     assert error.value.code == "length_mismatch"
     progress = [e for e in events if e["event"] == "download_progress"]
     assert progress[-1]["received_bytes"] == 104
     assert all(e["complete"] is False for e in progress)
     assert not any(e["event"] in ("response_complete", "file_verified") for e in events)
+    prefix = next(e for e in observations if e["kind"] == "response_prefix_saved")
+    assert prefix["package_stream"] is True
+    assert prefix["complete"] is False
+    assert prefix["representation"] == "http_response_prefix"
 
 
 def test_http_redirect_cycle_stops_before_second_request(server, tmp_path):
@@ -418,6 +438,32 @@ def test_http_redirect_cycle_stops_before_second_request(server, tmp_path):
                             cookie_jar=CookieJar(), cancel=threading.Event(), on_event=events.append)
     assert error.value.code == "redirect_cycle"
     assert sum(e["event"] == "request" for e in events) == 1
+
+
+def test_malformed_location_on_http_200_does_not_break_fetch(server, tmp_path):
+    response = LocalClient().fetch(
+        server + "/bad-location-200",
+        tmp_path / "body",
+        user_agent="Synthetic",
+        cookie_jar=CookieJar(),
+        cancel=threading.Event(),
+    )
+    assert response.path.read_bytes() == b"body retained despite malformed Location"
+
+
+def test_invalid_redirect_retains_raw_location_observation(server, tmp_path):
+    observed = []
+    with pytest.raises((FxfetchError, ValueError)):
+        LocalClient().fetch(
+            server + "/bad-redirect",
+            tmp_path / "body",
+            user_agent="Synthetic",
+            cookie_jar=CookieJar(),
+            cancel=threading.Event(),
+            on_transport_event=observed.append,
+        )
+    response = next(row for row in observed if row["kind"] == "response_observed")
+    assert response["location_raw"] == "http://["
 
 
 def test_real_transport_workflow_event_chain_and_shared_redirect_limit(server, tmp_path):

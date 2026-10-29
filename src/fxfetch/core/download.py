@@ -14,6 +14,14 @@ from .limits import Limits
 _DEFAULT_LIMITS = Limits()
 
 
+def is_package_prefix(prefix: bytes, *, incomplete: bool = False) -> bool:
+    signatures = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+    prefix = prefix[:4]
+    if incomplete:
+        return bool(prefix) and any(signature.startswith(prefix) for signature in signatures)
+    return prefix in signatures
+
+
 def classify_package(path: Path, limits: Limits = _DEFAULT_LIMITS) -> str | None:
     if path.stat().st_size > limits.max_package_bytes:
         raise FxfetchError("package_limit", "Package exceeds byte limit")

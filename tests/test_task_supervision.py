@@ -6,9 +6,14 @@ import json
 import sys
 import threading
 import time
+import zipfile
 from dataclasses import replace
 
+import pytest
+
+import fxfetch.service as service_module
 from fxfetch.config import Settings
+from fxfetch.core.errors import FxfetchError
 from fxfetch.core.limits import Limits
 from fxfetch.core.process_limits import run_limited
 from fxfetch.core.web_apk import derive_names
@@ -90,7 +95,11 @@ def test_queue_expiry_without_claim_expires_both_kinds(tmp_path):
     with service.store.connect() as db:
         db.execute("UPDATE jobs SET created=? WHERE id=?", (time.time() - 700, waiting["id"]))
         db.execute("UPDATE builds SET created=? WHERE id=?", (time.time() - 1000, build["id"]))
-    service.store.expire_queued(600, 900)
+    expired = service.store.expire_queued(600, 900)
+    assert [job["id"] for job in expired] == [waiting["id"]]
+    assert expired[0]["input"]["entry_url"] == "https://synthetic.invalid/"
+    assert expired[0]["result"]["reason_code"] == "queue_timeout"
+    assert service.store.expire_queued(600, 900) == []
     result = service.get_job("owner", waiting["id"])
     assert result["reason_code"] == "queue_timeout" and result["result"]["coverage"] == "not_started"
     assert result["progress"]["events"][-1]["event"] == "queue_timeout"
@@ -186,20 +195,51 @@ def test_real_worker_disabled_build_and_progress(tmp_path):
     assert not (service.store.root / ".build-private" / "scratch" / ("task-" + build["id"])).exists()
 
 
-def test_maintenance_expires_waiting_job_without_claim(tmp_path):
+def test_maintenance_expires_waiting_job_without_claim(tmp_path, monkeypatch):
     service = make_service(tmp_path, chain_timeout=0.1)
-    item = queued(service)
+    busy = queued(service, "busy")
+    service.store.claim_job()
+    item = service.create_job("owner", "waiting", {"url": "https://synthetic.invalid/"})
+    sealing = threading.Event()
+    release = threading.Event()
+    finalize = service_module.finalize_package
+
+    def paused_finalize(*args, **kwargs):
+        sealing.set()
+        assert release.wait(5), "Test did not release the archive seal"
+        return finalize(*args, **kwargs)
+
+    monkeypatch.setattr(service_module, "finalize_package", paused_finalize)
     worker = threading.Thread(target=service._loop, args=("maintenance",))
     worker.start()
     try:
-        deadline = time.monotonic() + 3
-        while service.get_job("owner", item["id"])["state"] == "queued" and time.monotonic() < deadline:
+        assert sealing.wait(5), "Maintenance did not seal the expired job"
+        result = service.get_job("owner", item["id"])
+        assert result["state"] == "completed"
+        assert result["reason_code"] == "queue_timeout"
+        assert result["data_package"]["state"] == "building"
+        with pytest.raises(FxfetchError, match="Data package is unavailable"):
+            service.data_package_file("owner", item["id"])
+        release.set()
+        deadline = time.monotonic() + 5
+        while service.get_job("owner", item["id"])["data_package"]["state"] != "ready" and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert service.get_job("owner", item["id"])["reason_code"] == "queue_timeout"
+        path, _ = service.data_package_file("owner", item["id"])
+        with zipfile.ZipFile(path) as bundle:
+            manifest = json.loads(bundle.read("manifest.json"))
+        assert manifest["package_result"] == {
+            "outcome": "failed", "reason_code": "queue_timeout", "coverage": "not_started",
+        }
+        assert manifest["observations"]["state"] == "unavailable"
+        assert manifest["files"] == manifest["external_packages"] == []
+        assert service.store.claim_job() is None
+        assert service.store.get_job("owner", busy["id"])["state"] == "running"
     finally:
+        release.set()
         service._stop.set()
-        worker.join(2)
+        worker.join(5)
     assert not worker.is_alive()
+    assert not service._data_package_active
 
 
 def test_real_build_timeout_and_cancel_kill_descendant_tree(tmp_path, monkeypatch):

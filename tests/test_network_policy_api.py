@@ -67,7 +67,15 @@ def test_api_retains_direct_failure_proxy_attempt_and_events(tmp_path):
         assert any(
             row.get("network_mode") == "proxy" and row.get("cookies_inherited") is False for row in events
         )
-        evidence = json.loads((tmp_path / "jobs" / job["id"] / "evidence.json").read_text(encoding="utf-8"))
+        evidence_path = tmp_path / "jobs" / job["id"] / "evidence.json"
+        evidence_deadline = time.monotonic() + 5
+        evidence = {}
+        while time.monotonic() < evidence_deadline:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            if evidence.get("terminal_status") == "committed":
+                break
+            Event().wait(0.01)
+        assert evidence.get("terminal_status") == "committed"
         private_attempts = evidence["summary"]["network_attempts"]
         assert len(private_attempts) == len(attempts)
         for private, public in zip(private_attempts, attempts, strict=True):
