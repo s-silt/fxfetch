@@ -114,7 +114,7 @@ def _server_config(root: Path, options: argparse.Namespace | None = None) -> dic
 
 def _parser(command: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fxfetch" + (f" {command}" if command else ""))
-    if command in {"capture-web", "export-web"}:
+    if command in {"capture-web", "export-web", "prepare-analysis", "analyze-data"}:
         parser.add_argument("--out", type=Path, required=True, help="New private output directory")
     elif command not in {"verify-web", "verify-data"}:
         parser.add_argument("--out", type=Path, default=_ROOT, help="Private local output/service root")
@@ -129,6 +129,11 @@ def _parser(command: str | None = None) -> argparse.ArgumentParser:
         parser.add_argument("bundle_dir", type=Path)
     elif command == "verify-data":
         parser.add_argument("archive_path", type=Path)
+    elif command in {"prepare-analysis", "analyze-data"}:
+        parser.add_argument("archive_path", type=Path)
+        if command == "analyze-data":
+            parser.add_argument("--fxapk", default="fxapk", help="Trusted local fxapk executable (not a shell command)")
+            parser.add_argument("--timeout", type=float, default=300.0, help="Analysis deadline in seconds (1–3600)")
     elif command == "serve":
         parser.add_argument("--host")
         parser.add_argument("--port", type=int)
@@ -147,7 +152,8 @@ def _parser(command: str | None = None) -> argparse.ArgumentParser:
             "--authorized-active", action="store_true", help="Authorize this invocation to resolve/connect"
         )
         parser.epilog = (
-            "Commands: init, init-build, serve, doctor, capture-web, export-web, verify-web, verify-data. "
+            "Commands: init, init-build, serve, doctor, capture-web, export-web, verify-web, verify-data, "
+            "prepare-analysis, analyze-data. "
             "Run fxfetch COMMAND --help."
         )
     if command in (None, "serve"):
@@ -166,7 +172,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = (
         arguments.pop(0)
         if arguments and arguments[0] in {
-            "init", "serve", "doctor", "init-build", "capture-web", "export-web", "verify-web", "verify-data"
+            "init", "serve", "doctor", "init-build", "capture-web", "export-web", "verify-web", "verify-data",
+            "prepare-analysis", "analyze-data",
         }
         else None
     )
@@ -323,6 +330,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             )
             return 0
+        if command in {"prepare-analysis", "analyze-data"}:
+            from .core.analysis_package import prepare_analysis
+            from .core.analysis_runner import analyze_archive
+
+            if command == "prepare-analysis":
+                receipt = prepare_analysis(options.archive_path, options.out, max_bytes=Limits().max_task_bytes)
+            else:
+                receipt = analyze_archive(
+                    options.archive_path, options.out, max_bytes=Limits().max_task_bytes,
+                    executable=options.fxapk, timeout=options.timeout,
+                )
+            _print({"state": receipt["state"], "receipt": str(options.out / "analysis.json"),
+                    "analysis_state": receipt["analysis"]["state"],
+                    "reason_code": receipt["analysis"].get("reason_code"),
+                    "coverage": "partial", "online": False})
+            return 0 if receipt["state"] in {"prepared", "completed"} else 1
         if command == "verify-data":
             from .core.task_evidence_io import verify_task_archive
 

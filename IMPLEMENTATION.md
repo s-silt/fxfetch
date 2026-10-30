@@ -1,5 +1,15 @@
 # 实现状态与验收
 
+## fxapk 离线衔接（后续本地实现）
+
+- `prepare-analysis` 校验统一任务 ZIP 并整理独立输入；`analyze-data` 通过受限子进程调用已安装的 `fxapk analyze-web --offline --fmt json`。不修改 fxapk 源码，不改 APK/WebView 流程。
+- 原始 ZIP、manifest、观察日志保留在分析输入之外；HAR 只投影明确请求身份及响应，来源映射指向原观察序号。候选、未知关联、frame 导航等未投影观察仍在原包，不冒充实际请求。
+- `analysis_materials` 从明确关联的响应 MIME 选择解析器，避免浏览器 `.body` 脚本被作为普通文本漏掉静态跳转分析；同 URL 不够构成关联，冲突和未知保留为缺口。DOM、响应正文和截断前缀仍分别标注，字节和哈希不改写。
+- 第一版实测：72 项定向测试、1 项真实 fxapk CLI 合成联调通过；全量 969 passed、23 skipped。Windows Python 3.13 / fxapk 1.21，未做 NAS/Docker 验收。这是后续 MIME/混合材料补修之前的结果，不代表补修后验证。
+- MIME/来源补修后：81 项定向测试通过；最终类型标注修正后，真实 fxapk CLI 四个合成案例全部通过，全量 978 passed、26 skipped、0 failed，Ruff/Pyright 通过。四个可选集成用例已单独运行；其余跳过为平台相关。普通页面、blocked、合成包分离案例覆盖 JS 静态跳转、JSON 接口、第三方请求、未知/拒绝/失败请求、DOM 和截断前缀；子进程审计钩子确认加载，未记录 DNS/连接尝试。使用合成浏览器观察，不代表实际 Chrome 或 Android 采集验收。
+- 网页入口已核对：目前只有独立数据包下载，尚未增加自动或手动分析按钮。后续需独立的分析任务状态、并发/期限/取消与重启中断处理、会话所有权和报告下载接口；不能把长时间分析塞进下载请求或采集线程。页面载入、轮询和数据包下载均不得启动分析。
+- 本地合成观察和真实 fxapk 子进程联调不等于真实浏览器采集验收；真实站点、Android worker、网页分析 UI 尚未验收。
+
 ## 独立网页材料采集（第一阶段）
 
 本阶段实现为独立且有界的 `fxfetch capture-web` 工作流，包含 HTTP/浏览器采集器、每次采集独立的 JSONL provenance ledger，以及基于 `fxfetch.web-evidence.v1` 的离线目录导出/验证（例如 `fxfetch export-web CAPTURE_DIR --out NEW_BUNDLE_DIR`、`fxfetch verify-web BUNDLE_DIR`）。覆盖范围始终为 partial；浏览器命令必须显式提供 `--service-root .runtime/service` 并使用已有受保护的 Android worker。证据包可能包含私有查询参数和正文，不会匿名化；ledger 只适用于独立采集，不升级旧服务下载任务。本阶段没有 HAR、UI 或 fxapk 集成，也不改变既有下载行为。字节预算不包含 JSONL ledger 与元数据开销。验证覆盖合成真实 Chrome，实际 Android wrapper 尚未测试；哈希只保证完整性，不是真实性认证。
