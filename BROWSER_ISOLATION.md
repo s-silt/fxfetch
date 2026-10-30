@@ -25,7 +25,7 @@
 
 - 只复制本机已安装签名 Chrome，锁定可执行文件及依赖清单/哈希；不下载浏览器、不改用户日常 Chrome、不修改系统代理。所有可能启动的辅助 EXE 也要纳入策略或被禁止启动；不能只保护主 browser PID。
 - WFP 在 `ALE_AUTH_CONNECT_V4/V6` 按副本应用 ID/受控身份拒绝连接；native-CONNECT 模式唯一允许的出口为专用 broker 的精确 loopback TCP 地址/端口。明确覆盖其他 loopback 端口、所有 IPv6、UDP、QUIC、STUN/TURN、mDNS/LLMNR；不得用“Block Any + Allow broker”期望例外胜出。
-- 独立 broker 严格校验 HTTP absolute-form、Host、CONNECT authority，拒绝凭据混淆、特殊协议与私有/特殊 IP。DNS 仅用服务既定公共解析器，锁定实际 IP；CONNECT 可沿既定本地代理建立到已验证 IP 的隧道，Chrome 保留证书校验。不装根证书，不 TLS MITM。broker 对整个 TLS 隧道实施保守 wire-byte/并发/时间预算，CDP 对逻辑响应另计预算；不能声称隧道内完整 HTTP 计数。
+- 独立 broker 严格校验 HTTP absolute-form、Host、CONNECT authority，拒绝凭据混淆、特殊协议与私有/特殊 IP。DNS 仅用服务既定公共解析器，锁定实际 IP；CONNECT 可沿既定本地代理建立到已验证 IP 的隧道，Chrome 每次请求先校验证书；新网页任务默认允许对已通过请求守卫、实际产生证书错误的请求逐事件继续，严格模式则停止。不得全局设置忽略证书，不因其他连接错误降级；保留实际错误、风险与证书原件/缺口，退出时清理事件处理设置。逐事件继续仅对可确认归属的顶层页面启用，iframe 保持原请求守卫；无法可靠关联的嵌入页面证书错误明确失败或缺口，不猜测父子关联。不装根证书，不 TLS MITM。broker 对整个 TLS 隧道实施保守 wire-byte/并发/时间预算，CDP 对逻辑响应另计预算；不能声称隧道内完整 HTTP 计数。
 - 警惕 DNS Client 服务等委托网络请求：程序路径规则只约束 Chrome socket，不能未经实测就宣称阻断所有代理服务的出站。禁用浏览器隐式 DNS/代理发现只是减面措施；合成捕获仍须证明无泄漏。
 - Chrome 所有可写路径、TEMP/TMP、profile、缓存、native download 均进入固定容量专用 VHD/VHDX 或等价硬限制文件系统。禁止把 writable AppContainer package 存储或用户 LocalAppData 留在外部。单独明确总任务预算与其他 Python 输出预留，容量阈值由真实文件写入失败证明，不能以目录巡检代替。
 - 固定容量卷的创建/挂载及 WFP 规则安装需要管理员上下文；当前服务非管理员。安装动作只能作用于项目独立副本/新建私有虚拟盘，必须生成精确 rollback 清单，不改全机默认入站/出站策略，不修改已有用户规则。

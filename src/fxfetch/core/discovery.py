@@ -136,6 +136,9 @@ def download_action(
         r"(?:下载并安装|下载安装|下载|安装|download(?:\s+and\s+install)?|install)"
         r"(?:\s*(?:APP|APK|Android|iOS|now|app))?",
         " ".join(label.split()), re.I,
+    ) or re.fullmatch(
+        r"get\s+(?:(?:the\s+)?(?:apk|android\s+app)|(?:the\s+)?app\s+for\s+android)",
+        " ".join(label.split()), re.I,
     ))
     navigation = bool(re.search(r"首页|分类|标签|文章|教程|指南|说明|帮助|客服|如何|怎么|遇|之后|后|\?", label))
     html_article = bool(re.search(r"\.(?:html?|php)$", urlsplit(href).path, re.I))
@@ -457,6 +460,7 @@ def discover_html(
     except (ValueError, AssertionError) as exc:
         raise FxfetchError("html_parse_failed", "Static HTML parse failed") from exc
     if "browser_required" in parser.result.gaps:
+        from .json_package import embedded_json_packages
         from .script_package import script_package_candidates
 
         try:
@@ -468,6 +472,10 @@ def discover_html(
             # Optional literal discovery cannot turn an unprocessed script
             # into package absence or prevent the existing Chrome handoff.
             parser.result.gaps.append("script_package_incomplete")
+        embedded = embedded_json_packages(text, source_url, maximum)
+        for candidate in embedded.candidates:
+            parser.add(candidate.url, label=candidate.label, action=candidate.action)
+        parser.result.gaps.extend(embedded.gaps)
     if any(item.action == "download_attribute" for item in parser.result.candidates):
         parser.result.candidates = [
             item

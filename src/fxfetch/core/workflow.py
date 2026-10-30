@@ -693,6 +693,8 @@ class Workflow:
                         resource_failures.add((chain, image.url))
                     if error.code in {
                         "target_not_public",
+                        "dns_unsafe_answer",
+                        "dns_tls_verification_failed",
                         "peer_mismatch",
                         "tls_verification_failed",
                         "tls_handshake_failed",

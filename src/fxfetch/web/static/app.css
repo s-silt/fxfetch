@@ -132,3 +132,29 @@ footer { max-width:1240px; padding:20px 32px 24px; margin-top:24px; }
 }
 
 .direct-download-link{display:block;text-align:center;margin-top:10px;padding:12px;border:1px solid var(--line);border-radius:10px;color:var(--green);text-decoration:none;font-size:14px}
+.tls-option { margin:14px 0; padding:12px; border:1px solid #e8d5b2; border-radius:10px; background:#fffbf3; }
+.tls-option label { display:flex; align-items:flex-start; gap:9px; margin:0; cursor:pointer; font-size:13px; line-height:1.6; }
+.tls-option select { width:100%; margin-top:7px; font-size:13px; min-height:42px; }
+.tls-option p { margin:7px 0 0; color:#775b32; font-size:11px; line-height:1.7; overflow-wrap:anywhere; }
+.tls-warning { padding:12px; border-left:3px solid #b37b2b; background:#fffbf3; color:#775b32; font-size:12px; line-height:1.8; overflow-wrap:anywhere; }
+
+/* Primary collection actions stay ahead of optional transport settings. */
+.input-card #download-button { margin-top:18px; }
+.input-card .strategy { margin:10px 0 0; }
+.advanced-settings { margin-top:16px; border-top:1px solid var(--line); min-width:0; }
+.advanced-settings > summary { display:flex; align-items:center; gap:10px; min-height:48px; padding:10px 0; cursor:pointer; list-style:none; font-size:12px; font-weight:600; }
+.advanced-settings > summary::-webkit-details-marker { display:none; }
+.advanced-settings > summary::after { content:"⌄"; color:var(--muted); font-size:17px; line-height:1; transition:transform .15s; }
+.advanced-settings[open] > summary::after { transform:rotate(180deg); }
+.advanced-settings > summary:focus-visible { outline:3px solid #81a894; outline-offset:3px; border-radius:6px; }
+.advanced-current { margin-left:auto; color:var(--muted); font-size:11px; font-weight:400; }
+.advanced-settings .tls-option { margin:0 0 4px; padding:14px; border-color:var(--line); background:#f8faf6; }
+.advanced-settings .tls-option p { color:#68766e; }
+.advanced-settings .tls-option select { font-size:12px; padding:11px 8px; }
+.input-card .capabilities { margin-top:12px; padding-top:12px; }
+@media(max-width:480px) {
+  .input-card .section-heading { margin-bottom:17px; }
+  .input-card textarea { min-height:92px; }
+  .input-card .separator { margin:16px 0 12px; }
+  .advanced-settings .tls-option { padding:12px; }
+}

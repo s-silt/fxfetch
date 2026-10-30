@@ -9,6 +9,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from .core.analysis_evidence_filter import filter_report
+from .core.analysis_har import json_bytes
 from .core.analysis_runner import MAX_REPORT_BYTES, _report_receipt
 from .core.web_evidence_io import check_ancestors, is_reparse, read_json_object
 from .core.web_evidence_schema import EvidenceError
@@ -51,9 +53,7 @@ def build_analysis_report(output: Path, pending: Path) -> dict[str, Any]:
     if state != "completed":
         return {
             "state": state,
-            "reason_code": safe_reason(
-                analysis.get("reason_code", receipt.get("reason_code"))
-            ),
+            "reason_code": safe_reason(analysis.get("reason_code", receipt.get("reason_code"))),
         }
 
     try:
@@ -70,12 +70,22 @@ def build_analysis_report(output: Path, pending: Path) -> dict[str, Any]:
         check_ancestors(report)
         if not report.is_file() or is_reparse(report) or report.stat().st_size > MAX_REPORT_BYTES:
             raise EvidenceError("analysis_report_invalid")
+        # Authenticate the original before applying a publication-only copy filter.
+        published, filter_stats = filter_report(read_json_object(report, MAX_REPORT_BYTES), output, receipt)
+        report_bytes = json_bytes(published)
+        if len(report_bytes) > MAX_REPORT_BYTES:
+            raise EvidenceError("analysis_report_too_large")
         sanitized = json.loads(json.dumps(receipt))
         sanitized_analysis = sanitized.get("analysis")
         if isinstance(sanitized_analysis, dict):
             sanitized_analysis.pop("command", None)
             sanitized_analysis.pop("executable", None)
             sanitized_analysis["online"] = False
+            sanitized_analysis["report"] = {**verified, "sha256": hashlib.sha256(report_bytes).hexdigest()}
+            prior_filter = sanitized_analysis.get("evidence_filter")
+            if isinstance(prior_filter, dict):
+                filter_stats["suppressed_findings"] += int(prior_filter.get("suppressed_findings", 0))
+            sanitized_analysis["evidence_filter"] = filter_stats
         check_ancestors(pending.parent)
         if (
             not pending.parent.is_dir()
@@ -93,7 +103,7 @@ def build_analysis_report(output: Path, pending: Path) -> dict[str, Any]:
                     separators=(",", ":"),
                 ).encode("utf-8"),
             )
-            bundle.write(report, "report/input.json")
+            bundle.writestr("report/input.json", report_bytes)
         if is_reparse(pending):
             raise EvidenceError("analysis_report_invalid")
         size, digest = bounded_hash(pending, MAX_ANALYSIS_REPORT_ZIP_BYTES)

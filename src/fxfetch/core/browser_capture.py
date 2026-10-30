@@ -30,6 +30,9 @@ from .browser_response import (
     write_capture_diagnostic,
 )
 from .browser_runtime import RuntimeDiagnostics
+from .browser_tls_evidence import BrowserTLSCapture
+from .browser_tls_policy import BrowserTLSPolicy, certificate_failure_is_critical, resolve_tls_policy
+from .browser_tls_trace import BrowserTLSTrace
 from .browser_web_evidence import BrowserWebEvidence, record_saved_material
 from .cdp_transport import CDPCommandError, CDPMux, resolve_endpoint
 from .classify import classify_input
@@ -49,7 +52,7 @@ MAX_NO_PROGRESS_SECONDS = 30.0
 _UNSUPPORTED_TARGETS = {"worker", "shared_worker", "service_worker", "worklet", "auction_worklet"}
 _DEFAULT_LIMITS = Limits()
 _BUSINESS_TEXT = re.compile(
-    r"登录|注册|支付|充值|购买|sign.?in|sign.?up|register|payment|purchase", re.IGNORECASE
+    r"登录|注册|支付|付款|充值|购买|sign.?in|sign.?up|log.?in|register|payment|purchase|\bpay\b", re.IGNORECASE
 )
 _SEMANTIC_CONTROLS = "a,button,input[type=button],[role=button]"
 _ACTION_HINTS = ":is([class*='download' i],[class*='install' i],[class*='button' i],[class*='btn' i],[onclick])"
@@ -101,6 +104,9 @@ class BrowserCaptureResult:
     candidates: list[Candidate] = field(default_factory=list)
     selection_candidates: list[Candidate] = field(default_factory=list)
     page_qr: dict[str, Any] = field(default_factory=dict)
+    tls_verification: str = "required"
+    tls_policy: str = "strict"
+    tls_fallback_used: bool = False
 
 
 async def capture_browser(
@@ -115,12 +121,15 @@ async def capture_browser(
     purpose: str = "package",
     journal: EvidenceJournal | None = None,
     observation_context: dict[str, str] | None = None,
+    ignore_tls_errors: bool = False,
+    tls_policy: str = "strict",
 ) -> BrowserCaptureResult:
     """Capture without HTTP replay, native file staging or downloaded-code execution.
 
     Tests may inject a tests-only local lease. Production needs its own accepted
     lease issuer. Settled pages with no package stay failed/partial, not not_found.
     """
+    tls_policy = resolve_tls_policy(tls_policy, ignore_tls_errors)
     if lease is None:
         raise FxfetchError("browser_guard_unavailable", "Browser confinement lease is unavailable")
     proof = lease.verify_before_launch()
@@ -132,15 +141,18 @@ async def capture_browser(
         raise FxfetchError("unsupported_capture_purpose", "Unsupported browser capture purpose")
     if chain not in {"android", "iphone"} or urlsplit(entry_url).scheme not in {"http", "https"}:
         raise FxfetchError("unsupported_input", "Unsupported browser capture input")
-    result = BrowserCaptureResult()
+    result = BrowserCaptureResult(tls_policy=tls_policy)
     if purpose == "web":
         result.gaps = ["single_passive_visit", "interaction_not_performed"]
     deadline = time.monotonic() + min(600.0, limits.chain_timeout)
     requests = redirects = body_bytes = candidate_number = interactions = web_bytes = 0
     ready: dict[str, str] = {}
+    tls_sessions: set[str] = set()
     request_numbers: dict[tuple[str, str], int] = {}
     web_observer = (
-        BrowserWebEvidence(journal=journal, event_context=observation_context)
+        BrowserWebEvidence(journal=journal, event_context={
+            **(observation_context or {}), "tls_verification": "required", "tls_policy": tls_policy,
+        }, tls_context=lambda session, url: tls_control.context(session, url))
         if purpose == "web" or journal is not None else None
     )
     policy_observer = web_observer if purpose == "web" else None
@@ -182,6 +194,25 @@ async def capture_browser(
         if on_event is not None:
             on_event({"event": event, "url": url, "chain": chain, "request_count": requests, **values})
 
+    def note_tls_gap(session: str, event: dict[str, Any], record: dict[str, object],
+                     reason: str = "browser_certificate_connection_binding_unavailable") -> None:
+        url = event["request"]["url"]
+        if urlsplit(url).scheme != "https":
+            return
+        # Network.getCertificate accepts an origin, not a connection/request.
+        # Security's page certificate also lacks that binding. Neither is a
+        # trustworthy source of this intercepted request's original peer DER.
+        record["tls_certificate_capture"] = "not_captured"
+        record["tls_certificate_reason"] = reason
+        result.gaps.append("tls_certificate_not_captured")
+        if web_observer is not None:
+            web_observer.journal_event(
+                "gap", **web_observer.fetch_context(session, event),
+                url=url, source_url=url, code="tls_certificate_not_captured",
+                reason_code=reason, capture_status="not_captured", association="unknown",
+                representation="tls_certificate_der", complete=False,
+            )
+
     def schedule(coroutine: Coroutine[Any, Any, None]) -> None:
         task = asyncio.create_task(coroutine)
         tasks.add(task)
@@ -206,6 +237,53 @@ async def capture_browser(
     async def send(session: str | None, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         assert mux is not None
         return await mux.send(session, method, params)
+
+    def tls_policy_event(kind: str, fields: dict[str, Any]) -> None:
+        if kind == "tls_verification_fallback":
+            result.tls_fallback_used = True
+            result.tls_verification = "unknown"
+        elif kind == "gap" and isinstance(fields.get("code"), str):
+            result.gaps.append(fields["code"])
+        if web_observer is not None:
+            web_observer.journal_event(kind, **fields)
+        if kind in {"tls_certificate_error", "tls_verification_fallback"}:
+            emit("tls_fallback_continued" if kind == "tls_verification_fallback" else kind,
+                 fields["source_url"], tls_verify_reason=fields["tls_verify_reason"])
+
+    tls_control = BrowserTLSPolicy(policy=tls_policy, check=check, send=send, emit=tls_policy_event)
+
+    def certificate_event(kind: str, fields: dict[str, Any]) -> None:
+        # Trace/origin snapshots cannot identify which connection inherited a
+        # certificate exception. Keep their validation status explicitly unknown.
+        fields = {"tls_verification": "unknown" if tls_control.affected else "required", **fields}
+        if kind == "gap" and isinstance(fields.get("code"), str):
+            result.gaps.append(fields["code"])
+        if web_observer is not None:
+            web_observer.journal_event(kind, **fields)
+
+    def reserve_certificate_bytes(size: int) -> None:
+        nonlocal body_bytes
+        body_bytes += size
+
+    tls_capture = BrowserTLSCapture(
+        output_dir=output_dir, root=journal.path.parent if journal is not None else output_dir,
+        max_task_bytes=limits.max_task_bytes, deadline=deadline, cancel=cancel,
+        send=send, emit=certificate_event,
+        remaining_bytes=lambda: limits.max_task_bytes - body_bytes,
+        reserve_bytes=reserve_certificate_bytes,
+    )
+    async def certificate_cleanup(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        assert mux is not None
+        if method == "Tracing.end" and tls_trace.owned:
+            return await mux.send_cleanup(method)
+        if method == "IO.close" and tls_trace.stream is not None and params.get("handle") == tls_trace.stream:
+            return await mux.send_cleanup(method, stream=tls_trace.stream)
+        raise ValueError("Unowned certificate cleanup")
+
+    tls_trace = BrowserTLSTrace(
+        deadline=deadline, cancel=cancel, send=send, emit=certificate_event,
+        preserve=tls_capture.preserve_network_event, cleanup=certificate_cleanup,
+    )
 
     async def controlled(operation: Coroutine[Any, Any, Any]) -> Any:
         """Bound page-side execution even if a hostile getter never returns."""
@@ -232,6 +310,10 @@ async def capture_browser(
             target = data["targetInfo"]
             web_observer.target_attached(session, target)
         await send(session, "Page.enable")
+        # Set explicitly for every isolated target, including strict-default
+        # captures after a previous task opted out of certificate checks.
+        tls_sessions.add(session)
+        await tls_control.setup(session, target_type=data["targetInfo"].get("type", ""))
         if purpose == "web":
             frame_tree = await send(session, "Page.getFrameTree")
             frame = frame_tree.get("frameTree", {}).get("frame", {})
@@ -672,6 +754,8 @@ async def capture_browser(
         check()
         last_activity = time.monotonic()
         url, request_id = event["request"]["url"], event["requestId"]
+        if urlsplit(url).scheme == "https":
+            tls_trace.expected = True
         if "responseStatusCode" not in event and "responseErrorReason" not in event:
             requests += 1
             if requests > limits.max_requests:
@@ -714,11 +798,13 @@ async def capture_browser(
                     web_observer.record_request_denied(session, request_ref, reason=error.code)
                 raise
             if web_observer is not None:
-                web_observer.record_request_permitted(session, request_ref, network_id)
+                web_observer.record_request_permitted(session, request_ref, network_id, url=approved_url)
+            tls_control.approved(session, request_id, approved_url, network_id)
             emit("request", url, method=event["request"].get("method", "GET"))
             request_numbers[(session, request_id)] = requests
             await send(session, "Fetch.continueRequest", {"requestId": request_id})
             return
+        tls_control.settled(session, request_id)
         if event.get("responseErrorReason"):
             headers = {item["name"].lower(): item["value"] for item in event.get("responseHeaders", [])}
             optional = optional_resource_failure(
@@ -733,6 +819,7 @@ async def capture_browser(
                 }
             )
             result.responses.append(response_error)
+            note_tls_gap(session, event, response_error, "browser_tls_response_failed")
             await send(session, "Fetch.failRequest", {"requestId": request_id, "errorReason": "Aborted"})
             if optional and event["responseErrorReason"] == "Aborted":
                 # Playwright intentionally aborts implicit favicon requests.
@@ -771,6 +858,8 @@ async def capture_browser(
                 "resource_type": event.get("resourceType", ""),
             }
         is_main = purpose == "web" and observed_main
+        response_record.update(tls_control.context(session, url))
+        tls_capture.observe_response(response_record)
         result.responses.append(response_record)
         location_raw = headers.get("location")
         emit("response_received", url, status=status, content_type=headers.get("content-type", ""))
@@ -849,7 +938,20 @@ async def capture_browser(
                 )
             await send(session, "Fetch.continueRequest", {"requestId": request_id})
 
+    async def handle_certificate_error(session: str, data: dict[str, Any]) -> None:
+        try:
+            await tls_control.certificate_error(session, data)
+        except FxfetchError as error:
+            url = data.get("requestURL")
+            if (receiving.locked() and isinstance(url, str) and not package_response_candidate(url, {})
+                    and error.code in {"browser_tls_unpermitted_error", "browser_tls_error_unsupported", "tls_verification_failed"}):
+                result.gaps.append(error.code)
+                deferred_resource_errors.append(error)
+                return
+            raise
+
     def event(session: str, method: str, data: dict[str, Any]) -> None:
+        tls_trace.event(method, data)
         if method == "transport_error":
             errors.append(FxfetchError("browser_cdp_failed", "CDP bridge closed"))
             done.set()
@@ -857,6 +959,20 @@ async def capture_browser(
             schedule(setup(session, data))
         elif method == "Fetch.requestPaused":
             schedule(paused(session, data))
+        elif method == "Security.certificateError":
+            schedule(handle_certificate_error(session, data))
+        elif method == "Target.detachedFromTarget" and isinstance(data.get("sessionId"), str):
+            tls_control.detached(data["sessionId"])
+        elif method in {"Network.loadingFinished", "Network.loadingFailed"}:
+            failed_url = tls_control.network_settled(session, data.get("requestId")) or ""
+            if method == "Network.loadingFailed" and tls_control.unhandled_network_error(data.get("errorText")):
+                failure = FxfetchError("browser_tls_policy_unavailable", "Chrome did not complete a permitted certificate continuation")
+                if certificate_failure_is_critical(failed_url, data.get("type"), receiving.locked()):
+                    errors.append(failure)
+                    done.set()
+                else:
+                    deferred_resource_errors.append(failure)
+                    result.gaps.append("browser_subresource_tls_policy_unavailable")
         elif method == "Page.frameNavigated" and web_observer is not None:
             web_observer.frame_navigated(session, data.get("frame", {}))
         elif method == "Network.requestWillBeSent" and web_observer is not None:
@@ -1006,11 +1122,16 @@ async def capture_browser(
                     metadata = await controlled(item.evaluate(
                         """(e, selectors) => {
                             if (!e.isConnected) return null;
-                            const text=e.innerText||e.value||e.getAttribute('aria-label')||e.querySelector('img')?.alt||'';
+                            const parts=n=>[n.innerText,n.value,n.getAttribute('aria-label'),n.querySelector('img')?.alt]
+                                .filter(v=>typeof v==='string' && v.trim()).map(v=>v.trim());
+                            // Accessible download text complements visible text;
+                            // it must never replace visible business semantics.
+                            const labels=[...new Set(parts(e))];
+                            const text=labels.join(' ');
                             const extra=!e.matches(selectors.semantic);
                             return {
-                            text:text.slice(0,256),longLabel:text.length>256,extra,
-                            nested:extra && [...e.querySelectorAll(selectors.all)].some(c=>(c.innerText||c.value||c.getAttribute('aria-label')||'').trim()),
+                            text:text.slice(0,256),primary:(labels[0]||'').slice(0,256),longLabel:text.length>256,extra,
+                            nested:extra && [...e.querySelectorAll(selectors.all)].some(c=>parts(c).length),
                             href:e.getAttribute('href')||'',resolved:typeof e.href==='string'?e.href:'',
                             attrs:Object.fromEntries(['class','id','download'].filter(k=>e.hasAttribute(k)).map(k=>[k,e.getAttribute(k)])),
                             form:!!e.closest('form')
@@ -1020,9 +1141,11 @@ async def capture_browser(
                     if metadata is None:
                         continue
                     label, href = metadata["text"], metadata["href"]
-                    if metadata["form"] or _BUSINESS_TEXT.search(label):
+                    # An oversized combined label is not safely classified from
+                    # its truncated prefix, including semantic button elements.
+                    if metadata["form"] or metadata["longLabel"] or _BUSINESS_TEXT.search(label):
                         continue
-                    if metadata["extra"] and (metadata["longLabel"] or metadata["nested"]):
+                    if metadata["extra"] and metadata["nested"]:
                         continue
                     mismatch = (chain == "android" and re.search(r"iphone|ios|ipa|苹果", label, re.I)) or (
                         chain == "iphone" and re.search(r"android|apk|安卓", label, re.I)
@@ -1031,7 +1154,9 @@ async def capture_browser(
                         parsed_href = urlsplit(href)
                     except ValueError:
                         continue
-                    action = download_action(label, href, metadata["attrs"], require_short=metadata["extra"])
+                    action = download_action(metadata["primary"], href, metadata["attrs"], require_short=metadata["extra"])
+                    if not action:
+                        action = download_action(label, href, metadata["attrs"], require_short=metadata["extra"])
                     if mismatch or not (action or (not metadata["extra"] and
                                                    parsed_href.path.lower().endswith((".apk", ".ipa")))):
                         continue
@@ -1448,6 +1573,7 @@ async def capture_browser(
             await context.route(re.compile(r"^(?!.*\/favicon\.ico(?:[?#].*)?$).+", re.I), hold_until_attached)
             try:
                 mux = await CDPMux.connect(endpoint, event, check, limits.read_timeout)
+                await tls_trace.start()
                 try:
                     await send(
                         None, "Browser.setDownloadBehavior", {"behavior": "deny", "eventsEnabled": True}
@@ -1536,33 +1662,60 @@ async def capture_browser(
                         deferred_resource_errors[0],
                     )
             finally:
-                if (purpose == "web" or not result.artifacts) and not cancel.is_set() and deadline - time.monotonic() > 0.5:
-                    try:
-                        await asyncio.wait_for(snapshot_and_qr(context.pages, scan_qr=False), timeout=0.5)
-                    except (FxfetchError, PlaywrightError, TimeoutError, OSError):
-                        result.gaps.append("browser_final_dom_unavailable")
-                if purpose != "web" and not result.artifacts and snapshots:
-                    try:
-                        build_offline()
-                    except (FxfetchError, OSError) as error:
-                        result.offline = {
-                            "available": False,
-                            "coverage": "partial",
-                            "reasons": [
-                                error.code if isinstance(error, FxfetchError) else "offline_storage_failed",
-                            ],
-                        }
-                for task in tuple(tasks):
-                    task.cancel()
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                if mux is not None:
-                    await mux.close()
-                # Remote process teardown belongs to the independent lease.
-                if proof.cdp_endpoint is None:
-                    await context.close()
-                else:
-                    await browser.close()
+                try:
+                    if (purpose == "web" or not result.artifacts) and not cancel.is_set() and deadline - time.monotonic() > 0.5:
+                        try:
+                            await asyncio.wait_for(snapshot_and_qr(context.pages, scan_qr=False), timeout=0.5)
+                        except (FxfetchError, PlaywrightError, TimeoutError, OSError):
+                            result.gaps.append("browser_final_dom_unavailable")
+                    if purpose != "web" and not result.artifacts and snapshots:
+                        try:
+                            build_offline()
+                        except (FxfetchError, OSError) as error:
+                            result.offline = {
+                                "available": False,
+                                "coverage": "partial",
+                                "reasons": [
+                                    error.code if isinstance(error, FxfetchError) else "offline_storage_failed",
+                                ],
+                            }
+                    for task in tuple(tasks):
+                        task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    certificate_deadline = min(deadline, time.monotonic() + 5.0)
+                    await tls_trace.finish(certificate_deadline)
+                    await tls_capture.finish(certificate_deadline)
+                finally:
+                    if mux is not None and tls_control.pending:
+                        async def cancel_certificate(session: str, event_id: int) -> None:
+                            assert mux is not None
+                            try:
+                                await mux.cancel_certificate_error(session, event_id)
+                            except (FxfetchError, OSError, ValueError):
+                                certificate_event("gap", {"code": "tls_policy_restore_failed",
+                                                          "reason_code": "tls_policy_restore_failed"})
+                        await asyncio.gather(*(cancel_certificate(session, event_id)
+                                               for session, event_id in tuple(tls_control.pending)))
+                    if mux is not None and tls_sessions:
+                        async def restore_tls(session: str) -> None:
+                            assert mux is not None
+                            try:
+                                await mux.restore_tls_verification(session)
+                            except Exception:
+                                certificate_event("gap", {"code": "tls_policy_restore_failed",
+                                                          "reason_code": "tls_policy_restore_failed"})
+
+                        # All restored commands are fixed override/ignore=false;
+                        # they cannot authorize navigation or expand task access.
+                        await asyncio.gather(*(restore_tls(session) for session in tls_sessions))
+                    if mux is not None:
+                        await mux.close()
+                    # Remote process teardown belongs to the independent lease.
+                    if proof.cdp_endpoint is None:
+                        await context.close()
+                    else:
+                        await browser.close()
         if purpose == "web" and web_observer is not None:
             result.outcome, result.reason_code = web_observer.final_outcome(
                 result.outcome, result.reason_code

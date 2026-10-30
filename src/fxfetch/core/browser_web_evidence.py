@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
+from .browser_tls_evidence import utc_now
 from .discovery import rendered_challenge
 from .http_client import EVIDENCE_HEADERS, MAX_EVIDENCE_HEADER_BYTES
 from .web_journal import EvidenceJournal
@@ -19,9 +21,11 @@ class BrowserWebEvidence:
         *,
         journal: EvidenceJournal | None,
         event_context: dict[str, str] | None = None,
+        tls_context: Callable[[str, str], dict[str, object]] | None = None,
     ) -> None:
         self.journal = journal
         self.event_context = event_context or {}
+        self.tls_context = tls_context
         self.target_ids: dict[str, str] = {}
         self.request_refs: dict[tuple[str, str], str] = {}
         self.request_counts: dict[tuple[str, str], int] = {}
@@ -36,6 +40,9 @@ class BrowserWebEvidence:
         self.gaps: list[str] = []
 
     def journal_event(self, kind: str, **fields: object) -> None:
+        session, url = fields.get("session_id"), fields.get("source_url", fields.get("url"))
+        if self.tls_context is not None and isinstance(session, str) and isinstance(url, str) and "tls_verification" not in fields:
+            fields.update(self.tls_context(session, url))
         if self.journal is not None:
             try:
                 self.journal.append(kind, {**self.event_context, **fields})
@@ -156,13 +163,14 @@ class BrowserWebEvidence:
             reason_code=reason,
         )
 
-    def record_request_permitted(self, session: str, request_ref: str, network_id: object) -> None:
+    def record_request_permitted(self, session: str, request_ref: str, network_id: object, *, url: str | None = None) -> None:
         self.journal_event(
             "request_permitted",
             **self.session_context(session),
             request_ref=request_ref,
             network_id=network_id if isinstance(network_id, str) else None,
             permitted=True,
+            **({"url": url} if url is not None else {}),
         )
 
     def request_ref(self, session: str, request_id: str) -> str | None:
@@ -227,12 +235,15 @@ class BrowserWebEvidence:
             "method": event["request"].get("method", "GET"),
         }
         location_raw = headers.get("location")
+        observed_at = utc_now()
+        response["observed_at"] = observed_at
         self.journal_event(
             "response_observed",
             **self.fetch_context(session, event),
             url=url,
             method=event["request"].get("method", "GET"),
             status=status,
+            observed_at=observed_at,
             headers=safe_headers,
             location_raw=location_raw,
             location_resolved=urljoin(url, location_raw) if location_raw else None,

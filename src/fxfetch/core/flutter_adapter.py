@@ -177,7 +177,8 @@ def discover_flutter(
         result.gaps = ["flutter_runtime_required"]
     except FxfetchError as error:
         if error.outcome == "blocked" or error.code in {
-            "cancelled", "chain_timeout", "target_not_public", "peer_mismatch", "tls_verification_failed",
+            "cancelled", "chain_timeout", "target_not_public", "dns_unsafe_answer", "dns_tls_verification_failed",
+            "peer_mismatch", "tls_verification_failed",
             "invalid_url", "invalid_header", "invalid_framing", "response_header_limit",
         }:
             raise

@@ -242,7 +242,7 @@ def test_workflow_html_is_archived_with_redirect_without_replay(tmp_path: Path) 
             )
 
 
-def test_workflow_direct_apk_is_referenced_but_not_archived(tmp_path: Path) -> None:
+def test_workflow_direct_apk_is_referenced_and_embedded_as_original(tmp_path: Path) -> None:
     package = _apk_bytes()
     terminal, metadata, _ = _capture_policy(
         tmp_path,
@@ -275,4 +275,8 @@ def test_workflow_direct_apk_is_referenced_but_not_archived(tmp_path: Path) -> N
         assert package_request["fields"]["url"] == manifest["external_packages"][0]["source_url"]
         assert package_request["fields"]["collector_id"] == "http"
         assert package_request["fields"]["attempt_id"] == "network-1-direct"
-        assert all(package not in bundle.read(name) for name in bundle.namelist())
+        attachment = manifest["attachments"][0]
+        assert attachment["kind"] == "package"
+        assert attachment["validation"] == {"status": "passed", "reason_code": None}
+        assert bundle.read(attachment["path"]) == package
+        assert manifest["external_packages"][0]["embedded_path"] == attachment["path"]

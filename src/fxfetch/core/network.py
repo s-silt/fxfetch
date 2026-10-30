@@ -53,6 +53,8 @@ def build_default_client(
     limits: Limits,
     proxyconfig: LocalConnectProxy | None = None,
     transport_observer: Callable[[dict[str, object]], None] | None = None,
+    ignore_tls_errors: bool = False,
+    tls_policy: str = 'strict',
 ) -> HttpClient:
     """Construct one explicitly selected transport, not the retry policy itself."""
     resolver = DefaultPublicDNSResolver(proxy=proxyconfig)
@@ -62,6 +64,9 @@ def build_default_client(
         proxy=proxyconfig,
         dns_timeout=20.0,
         transport_observer=transport_observer,
+        ignore_tls_errors=ignore_tls_errors,
+        tls_policy=tls_policy,
+        dns_records=lambda: resolver.last_records,
     )
 
 
@@ -88,8 +93,10 @@ def _default_collector(
     limits: Limits,
     proxy: LocalConnectProxy | None,
     observer: Callable[[dict[str, object]], None] | None = None,
+    ignore_tls_errors: bool = False,
+    tls_policy: str = 'strict',
 ) -> Collector:
-    return Workflow(build_default_client(limits, proxy, observer), limits=limits)
+    return Workflow(build_default_client(limits, proxy, observer, ignore_tls_errors, tls_policy), limits=limits)
 
 
 class AcquisitionPolicy:
@@ -109,12 +116,20 @@ class AcquisitionPolicy:
         browser_root: Path | None = None,
         android_lease_id: str | None = None,
         transport_observer: Callable[[dict[str, object]], None] | None = None,
+        ignore_tls_errors: bool = False,
+        tls_policy: str = 'strict',
     ) -> None:
         self.limits = limits
         self.proxy = proxy
         self.browser_root = browser_root
         self.android_lease_id = android_lease_id
         self.transport_observer = transport_observer
+        if type(ignore_tls_errors) is not bool:
+            raise ValueError('ignore_tls_errors must be boolean')
+        self.ignore_tls_errors = ignore_tls_errors
+        if tls_policy not in ('auto', 'strict'):
+            raise ValueError('Invalid TLS policy')
+        self.tls_policy = 'auto' if ignore_tls_errors else tls_policy
         self.collector_factory = collector_factory or self._collector
 
     def _collector(self, limits: Limits, proxy: LocalConnectProxy | None) -> Collector:
@@ -126,12 +141,14 @@ class AcquisitionPolicy:
                 from .browser_workflow import BrowserWorkflow
 
                 return BrowserWorkflow(
-                    Workflow(build_default_client(limits, transport_observer=self.transport_observer), limits), config, limits,
+                    Workflow(build_default_client(limits, transport_observer=self.transport_observer,
+                                                  tls_policy=self.tls_policy), limits), config, limits,
                     lease_id=self.android_lease_id,
                     http_first=True,
                     journal=getattr(self.transport_observer, "journal", None),
+                    tls_policy=self.tls_policy,
                 )
-        return _default_collector(limits, proxy, self.transport_observer)
+        return _default_collector(limits, proxy, self.transport_observer, tls_policy=self.tls_policy)
 
     def run(
         self,

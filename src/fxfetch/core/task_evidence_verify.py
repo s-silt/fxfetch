@@ -9,8 +9,13 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .task_evidence_attachments import validate_certificate_der
 from .task_evidence_observations import MAX_OBSERVATION_BYTES
-from .task_evidence_provenance import parse_observations, validate_material_provenance
+from .task_evidence_provenance import (
+    parse_observations,
+    validate_attachment_provenance,
+    validate_material_provenance,
+)
 from .task_evidence_schema import (
     MAX_TASK_FILES,
     MAX_TASK_MANIFEST_BYTES,
@@ -18,6 +23,8 @@ from .task_evidence_schema import (
     strict_json,
     validate_task_manifest,
 )
+from .task_evidence_tls import tls_capture_summary, validate_task_tls_policy
+from .task_evidence_tls_policy import validate_auto_tls_policy
 from .task_evidence_zip import preflight_task_zip
 from .web_evidence_io import check_ancestors, is_reparse
 from .web_evidence_schema import portable_path
@@ -93,6 +100,8 @@ def verify_task_archive(
             if manifest["observations"]["path"] is not None:
                 expected.add("observations.jsonl")
             expected.update(record["path"] for record in manifest["files"])
+            attachments = manifest.get('attachments', [])
+            expected.update(record['path'] for record in attachments)
             if archive_names != expected:
                 raise EvidenceError("task_evidence_unlisted_file")
             rows: list[dict[str, Any]] = []
@@ -139,7 +148,7 @@ def verify_task_archive(
                     or finished != manifest["observations"]["finished_at"]
                 ):
                     raise EvidenceError("task_evidence_observation_state_mismatch")
-            for record in manifest["files"]:
+            for record in manifest["files"] + attachments:
                 info = bundle.getinfo(record["path"])
                 if info.file_size != record["size"]:
                     raise EvidenceError("task_evidence_size_mismatch")
@@ -154,6 +163,10 @@ def verify_task_archive(
                         digest_value.update(block)
                 if count != record["size"] or digest_value.hexdigest() != record["sha256"]:
                     raise EvidenceError("task_evidence_hash_mismatch")
+                if record.get('kind') == 'package' and info.compress_type != zipfile.ZIP_STORED:
+                    raise EvidenceError('task_evidence_package_compression_invalid')
+                if record.get('kind') == 'certificate':
+                    validate_certificate_der(_read_entry(bundle, info, 1024 * 1024, deadline))
             _validate_zip_file_hierarchy(seen)
             validate_material_provenance(
                 rows,
@@ -161,6 +174,19 @@ def verify_task_archive(
                 manifest["external_packages"],
                 allow_incomplete=manifest["observations"]["state"] != "healthy",
             )
+            validate_attachment_provenance(rows, attachments, deadline=deadline, tls_policy=manifest.get('tls_policy'))
+            if 'tls_policy' in manifest:
+                fallback = validate_auto_tls_policy(rows, manifest['tls_policy'])
+                if manifest['observations']['state'] != 'healthy':
+                    fallback['state'] = 'unavailable'
+                if fallback != manifest['tls_fallback']:
+                    raise EvidenceError('task_evidence_tls_fallback_summary_mismatch')
+            else:
+                validate_task_tls_policy(rows, manifest.get('ignore_tls_errors', False))
+            if 'tls_certificates' in manifest and manifest['tls_certificates'] != tls_capture_summary(
+                rows, attachments, manifest['gaps']
+            ):
+                raise EvidenceError('task_evidence_tls_summary_mismatch')
     except EvidenceError:
         raise
     except (OSError, ValueError, UnicodeError, zipfile.BadZipFile, RuntimeError) as error:

@@ -10,6 +10,7 @@ cannot be distinguished here and remain subject to the controlled CDP session.
 
 from __future__ import annotations
 
+import errno
 import ipaddress
 import re
 import select
@@ -19,14 +20,23 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from typing import Any
 from urllib.parse import urlsplit
 
 from .errors import FxfetchError
 from .guard import is_public, validate_url
-from .public_dns import DefaultPublicDNSResolver
+from .public_dns import DefaultPublicDNSResolver, bounded_dns_records
 
 HEADER_LIMIT = 32768
 BLOCK = 65536
+_BUDGET_ERRORS = frozenset({
+    "browser_connection_limit", "request_limit", "request_header_limit",
+    "browser_wire_limit", "browser_permit_limit", "task_timeout",
+})
+_DNS_FAILURES = frozenset({
+    "dns_failed", "dns_no_addresses", "dns_nxdomain", "dns_invalid_response",
+    "dns_tls_verification_failed", "proxy_failed", "proxy_timeout",
+})
 
 
 class BrowserGateway:
@@ -38,7 +48,7 @@ class BrowserGateway:
         max_connections: int = 300,
         max_wire_bytes: int = 640 * 1024 * 1024,
         cancel: threading.Event | None = None,
-        on_event: Callable[[dict], None] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         if timeout <= 0 or max_connections < 1 or max_wire_bytes < 1:
             raise ValueError("invalid browser gateway budget")
@@ -48,7 +58,7 @@ class BrowserGateway:
         self.on_event = on_event
         self.deadline = 0.0
         self.connections = self.wire_bytes = 0
-        self.errors: list[dict] = []
+        self.errors: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(16)
         self._stopped = threading.Event()
@@ -250,7 +260,34 @@ class BrowserGateway:
         try:
             literal = ipaddress.ip_address(parts.hostname)
         except ValueError:
-            addresses = DefaultPublicDNSResolver().resolve(parts.hostname, port)
+            resolver = DefaultPublicDNSResolver()
+            failure: FxfetchError | None = None
+            try:
+                addresses = resolver.resolve(parts.hostname, port)
+                self._check()
+            except FxfetchError as error:
+                failure = error
+                raise
+            finally:
+                records = bounded_dns_records(resolver.last_records)
+                normal_close = bool(failure is not None and failure.code == "cancelled"
+                                    and self._stopped.is_set() and not self.cancel.is_set())
+                if failure is not None and failure.code in {"task_timeout", "cancelled"}:
+                    # DNS can finish after the lease's deadline. Retain its
+                    # evidence as discarded, never advertise usable answers.
+                    for record in records:
+                        record.update(status="discarded", reason_code=failure.code,
+                                      late_answer_discarded=True)
+                if self.on_event and not normal_close:
+                    for record in records:
+                        self.on_event({"event": "dns_resolution_observed", "url": url,
+                                       "host": parts.hostname, "dns_record": record})
+                    if failure is not None:
+                        last = next((row for row in reversed(records) if row.get("query_type")), {})
+                        self.on_event({"event": "dns_resolution_failed", "url": url,
+                                       "provider": last.get("provider", last.get("endpoint")),
+                                       "query_type": last.get("query_type"),
+                                       "reason_code": failure.code})
         else:
             addresses = (str(literal),)
         if not addresses or any(not is_public(value) for value in addresses):
@@ -258,9 +295,24 @@ class BrowserGateway:
         self._check()
         return addresses[0], port
 
-    def _record_error(self, code: str, url: str) -> None:
+    def _record_error(self, code: str, url: str, *, connected: bool = False) -> None:
+        # _check() also uses cancelled when ordinary lease teardown closes the
+        # gate. That expected local shutdown is not a failed target request.
+        if code == "cancelled" and self._stopped.is_set() and not self.cancel.is_set():
+            return
         unattributed = code == "browser_request_not_permitted"
-        event = {"event": "browser_connection_blocked", "reason_code": code}
+        name = "browser_connection_blocked"
+        if code == "cancelled":
+            name = "browser_connection_cancelled"
+        elif code in _BUDGET_ERRORS:
+            name = "browser_budget_exhausted"
+        elif code == "browser_transport_failed":
+            name = "browser_transport_failed" if connected else "browser_connection_failed"
+        elif code in _DNS_FAILURES:
+            name = "browser_connection_failed"
+        event: dict[str, Any] = {"event": name, "reason_code": code}
+        if name in {"browser_connection_failed", "browser_transport_failed"}:
+            event["connection_phase"] = "established" if connected else "before_connect"
         if unattributed:
             event["host"] = urlsplit(url).hostname or ""
         else:
@@ -270,6 +322,21 @@ class BrowserGateway:
             del self.errors[:-128]
         if self.on_event and not unattributed:
             self.on_event(event)
+
+    def _closed_socket_error(
+        self, error: OSError | ValueError, sockets: tuple[socket.socket | None, ...],
+        *, selecting: bool,
+    ) -> bool:
+        # Do not suppress a genuine timeout/reset merely because close raced
+        # with it. Only a closed local descriptor, while stopping, proves this
+        # particular failure came from teardown rather than the destination.
+        if not (self._stopped.is_set() or self.cancel.is_set()):
+            return False
+        if not any(connection is not None and connection.fileno() < 0 for connection in sockets):
+            return False
+        if isinstance(error, ValueError):
+            return selecting
+        return error.errno in {errno.EBADF, errno.ENOTSOCK, 10038}
 
     def _charge(self, amount: int) -> None:
         with self._lock:
@@ -284,7 +351,9 @@ class BrowserGateway:
             return
         remote: socket.socket | None = None
         url = ""
+        connected = False
         established = False
+        selecting = False
         body_remaining = 0
         try:
             with self._lock:
@@ -360,6 +429,7 @@ class BrowserGateway:
                 self._sockets.add(remote)
             remote.settimeout(min(10.0, self._check()))
             remote.connect((address, port))
+            connected = True
             if ipaddress.ip_address(remote.getpeername()[0]) != ipaddress.ip_address(address):
                 raise FxfetchError("peer_mismatch", "Browser TCP peer differs from validated IP")
             if forward is None:
@@ -379,7 +449,9 @@ class BrowserGateway:
                 sources = [remote]
                 if forward is None or body_remaining:
                     sources.append(client)
+                selecting = True
                 readable, _, _ = select.select(sources, [], [], 0.1)
+                selecting = False
                 for source in readable:
                     size = min(BLOCK, body_remaining) if source is client and forward is not None else BLOCK
                     block = source.recv(size)
@@ -391,14 +463,18 @@ class BrowserGateway:
                     destination = remote if source is client else client
                     destination.sendall(block)
         except FxfetchError as error:
-            self._record_error(error.code, url)
+            self._record_error(error.code, url, connected=connected)
             if not established:
                 try:
                     client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 except OSError:
                     pass  # Browser may already have cancelled the request.
-        except (OSError, ValueError):
-            self._record_error("browser_transport_failed", url)
+        except (OSError, ValueError) as error:
+            if self._closed_socket_error(error, (client, remote), selecting=selecting):
+                if self.cancel.is_set():
+                    self._record_error("cancelled", url, connected=connected)
+            else:
+                self._record_error("browser_transport_failed", url, connected=connected)
         finally:
             for connection in (client, remote):
                 if connection is not None:

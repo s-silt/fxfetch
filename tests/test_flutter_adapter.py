@@ -60,6 +60,16 @@ def test_unrelated_html_has_zero_resource_access():
     assert not result.supported
 
 
+@pytest.mark.parametrize("code", ["dns_unsafe_answer", "dns_tls_verification_failed"])
+def test_dns_security_rejection_stops_flutter_source_following(code):
+    def fetch(url, cap):
+        raise FxfetchError(code, "Synthetic DNS security rejection")
+
+    with pytest.raises(FxfetchError) as error:
+        discover_flutter(HTML, SOURCE, "android", fetch)
+    assert error.value.code == code
+
+
 def _file_fetch(path):
     def fetch(url, cap):
         if url.endswith("flutter_bootstrap.js"):

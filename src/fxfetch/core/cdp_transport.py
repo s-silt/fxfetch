@@ -181,7 +181,39 @@ class CDPMux:
     async def send(
         self, session: str | None, method: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        self.check()
+        return await self._send(session, method, params, self.check, self.command_timeout)
+
+    async def send_cleanup(self, method: str, *, stream: str | None = None) -> dict[str, Any]:
+        """Fixed control-plane cleanup, never navigation or network commands."""
+        if method == "Tracing.end" and stream is None:
+            params = {}
+        elif method == "IO.close" and isinstance(stream, str) and 0 < len(stream) <= 256:
+            params = {"handle": stream}
+        else:
+            raise ValueError("Unsupported cleanup operation")
+        return await self._send(None, method, params, lambda: None, 1.0)
+
+    async def restore_tls_verification(self, session: str) -> dict[str, Any]:
+        """Cleanup can only restore checking, never disable TLS validation."""
+        if not isinstance(session, str) or not 0 < len(session) <= 256:
+            raise ValueError("Invalid cleanup session")
+        try:
+            await self._send(session, "Security.setOverrideCertificateErrors", {"override": False}, lambda: None, 1.0)
+        finally:
+            result = await self._send(session, "Security.setIgnoreCertificateErrors", {"ignore": False}, lambda: None, 1.0)
+        return result
+
+    async def cancel_certificate_error(self, session: str, event_id: int) -> dict[str, Any]:
+        """Independent bounded cleanup can reject an owned event, never continue it."""
+        if (not isinstance(session, str) or not 0 < len(session) <= 256
+                or type(event_id) is not int or not 0 <= event_id < 2**31):
+            raise ValueError("Invalid certificate cleanup scope")
+        return await self._send(session, "Security.handleCertificateError", {"eventId": event_id, "action": "cancel"},
+                                lambda: None, 1.0)
+
+    async def _send(self, session: str | None, method: str, params: dict[str, Any] | None,
+                    check: Callable[[], None], timeout: float) -> dict[str, Any]:
+        check()
         self.sequence += 1
         sequence = self.sequence
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -191,19 +223,19 @@ class CDPMux:
         if session:
             message["sessionId"] = session
         assert self.process.stdin is not None
-        end = time.monotonic() + self.command_timeout
+        end = time.monotonic() + timeout
         drain: asyncio.Task[None] | None = None
         try:
             self.process.stdin.write(json.dumps(message).encode() + b"\n")
             drain = asyncio.create_task(self.process.stdin.drain())
             while not drain.done():
-                self.check()
+                check()
                 if time.monotonic() >= end:
                     raise FxfetchError("browser_read_timeout", "CDP command write exceeded its time budget")
                 await asyncio.wait({drain}, timeout=0.05)
             await drain
             while not future.done():
-                self.check()
+                check()
                 if time.monotonic() >= end:
                     raise FxfetchError(
                         "browser_read_timeout", "CDP operation made no progress within its time budget"

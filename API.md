@@ -8,13 +8,13 @@
 
 ## 任务数据包
 
-每个执行中的普通下载任务在原工作流完成后离线封存一个独立 ZIP；采集工作流不会重放。原 APK / IPA 保持为单独的 artifact 下载，ZIP 仅含明确记录的网页材料、有限观察、清单和原包的外部引用，不含 APK / IPA 字节。ZIP 归档失败不会改写原任务结果或移除已保存 artifact。
+每个执行中的普通下载任务在原工作流完成后离线封存一个独立 ZIP；采集工作流不会重放。原 APK / IPA 仍可单独下载，v2 ZIP 另在 `attachments[]` 纳入已完整接收的 APK/IPA 原字节与实际保存的 TLS DER 证书；校验失败的完整原包标为 `validation.status: failed`，不会成为成功 artifact。网页材料仍由 `files` 描述，不包含二进制附件。ZIP 归档失败不会改写原任务结果或移除已保存 artifact。
 
-`GET /api/jobs/{id}` 返回独立的 `data_package` 状态：`pending`、`building`、`ready`、`failed` 或 `unavailable`。就绪时带有 `filename`、`size`、`sha256` 和 `web_materials` 摘要；失败时提供 `reason_code`。旧任务没有该归档时显示 `unavailable`。`web_materials` 总是标注 `coverage: "partial"`。
+`GET /api/jobs/{id}` 返回独立的 `data_package` 状态：`pending`、`building`、`ready`、`failed` 或 `unavailable`。就绪时带有 `filename`、`size`、`sha256` 、`web_materials` 和 `attachments: {packages, certificates, bytes}` 摘要；失败时提供 `reason_code`。旧任务没有该归档时显示 `unavailable`。`web_materials` 总是标注 `coverage: "partial"`。新归档另带 `tls_certificates: {state, http_certificates, chrome_certificates, association_limited, reasons}`；state 为 `not_applicable`（没有相关观察）、`saved`、`partial` 或 `not_captured`。Chrome 原件齐全但仅有 origin 或浏览器网络事件范围关联时为 saved 且 association_limited=true。
 
 `GET /api/jobs/{id}/data-package` 使用与任务/artifact 相同的会话认证、所有权和归档可见性规则；仅就绪归档可下载，返回 `application/zip`、附件文件名及 `Cache-Control: no-store`。读取、下载或刷新任务不会触发目标网络访问。
 
-离线 CLI `fxfetch verify-data ARCHIVE.zip` 有界验证 ZIP 路径、清单、观察记录和归档材料哈希；不会解压归档。其成功仅说明 ZIP 内材料通过检查，不说明外部引用的 APK / IPA 字节已被本次验证。
+离线 CLI `fxfetch verify-data ARCHIVE.zip` 有界验证 ZIP 路径、清单、观察记录和归档材料哈希；不会解压归档。其成功仅说明 ZIP 内列明的材料及附件原字节/绑定通过完整性检查，不表示 APK 结构、签名或安全性验证通过；外部引用的未嵌入原包仍未验证。HTTP 原件来自同一次实际连接，默认验证身份；实际发生证书错误后继续时独立标记未验证；Chrome 在隔离采集会话内被动读取普通 `netlog` 类别的 `SSL_CERTIFICATES_RECEIVED` 事件，能取得的原 DER 记录 `capture_source: chrome_netlog_ssl_certificates_received`、`association: browser_network_event`、`request_association: unknown`，保留事件 PID、source ID、时间及链序号。不能可靠绑定请求时 `source_url` 为空、不猜 origin；原 trace 仅在内存中限额处理，不打包网络日志。另通过 CDP 尽力读取已观测 HTTPS origin 的证书快照，记录 `capture_source: chrome_cdp_network_get_certificate`、`association: origin_snapshot` 与 `request_association: observation_trigger_only`。origin 快照附件保留会话/目标、触发响应、origin、观察/保存时间及原始链序号，不声称属于该次具体连接；仅有指纹的历史证书不能还原。合法链成员可以部分保存，缺失及获取失败明确记入 gaps。
 
 Host 由启动参数明确允许。上传鉴权在 multipart 解析前完成，先有界收取最多 11 MiB 的请求，再交给解析器；文件最多 10 MiB、总上传时间 30 秒、单次解码。支持的静态图片格式在受限进程内验证和扫码，具体格式见下文。
 
@@ -26,11 +26,11 @@ Host 由启动参数明确允许。上传鉴权在 multipart 解析前完成，�
 | `POST /api/preview` | `{url}` → `{kind,url,request_url,original_input,normalized,network_requests:0}` |
 | `POST /api/qr-images` | multipart `file` → 图片 `id`、解码状态、哈希、候选、截断信息；无目标请求 |
 | `GET /api/qr-images/{id}/thumbnail` | 当前会话图片的服务端 JPEG 缩略图，不返回原图元数据 |
-| `POST /api/jobs` | `{url}` 或 `{image_id,candidate_id,url?}`；显式授权本次采集；202 返回 job |
+| `POST /api/jobs` | `{url,tls_policy?}` 或 `{image_id,candidate_id,url?,tls_policy?}`；显式授权本次采集；202 返回 job |
 | `GET /api/jobs` | 当前会话最新 50 个任务摘要；`active_builds` 为排队/运行构建数量 |
 | `DELETE /api/jobs` | 认证、Origin、CSRF 后清空当前会话记录，停止未完成任务；重复调用幂等 |
 | `GET /api/jobs/{id}` | 当前任务、结果、进度、产物、构建和可封装网页候选 |
-| `POST /api/jobs/{id}/continue` | `{candidate_id}`；选择精确下载候选后创建独立子任务，202 返回 child job |
+| `POST /api/jobs/{id}/continue` | `{candidate_id,tls_policy?}`；选择精确下载候选后创建独立子任务，202 返回 child job |
 | `POST /api/jobs/{id}/cancel` | 取消排队或运行任务；重复操作幂等 |
 | `POST /api/jobs/{id}/web-apk-builds` | `{candidate_id}`；手动点击后构建，202 返回 build |
 | `GET /api/jobs/{id}/web-apk-builds/{build_id}` | 构建状态/结果/已登记产物 ID |
@@ -39,6 +39,11 @@ Host 由启动参数明确允许。上传鉴权在 multipart 解析前完成，�
 | `GET /api/jobs/{id}/rejected-files/{file_id}` | 已完整保存但包校验失败的原文件；只读附件下载，不改变任务结果 |
 
 二维码候选保留原始文本、严格解码结果与坐标；`url=null` 表示不可直接提交。多码必须选择。`truncated=true` 时须裁剪重新识别。提交的 `url` 是对所选二维码的编辑值，来源仍保留。原始 itms-services 文本作为 manifest 入口处理，不安装描述文件。
+
+`tls_policy` 接受 `auto` 或 `strict`，新网页任务和候选子任务默认 `auto`，每次提交独立固化。auto 仍先验证证书，仅真实证书校验错误允许有界继续；strict 在证书错误时停止。核心与 CLI 默认 strict。兼容旧输入 `ignore_tls_errors`（严格 JSON 布尔值）：true 映射 auto、false 映射 strict；与显式 `tls_policy` 冲突返回 422。幂等参数包含策略，同键改变策略返回 409。同一次提交的网络错误重试保留冻结参数，下一新任务恢复 auto。
+
+任务公开 JSON 的 `tls_policy`、`input.tls_policy` 与新数据包清单保留策略。`tls_fallback` 用 `state`（pending/recorded/unavailable）、`observed`、`count` 和固定 `reasons` 区分实际降级、未发生及记录缺失。采集前写 `task_tls_policy`，实际证书错误与继续分别保留证据，不能仅凭 auto 将所有连接记为 ignored。HTTP 严格验证成功仍为 `verified_tls_socket`，证书错误后继续为 `unverified_tls_socket`，需可追溯到对应失败和降级记录。Chrome 保留真实事件范围，无法与具体请求可靠关联的证书不能声称已验证或已降级。旧归档没有 `tls_policy` 时仍按原手动忽略字段解释，不改写历史含义。缺失原件继续记缺口。`downloaded` 仅表示传输和包结构校验通过，不证明服务器身份或软件安全；策略不影响公网守卫、预算、当前设备直接下载、系统信任或 WebView APK。
+
 
 网址输入可直接使用裸域名、`www` 域名和路径：缺少协议时补 `https://`，`//host/path` 补为 HTTPS，`https:/host/path` 补齐斜杠；已有 `http://` 保留。查询参数、转义和片段不因补齐被改写。前端提交前使用同一个离线 preview 规范化规则；preview 不解析 DNS、不访问目标。直接提交 jobs 也应用相同规则，发生补齐时 `input.original_input` 保存原始文本，`input.entry_url` 保存实际入口。`javascript/data/file/ftp/intent` 等显式其他协议不改写成 HTTPS；既有严格 `itms-services` manifest 入口仍单独处理。补齐不代表地址已通过公网连接检查。
 
@@ -61,6 +66,8 @@ Host 由启动参数明确允许。上传鉴权在 multipart 解析前完成，�
 错误有两种兼容格式：`{error:{code,message?}}` 或 `{detail:code}`。未认证 401，Origin/CSRF 403，不属于当前会话的对象 404，幂等/队列冲突 409，过大上传 413，忙碌/登录限流 429，构建能力缺失 503。
 
 前端每个活动任务按 1.5–5 秒自适应轮询，隐藏页面或无活动任务停止；轮询和恢复只读状态，不能重启采集。会话失效后停止请求并重新登录。
+
+DNS 进度事件为 `dns_resolution_observed` / `dns_resolution_failed`，公开字段仅保留 `provider`、`query_type`、固定 `reason_code` 与已有任务/URL 引用。完整有界 `dns_record` 只写入私有观察记录并随数据包保存，包含解析答案、分类、响应摘要和省略标记；摘要不等于 DNS 响应原件。`dns_unsafe_answer` 表示答案中含不允许连接的地址，任务失败且覆盖不完整，不代表没有 APK；`dns_tls_verification_failed` 指解析服务自身证书失败，不受目标证书自动续行策略影响。正常浏览器关闭不发拒绝事件；实际拒绝、建立连接失败、已连接传输中断、预算和取消分别使用 `browser_connection_blocked`、`browser_connection_failed`、`browser_transport_failed`、`browser_budget_exhausted`、`browser_connection_cancelled`。
 
 ### 下载候选继续
 
@@ -130,7 +137,7 @@ HTTP 优先；需要动态处理或收到 403/429/502/503 时最多尝试一次�
 
 ## 离线网页分析
 
-以下接口只使用该任务后台已就绪的 `fxfetch.task-evidence.v1` ZIP，不接受用户文件路径、URL、程序路径或执行参数。所有接口检查当前会话及父任务归属；父任务归档后返回 404。写接口沿用 Origin、CSRF；创建还必须提供 Idempotency-Key。
+以下接口只使用该任务后台已就绪的 `fxfetch.task-evidence.v1` / `v2` ZIP，不接受用户文件路径、URL、程序路径或执行参数。所有接口检查当前会话及父任务归属；父任务归档后返回 404。写接口沿用 Origin、CSRF；创建还必须提供 Idempotency-Key。
 
 | 方法 / 路径 | 行为 |
 | --- | --- |
@@ -145,7 +152,7 @@ HTTP 优先；需要动态处理或收到 403/429/502/503 时最多尝试一次�
 
 提交不解析 ZIP，只固定已就绪归档的来源路径、大小和 SHA-256。完整校验及报告整理由后台受限进程完成；损坏或摘要不匹配会异步失败，而非在 POST 请求线程展开材料。
 
-报告 ZIP 只含 `analysis.json` 与 `report/input.json`，原件按回执映射从独立数据包回查；不包含 APK/IPA、原始 ZIP 或执行日志，回执中的程序路径和命令不导出。原生报告仍可能包含敏感线索及 `meta.web_evidence.source_dir` 主机材料目录，不在网页中直接渲染；普通状态 JSON 不暴露这些内容。
+报告 ZIP 只含 `analysis.json` 与 `report/input.json`。发布前剔除缺少可定位原文完整值的硬编码密钥提示及重复摘要；已保留线索只说明静态字面值，不证明凭据有效或解密成功。原 fxapk 输出私有保留于 `native-report/`，旧报告发布也执行同一过滤，回执记录发布 JSON 的哈希。原件按回执映射从独立数据包回查；不包含 APK/IPA、原始 ZIP 或执行日志，回执中的程序路径和命令不导出。原生报告仍可能包含敏感线索及 `meta.web_evidence.source_dir` 主机材料目录，不在网页中直接渲染；普通状态 JSON 不暴露这些内容。
 
 服务重启将未完成分析置为 `interrupted/service_restarted`，不自动重试。刷新清空取消并隐藏当前会话分析，保留后台原文件，跨会话不可访问。
 

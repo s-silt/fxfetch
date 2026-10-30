@@ -22,7 +22,15 @@
     task_timeout:"采集已达到时间限制并停止，结果不完整；已取得的记录保留，不能据此判断没有 APK。",build_timeout:"打包已达到时间限制并停止，未交付完整 APK；原采集结果保留。",queue_timeout:"排队已超时并停止，本次操作未执行。",
     browser_worker_scope_unsupported:"该网页使用了尚未支持的后台脚本，本次采集未完成，不能据此判断没有 APK。",
     build_unavailable:"本机打包工具尚未就绪。",invalid_build_source:"此任务没有可用于打包的网页入口。",
-    target_not_public:"目标地址未通过公网连接检查。",dns_failed:"目标域名解析失败。",
+    target_not_public:"目标解析结果或地址未通过公网检查，已停止该目标连接；不能据此判断是否有 APK。",dns_failed:"目标域名解析失败。",
+    dns_unsafe_answer:"DNS 返回非公网或特殊地址，未连接该目标；不能据此判断是否有 APK。",
+    dns_tls_verification_failed:"DNS 服务的证书校验失败，未取得可信解析结果；未连接该目标。",
+    dns_nxdomain:"DNS 服务返回域名不存在；本次无法连接，不能据此判断是否有 APK。",
+    dns_no_addresses:"DNS 未返回与查询匹配的地址；本次无法连接，不能据此判断是否有 APK。",
+    dns_invalid_response:"DNS 响应格式或完整性检查失败，未使用该响应连接目标。",
+    dns_diagnostics_unavailable:"DNS 诊断记录不可用，无法确认解析详情。",
+    chain_timeout:"当前下载链路已达到时间限制，本次采集未完成。",
+    browser_transport_failed:"浏览器连接或传输未完成；不能据此判断是否有 APK。",
     browser_required:"页面内容依赖脚本，当前静态采集尚未完成；Chrome 动态采集未启用。",
     browser_guard_unavailable:"Chrome 连接前防护尚未验收，浏览器采集暂不可用。",
     browser_worker_unavailable:"Android Chrome 环境未能连接，本次采集已停止。",
@@ -46,6 +54,8 @@
     archive_ambiguous:"文件已接收，但应用包结构存在歧义，未计为成功取得原包。",
     landing_candidate_discovered:"已从页面下载配置找到真实地址，继续验证应用包。",
     tls_handshake_failed:"下载节点的 TLS 连接中断，本次节点未取得文件。",tls_verification_failed:"目标证书校验失败，已停止访问。",
+    tls_policy_continuation_unconfirmed:"证书错误后的继续操作未得到确认，请查看数据包中的缺口记录。",tls_policy_restore_failed:"证书处理设置的清理未得到确认，已保留缺口记录。",browser_subresource_tls_policy_unavailable:"部分页面资源的证书错误未能继续处理，采集覆盖不完整。",
+    browser_tls_policy_unavailable:"当前 Chrome 无法完成逐次证书错误处理，已停止本次浏览器访问。",browser_tls_event_invalid:"证书错误事件范围无法确认，已停止访问。",browser_tls_error_unsupported:"证书错误类型不在可处理范围，已停止访问。",browser_tls_unpermitted_error:"证书错误未关联到当前允许的请求，已停止访问。",browser_tls_policy_limit:"证书错误处理达到本次限额，已停止访问。",
     challenge_detected:"观察到实际验证页面或访问控制，尚未取得原包；此状态不能判断网站性质。",
     device_verification_required:"下载页要求真实手机设备验证，当前尚未取得原包。可手动打包联网入口后在手机上访问。",
     candidate_selection_required:"发现多个下载候选，请选择一个地址继续。",
@@ -69,7 +79,7 @@
     build_command_failed:"本机构建工具执行失败。",build_timed_out:"APK 构建超时。"
   };
   const state = {csrf:null, authenticated:false, capabilities:null, jobs:[], current:null, job:null, image:null,
-    selectedQR:null, previewURL:null, pendingJob:null, pendingBuilds:new Map(), pendingAnalyses:new Map(), pendingContinuations:new Map(), selectedContinuations:new Map(), progressExpanded:new Set(), submitting:false, uploading:false,
+    selectedQR:null, previewURL:null, pendingJob:null, pendingBuilds:new Map(), pendingAnalyses:new Map(), pendingContinuations:new Map(), selectedContinuations:new Map(), continuationTls:new Map(), progressExpanded:new Set(), submitting:false, uploading:false,
     epoch:0, clearing:false, mutations:new Set(), pollTimer:null, pollController:null, polling:false, pollDelay:1500, loading:false, activeBuildJobs:new Set(),
     capabilityTimer:null, capabilityController:null, capabilityGeneration:0, capabilityAttempts:0, capabilityDeadline:0, capabilityStatus:"idle"};
 
@@ -93,8 +103,14 @@
     state.pollTimer = null;
     if (state.pollController) state.pollController.abort();
   }
+  function updateTLSChoice() {
+    $("tls-policy-summary").textContent = $("tls-policy").value === "strict" ? "证书：严格验证" : "证书：自动处理";
+  }
   function signedOut(expired = false) {
     clearDirectLink();
+    $("tls-policy").value = "auto";
+    $("advanced-settings").open = false;
+    state.continuationTls.clear();
     state.authenticated = false;
     state.csrf = null;
     state.jobs = [];
@@ -286,8 +302,20 @@
     card.append(info, link);
     return card;
   }
-  const eventLabels = {download_action:"点击下载控件",browser_preparing:"准备 Android Chrome",browser_started:"浏览器已启动",browser_connection:"正在连接目标",browser_connection_blocked:"目标连接被拒绝",interaction_started:"操作下载控件",build_preparing:"准备模板",build_resources:"整理离线资源与字体",build_compiling:"编译 APK",build_signing:"签名",build_verifying:"校验签名与应用包",build_saving:"保存文件",task_started:"开始采集",request:"正在请求",response_received:"收到响应",response_progress:"正在接收响应",queue_timeout:"排队超时，未执行",redirect:"发生跳转",page_received:"已取得页面",download_candidate:"发现下载候选，尚未验证",download_started:"开始传输候选文件，尚未验证",download_progress:"正在传输",response_complete:"响应传输结束",file_verifying:"正在核验文件",file_verified:"文件核验通过",challenge_detected:"观察到验证或访问控制",browser_required:"静态采集仍有脚本覆盖缺口",task_completed:"本次采集结束",task_timeout:"采集超时，已停止",cancelled:"已取消",building:"开始打包",built:"APK 已生成",build_timeout:"打包超时，已停止",failed:"处理未完成"};
+  const eventLabels = {tls_certificate_error:"证书校验失败，已记录错误",tls_fallback_continued:"按本任务策略继续，服务器身份未经验证",download_action:"点击下载控件",browser_preparing:"准备 Android Chrome",browser_started:"浏览器已启动",browser_connection:"正在连接目标",browser_connection_blocked:"目标连接被拒绝",interaction_started:"操作下载控件",build_preparing:"准备模板",build_resources:"整理离线资源与字体",build_compiling:"编译 APK",build_signing:"签名",build_verifying:"校验签名与应用包",build_saving:"保存文件",task_started:"开始采集",request:"正在请求",response_received:"收到响应",response_progress:"正在接收响应",queue_timeout:"排队超时，未执行",redirect:"发生跳转",page_received:"已取得页面",download_candidate:"发现下载候选，尚未验证",download_started:"开始传输候选文件，尚未验证",download_progress:"正在传输",response_complete:"响应传输结束",file_verifying:"正在核验文件",file_verified:"文件核验通过",challenge_detected:"观察到验证或访问控制",browser_required:"静态采集仍有脚本覆盖缺口",task_completed:"本次采集结束",task_timeout:"采集超时，已停止",cancelled:"已取消",building:"开始打包",built:"APK 已生成",build_timeout:"打包超时，已停止",failed:"处理未完成"};
   function eventText(event) {
+    if (["dns_resolution_observed", "dns_resolution_failed", "dns_resolution_success"].includes(event?.event)) {
+      const provider = {alidns:"阿里 DNS", dnspod:"DNSPod", cloudflare:"Cloudflare DNS", google:"Google DNS"}[event.provider] || "DNS";
+      const query = ["A", "AAAA"].includes(event.query_type) ? ` ${event.query_type}` : "";
+      const failure = {dns_nxdomain:"服务返回域名不存在，未连接该目标", dns_no_addresses:"未返回匹配地址，未连接该目标", dns_invalid_response:"响应格式或完整性检查失败", dns_diagnostics_unavailable:"诊断记录不可用", task_timeout:"任务超时，解析已停止", chain_timeout:"链路超时，解析已停止"}[event.reason_code];
+      if (failure) return `${provider}${query}：${failure}`;
+      const reason = {dns_answer_accepted:"解析结果已通过地址检查", dns_unsafe_answer:"解析含非公网或特殊地址，未连接该目标", target_not_public:"解析地址未通过公网检查，未连接该目标", dns_tls_verification_failed:"解析服务证书校验失败", dns_failed:"解析失败", dns_timeout:"解析超时", cancelled:"解析已取消"}[event.reason_code];
+      return `${provider}${query}：${reason || (event.event === "dns_resolution_failed" ? "解析未完成" : event.event === "dns_resolution_success" ? "解析完成" : "已记录解析观察")}`;
+    }
+    if (event?.event === "browser_connection_failed") return "目标连接未能建立";
+    if (event?.event === "browser_transport_failed") return "连接建立后传输中断";
+    if (event?.event === "browser_budget_exhausted") return "浏览器采集已达到预算限制";
+    if (event?.event === "browser_connection_cancelled") return "浏览器连接已取消";
     if (event?.event === "network_fallback") return "直连初始连接未完成，改用一次本机代理尝试";
     if (event?.event === "network_attempt_started") return event.network_mode === "proxy" ? "开始独立代理尝试" : "开始直连尝试";
     if (event?.event === "network_attempt_completed") return `${event.network_mode === "proxy" ? "代理" : "直连"}尝试结束`;
@@ -350,7 +378,7 @@
       return row;
     };
     if (events.length) {
-      const significant = new Set(["browser_preparing","browser_started","interaction_started","browser_connection_blocked","network_fallback","network_attempt_started","redirect","download_candidate","download_started","file_verifying","file_verified","challenge_detected","browser_required","task_timeout","build_timeout"]);
+      const significant = new Set(["browser_preparing","browser_started","interaction_started","browser_connection_blocked","browser_connection_failed","browser_transport_failed","browser_budget_exhausted","dns_resolution_failed","dns_resolution_observed","network_fallback","network_attempt_started","redirect","download_candidate","download_started","file_verifying","file_verified","challenge_detected","browser_required","task_timeout","build_timeout"]);
       // Keep important chain changes when frequent byte updates would hide them.
       const picked = new Set(events.slice(-6));
       for (const event of events.filter((event) => significant.has(event.event)).slice(-6)) picked.add(event);
@@ -456,6 +484,13 @@
       heading.append(cancel);
     }
     content.append(heading, node("p", "job-url", job.input?.entry_url || ""));
+    const tlsPolicy = job.tls_policy || job.input?.tls_policy;
+    const tlsFallback = job.tls_fallback || job.data_package?.tls_fallback;
+    if (tlsFallback?.observed === true) content.append(node("p", "tls-warning", `本次记录了 ${tlsFallback.count} 次证书校验失败后的继续访问。相关 HTTPS 服务器身份未经验证，页面或 APK 可能被冒充、篡改。文件校验通过不代表来源可信；具体错误、证书原件及获取缺口保留在数据包中。${tlsFallback.state === "unavailable" ? "另有未能确认的证书处理记录，请查看数据包缺口。" : ""}`));
+    else if (!job.input?.tls_policy && job.input?.ignore_tls_errors === true) content.append(node("p", "tls-warning", "此历史任务曾手动忽略证书错误，HTTPS 服务器身份未经验证。文件校验通过不代表来源可信。"));
+    else if (tlsFallback?.state === "unavailable") content.append(node("p", "tls-warning", "证书处理记录不完整，暂时不能确认是否发生了放宽校验。请查看数据包中的错误及获取缺口。"));
+    else if (tlsPolicy === "auto") content.append(node("p", "muted", "证书策略：先校验，仅证书校验失败时继续；错误和原件随数据包保留。"));
+    else if (tlsPolicy === "strict") content.append(node("p", "muted", "证书策略：严格校验，证书错误时停止。"));
     content.append(node("p", "", `原包结果：${labels[job.outcome] || "尚未取得结论"}`));
     const artifacts = job.artifacts || [];
     if (artifacts.length) {
@@ -561,6 +596,18 @@
       }
     }
     panel.append(group);
+    if (!child) {
+      const option = node("div", "tls-option");
+      const label = node("label", "", "此次后续任务的证书处理");
+      const choice = node("select", "");
+      choice.id = `tls-policy-${job.id}`; label.setAttribute("for", choice.id);
+      choice.append(new Option("先校验，仅证书错误时继续（默认）", "auto"), new Option("严格校验，证书错误时停止", "strict"));
+      choice.value = pending?.body.tls_policy || state.continuationTls.get(job.id) || "auto";
+      choice.disabled = !!pending || state.clearing;
+      choice.onchange = () => state.continuationTls.set(job.id, choice.value);
+      option.append(label, choice, node("p", "", "每个新任务重新从证书校验开始。自动继续后服务器身份未经验证，风险和错误会保留。"));
+      panel.append(option);
+    }
     const action = node("button", "primary continuation-submit", child ? "查看后续任务" : pending?.busy ? "正在提交…" : pending ? "重试继续下载" : "继续下载所选地址");
     action.type = "button";
     action.disabled = state.clearing || !!pending?.busy || (!child && !pending && !state.selectedContinuations.has(job.id));
@@ -574,7 +621,7 @@
     if (!pending) {
       const selected = state.selectedContinuations.get(job.id);
       if (!(job.download_candidates || []).some((candidate) => candidate.id === selected)) return;
-      pending = {key:idempotencyKey(), body:{candidate_id:selected}, busy:false};
+      pending = {key:idempotencyKey(), body:{candidate_id:selected,tls_policy:state.continuationTls.get(job.id) || "auto"}, busy:false};
       state.pendingContinuations.set(job.id, pending);
     }
     if (pending.busy) return;
@@ -583,6 +630,7 @@
       const child = await api(`/api/jobs/${encodeURIComponent(job.id)}/continue`, {method:"POST",body:pending.body,headers:{"Idempotency-Key":pending.key}});
       if (epoch !== state.epoch || state.clearing || !state.authenticated) return;
       state.pendingContinuations.delete(job.id); state.selectedContinuations.delete(job.id);
+      state.continuationTls.delete(job.id);
       state.current = child.id; state.job = child; rememberJob(child.id);
       state.pollDelay = 1500; renderJob(); await loadJobs();
       if (epoch === state.epoch) notice("已提交所选地址。原任务保留，新下载不保留原页面的登录状态。");
@@ -597,14 +645,16 @@
     }
   }
   function updateInput() {
+    updateTLSChoice();
     const locked = state.submitting || !!state.pendingJob || state.clearing;
     $("url").disabled = locked;
+    $("tls-policy").disabled = locked;
     $("image-file").disabled = locked || state.uploading;
     $("clear-image").disabled = locked || state.uploading;
     $("dropzone").setAttribute("aria-disabled", String(locked || state.uploading));
     for (const radio of $("qr-candidates").querySelectorAll("input")) radio.disabled = locked || state.uploading || radio.dataset.blocked === "true";
     $("download-button").disabled = state.submitting || state.uploading || state.clearing || !!state.image?.truncated;
-    $("download-button").textContent = state.submitting ? "正在提交…" : state.pendingJob ? "重试提交（同一次任务）" : "开始采集（含应用下载）";
+    $("download-button").textContent = state.submitting ? "正在提交…" : state.pendingJob ? "重试提交（同一次任务）" : "开始采集";
     if (locked || state.uploading || state.image?.truncated || !state.authenticated) clearDirectLink();
     else scheduleDirectLink();
   }
@@ -701,7 +751,7 @@
         if (epoch !== state.epoch) return;
         if (!preview.request_url || ["unsupported", "store"].includes(preview.kind)) throw new Error(messages.unsupported_input);
         $("url").value = preview.url; updateHost();
-        const body = {url:originalInput};
+        const body = {url:originalInput,tls_policy:$("tls-policy").value};
         if (state.image && state.selectedQR) {
           body.image_id = state.image.id; body.candidate_id = state.selectedQR.id;
           const original = state.selectedQR.kind === "itms_manifest" ? state.selectedQR.text : state.selectedQR.url;
@@ -713,9 +763,11 @@
       const job = await api("/api/jobs", {method:"POST",body:pending.body,headers:{"Idempotency-Key":pending.key}});
       if (epoch !== state.epoch) return;
       state.pendingJob = null; state.current = job.id; state.job = job; rememberJob(job.id);
+      $("tls-policy").value = "auto";
+      $("advanced-settings").open = false;
       state.pollDelay = 1500; renderJob(); await loadJobs(); notice("任务已提交。刷新会清空当前会话记录，不会重新采集。");
     } catch (error) {
-      if (error.status && error.status < 500) state.pendingJob = null;
+      if (error.status && error.status < 500) { state.pendingJob = null; $("tls-policy").value = "auto"; }
       if (state.authenticated) notice(error.message + (state.pendingJob ? " 重试将沿用同一次提交，不会重复创建任务。" : ""), true);
     } finally { state.submitting = false; updateInput(); schedule(); }
   }
@@ -827,6 +879,8 @@
     $("refresh").disabled = true;
     state.jobs = []; state.current = null; state.job = null;
     state.pendingJob = null; state.pendingBuilds.clear(); state.pendingAnalyses.clear(); state.pendingContinuations.clear(); state.selectedContinuations.clear(); state.progressExpanded.clear(); state.activeBuildJobs.clear();
+    state.continuationTls.clear(); $("tls-policy").value = "auto";
+    $("advanced-settings").open = false;
     state.submitting = false; state.uploading = false;
     clearImage(); $("url").value = ""; updateHost(); rememberJob(null);
     $("job-picker").replaceChildren(new Option("还没有任务", "")); renderJob(); updateInput();
@@ -840,6 +894,17 @@
     finally { state.clearing = false; $("refresh").disabled = false; updateInput(); }
   }
   $("refresh").onclick = () => clearRecords();
+  $("tls-policy").value = "auto";
+  $("advanced-settings").open = false;
+  $("tls-policy").onchange = updateTLSChoice;
+  updateTLSChoice();
+  window.addEventListener("pageshow", () => {
+    $("tls-policy").value = state.pendingJob?.body.tls_policy || "auto";
+    if (!state.pendingJob) $("advanced-settings").open = false;
+    updateTLSChoice();
+    state.continuationTls.clear();
+    if (state.job) renderJob();
+  });
   document.addEventListener("visibilitychange", () => { if (document.hidden) { stopPolling(); stopCapabilityPolling(); } else { schedule(); void pollCapabilities(); } });
   window.addEventListener("beforeunload", () => { stopPolling(); stopCapabilityPolling(); if (state.previewURL) URL.revokeObjectURL(state.previewURL); });
   api("/api/session").then((session) => session.authenticated ? authenticated(session) : signedOut()).catch(() => { signedOut(); notice("暂时无法连接本地主机，请检查服务后刷新。",true); });

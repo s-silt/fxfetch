@@ -8,12 +8,12 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -23,6 +23,7 @@ from ..core.classify import classify_input, normalize_entry_url
 from ..core.errors import FxfetchError
 from ..core.lan import client_allowed
 from ..core.qr import decode_image
+from ..core.tls_policy import web_tls_policy
 from ..security import contained_path, password_matches, token_hash
 from ..service import JobService
 from ..store import Store
@@ -170,7 +171,18 @@ class Login(StrictModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
-class JobInput(StrictModel):
+class TLSInput(StrictModel):
+    tls_policy: Literal['auto', 'strict'] = 'auto'
+    ignore_tls_errors: StrictBool | None = None
+
+    @model_validator(mode='after')
+    def validate_tls_choice(self):
+        self.tls_policy = web_tls_policy({key: getattr(self, key) for key in self.model_fields_set
+                                         if key in {'tls_policy', 'ignore_tls_errors'}})
+        return self
+
+
+class JobInput(TLSInput):
     url: str | None = Field(default=None, max_length=8192)
     image_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     candidate_id: str | None = Field(default=None, max_length=80)
@@ -181,6 +193,10 @@ class PreviewInput(StrictModel):
 
 
 class BuildInput(StrictModel):
+    candidate_id: str = Field(min_length=1, max_length=80)
+
+
+class ContinuationInput(TLSInput):
     candidate_id: str = Field(min_length=1, max_length=80)
 
 
@@ -383,7 +399,7 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
         idempotency_key: Annotated[str | None, Header()] = None,
     ):
         return await run_in_threadpool(
-            jobs.create_job, current["id"], idem(idempotency_key), value.model_dump()
+            jobs.create_job, current["id"], idem(idempotency_key), value.model_dump(exclude={'ignore_tls_errors'})
         )
 
     @app.delete("/api/jobs")
@@ -451,12 +467,13 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
     @app.post("/api/jobs/{identifier}/continue", status_code=202)
     async def continue_job(
         identifier: str,
-        value: BuildInput,
+        value: ContinuationInput,
         current: Annotated[dict, Depends(session)],
         idempotency_key: Annotated[str | None, Header()] = None,
     ):
         return await run_in_threadpool(
-            jobs.continue_job, current["id"], identifier, idem(idempotency_key), value.candidate_id
+            jobs.continue_job, current["id"], identifier, idem(idempotency_key), value.candidate_id,
+            tls_policy=value.tls_policy,
         )
 
     @app.post("/api/jobs/{identifier}/cancel")

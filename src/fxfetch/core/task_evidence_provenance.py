@@ -13,6 +13,11 @@ from .task_evidence_schema import (
     EvidenceError,
     strict_json,
 )
+from .task_evidence_tls import (
+    CHROME_CERTIFICATE_SOURCES,
+    validate_chrome_provenance,
+    validate_netlog_provenance,
+)
 from .web_journal import MAX_RECORD_BYTES
 
 _SAVED_KINDS = {"response_body_saved", "response_prefix_saved", "terminal_snapshot"}
@@ -74,6 +79,8 @@ def parse_observations(
                 "response_body_saved", "response_prefix_saved", "redirect_observed",
                 "network_request_observed", "frame_navigated", "subresource_http_error",
                 "terminal_snapshot",
+                "tls_certificate_saved",
+                "tls_certificate_observed",
             }:
                 context = value["fields"]
                 if not all(
@@ -162,12 +169,17 @@ def validate_material_provenance(
     for row in rows:
         fields = row.get("fields")
         if (
-            row["kind"] == "request_attempted"
+            row["kind"] in {"request_attempted", "network_request_observed"}
             and isinstance(fields, dict)
             and isinstance(fields.get("request_ref"), str)
         ):
             requests.setdefault(fields["request_ref"], []).append(fields)
     request_refs = set(requests)
+    permitted: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        fields = row.get('fields')
+        if row['kind'] == 'request_permitted' and isinstance(fields, dict) and isinstance(fields.get('request_ref'), str):
+            permitted.setdefault(fields['request_ref'], []).append(fields)
     for ref, facts in requests.items():
         if len({
             (item.get("url"), item.get("collector_id"), item.get("attempt_id"))
@@ -175,13 +187,9 @@ def validate_material_provenance(
         }) > 1:
             raise EvidenceError("task_evidence_request_ref_conflict")
         identity = facts[0]
-        for row in rows:
-            fields = row.get("fields")
+        for fields in permitted.get(ref, []):
             if (
-                row["kind"] == "request_permitted"
-                and isinstance(fields, dict)
-                and fields.get("request_ref") == ref
-                and any(
+                any(
                     fields.get(key) != identity.get(key)
                     for key in ("collector_id", "attempt_id")
                 )
@@ -244,6 +252,68 @@ def validate_material_provenance(
             item.get("url") == package.get("source_url") for item in requests[ref]
         ):
             raise EvidenceError("task_evidence_request_context_mismatch")
+
+
+def validate_attachment_provenance(
+    rows: list[dict[str, Any]], attachments: list[dict[str, Any]], *, deadline: float | None = None,
+    tls_policy: str | None = None,
+) -> None:
+    requests: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    certificates: dict[tuple, set[tuple[str, str]]] = {}
+    bodies: dict[str, set[tuple[int, str, bool]]] = {}
+    tls_fields = ('tls_fallback_id', 'tls_verify_code', 'tls_verify_reason', 'connection_ip')
+
+    def check_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise EvidenceError('task_evidence_seal_timeout')
+
+    for row in rows:
+        check_deadline()
+        fields = row['fields']
+        ref, url = fields.get('request_ref'), fields.get('source_url', fields.get('url'))
+        collector, attempt = fields.get('collector_id'), fields.get('attempt_id')
+        if not all(isinstance(value, str) for value in (ref, url, collector, attempt)):
+            continue
+        context = (collector, attempt)
+        if row['kind'] in {'request_attempted', 'network_request_observed'}:
+            requests.setdefault((ref, url), set()).add(context)
+        size, digest = fields.get('size'), fields.get('sha256')
+        if type(size) is not int or not isinstance(digest, str):
+            continue
+        if row['kind'] in {'response_body_saved', 'response_prefix_saved'}:
+            bodies.setdefault(ref, set()).add((size, digest, fields.get('complete') is True))
+        if (row['kind'] == 'tls_certificate_saved' and isinstance(fields.get('path'), str)
+            and fields.get('tls_der_sha256') == digest and fields.get('complete') is True
+            and fields.get('representation') == 'tls_certificate_der' and fields.get('cert_role') == 'leaf'
+            and fields.get('capture_source') in {'verified_tls_socket', 'unverified_tls_socket'}
+            and fields.get('association') == 'same_connection'):
+            key = (fields['path'], size, digest, ref, url, fields['capture_source'], fields.get('tls_verification'))
+            if tls_policy is not None:
+                key += tuple(fields.get(name) for name in tls_fields)
+            certificates.setdefault(key, set()).add(context)
+    for attachment in attachments:
+        check_deadline()
+        ref = attachment.get('request_ref')
+        matching = requests.get((ref, attachment['source_url']), set()) if ref is not None else set()
+        if ref is not None and not matching:
+            raise EvidenceError('task_evidence_attachment_request_unobserved')
+        if attachment['kind'] != 'certificate':
+            if ref in bodies and (attachment['size'], attachment['sha256'], True) not in bodies[ref]:
+                raise EvidenceError('task_evidence_package_provenance_mismatch')
+            continue
+        if attachment.get('capture_source') in CHROME_CERTIFICATE_SOURCES:
+            continue
+        if not isinstance(ref, str):
+            raise EvidenceError('task_evidence_certificate_binding_invalid')
+        key = (attachment['source_path'], attachment['size'], attachment['sha256'],
+               ref, attachment['source_url'], attachment['capture_source'], attachment.get('tls_verification'))
+        if tls_policy is not None:
+            key += tuple(attachment.get(name) for name in tls_fields)
+        matches = certificates.get(key, set())
+        if not matches.intersection(matching):
+            raise EvidenceError('task_evidence_certificate_binding_invalid')
+    validate_chrome_provenance(rows, attachments, deadline)
+    validate_netlog_provenance(rows, attachments, deadline)
 
 
 def validate_saved_bytes(

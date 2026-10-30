@@ -13,14 +13,21 @@ from typing import Any
 
 from fxfetch import __version__
 
+from .task_evidence_attachments import collect_attachments
 from .task_evidence_observations import read_observations
-from .task_evidence_provenance import validate_material_provenance, validate_saved_bytes
+from .task_evidence_provenance import (
+    validate_attachment_provenance,
+    validate_material_provenance,
+    validate_saved_bytes,
+)
 from .task_evidence_schema import (
     MAX_TASK_FILES,
     TASK_EVIDENCE_SCHEMA,
     EvidenceError,
     validate_task_manifest,
 )
+from .task_evidence_tls import tls_capture_summary, validate_task_tls_policy
+from .task_evidence_tls_policy import validate_auto_tls_policy
 from .task_evidence_verify import _bounded_digest, _check_deadline, verify_task_archive
 from .web_evidence_io import check_ancestors, is_reparse, source_path
 
@@ -36,6 +43,8 @@ def build_task_archive(
     observation_path: Path | None,
     max_bytes: int,
     max_seconds: float = 15.0,
+    ignore_tls_errors: bool = False,
+    tls_policy: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     root = root.absolute()
     deadline = time.monotonic() + max_seconds
@@ -55,17 +64,27 @@ def build_task_archive(
         started_at,
         finished_at,
     ) = read_observations(observation_path)
+    fallback = None
+    if tls_policy is None:
+        validate_task_tls_policy(rows, ignore_tls_errors)
+    else:
+        fallback = validate_auto_tls_policy(rows, tls_policy)
+        if observation_state != 'healthy':
+            fallback['state'] = 'unavailable'
     gaps.extend(_result_gaps(result))
-    external = _external_packages(root, result, deadline)
+    external = _external_packages(root, result, deadline, max_bytes=max_bytes)
     request_refs = {
         item["fields"].get("request_ref")
         for item in rows
-        if item["kind"] == "request_attempted"
+        if item["kind"] in {"request_attempted", "network_request_observed"}
     }
     for package in external:
         if package.get("request_ref") not in request_refs:
             package.pop("request_ref", None)
             gaps.append("package_request_association_incomplete")
+    attachments, attachment_sources, attachment_gaps = collect_attachments(
+        root, job_id, result, rows, external, max_bytes, deadline, tls_policy=tls_policy)
+    gaps.extend(attachment_gaps)
     package_refs = {item["request_ref"] for item in external if item.get("request_ref")}
     files: list[dict[str, Any]] = []
     sources: list[tuple[str, Path]] = []
@@ -73,6 +92,9 @@ def build_task_archive(
     file_paths: set[str] = set()
     seen_materials: set[tuple[str, str]] = set()
     package_paths, package_hashes = _package_source_facts(root, result)
+    embedded_package_paths = {item['source_path'].casefold() for item in attachments if item['kind'] == 'package'}
+    package_paths.update(embedded_package_paths)
+    package_hashes.update((item['size'], item['sha256']) for item in attachments if item['kind'] == 'package')
     for row in rows:
         fields = row.get("fields")
         if not isinstance(fields, dict) or row.get("kind") not in {
@@ -84,6 +106,12 @@ def build_task_archive(
         request_ref = fields.get("request_ref")
         if isinstance(request_ref, str) and request_ref in package_refs:
             continue
+        relative = fields.get('path')
+        if (isinstance(relative, str) and relative.casefold() in embedded_package_paths) or (
+            type(fields.get('size')) is int and isinstance(fields.get('sha256'), str)
+            and (fields['size'], fields['sha256']) in package_hashes
+        ):
+            continue
         if fields.get("package_stream") is True:
             gaps.append("package_body_not_included")
             continue
@@ -92,7 +120,8 @@ def build_task_archive(
             gaps.append("material_path_unknown")
             continue
         if relative.casefold() in package_paths:
-            gaps.append("original_package_excluded")
+            if relative.casefold() not in embedded_package_paths:
+                gaps.append("original_package_excluded")
             continue
         recorded_size, recorded_hash = fields.get("size"), fields.get("sha256")
         if (
@@ -117,11 +146,10 @@ def build_task_archive(
         except OSError as error:
             raise EvidenceError("task_evidence_material_unavailable") from error
         if (size, sha256) in package_hashes:
-            gaps.append("original_package_excluded")
             continue
         if size == 0:
             continue
-        if len(files) >= MAX_TASK_FILES or sum(item["size"] for item in files) + size > max_bytes:
+        if len(files) + len(attachments) >= MAX_TASK_FILES or sum(item["size"] for item in files + attachments) + size > max_bytes:
             gaps.append("material_byte_budget")
             break
         member = relative.replace("\\", "/")
@@ -171,9 +199,12 @@ def build_task_archive(
         external,
         allow_incomplete=observation_state != "healthy",
     )
+    validate_attachment_provenance(rows, attachments, deadline=deadline, tls_policy=tls_policy)
     state = "saved" if files else "empty"
     manifest: dict[str, Any] = {
         "schema_version": TASK_EVIDENCE_SCHEMA,
+        **({'ignore_tls_errors': ignore_tls_errors} if tls_policy is None else {
+            'tls_policy': tls_policy, 'tls_fallback': fallback}),
         "producer_version": __version__,
         "job_id": job_id,
         "entry_url": entry_url,
@@ -201,6 +232,8 @@ def build_task_archive(
         "attempts": _attempts(result),
         "files": files,
         "external_packages": external,
+        "attachments": attachments,
+        "tls_certificates": tls_capture_summary(rows, attachments, list(dict.fromkeys(gaps))[:256]),
         "gaps": list(dict.fromkeys(gaps))[:256],
     }
     validate_task_manifest(manifest)
@@ -214,8 +247,8 @@ def build_task_archive(
         if archive_budget <= 0:
             raise EvidenceError("task_evidence_storage_budget")
         estimate = len(encoded_manifest) + len(observation_bytes or b"") + sum(
-            record["size"] for record in files
-        ) + 1024 * (len(files) + 2)
+            record["size"] for record in files + attachments
+        ) + 1024 * (len(files) + len(attachments) + 2)
         if estimate > min(archive_budget, shutil.disk_usage(archive_path.parent).free):
             raise EvidenceError("task_evidence_storage_budget")
         check_ancestors(pending)
@@ -230,19 +263,20 @@ def build_task_archive(
                     for offset in range(0, len(observation_bytes), 64 * 1024):
                         _check_deadline(deadline)
                         stream.write(observation_bytes[offset : offset + 64 * 1024])
-            for member, source in sources:
+            records_by_path = {item['path']: item for item in files + attachments}
+            for member, source in sources + attachment_sources:
                 _check_deadline(deadline)
                 check_ancestors(source)
-                expected = next(item for item in files if item["path"] == member)
+                expected = records_by_path[member]
                 copied = hashlib.sha256()
                 copied_size = 0
                 info = zipfile.ZipInfo(member)
-                info.compress_type = zipfile.ZIP_DEFLATED
+                info.compress_type = zipfile.ZIP_STORED if expected.get('kind') == 'package' else zipfile.ZIP_DEFLATED
                 with source.open("rb") as input_stream, bundle.open(info, "w") as output_stream:
                     while block := input_stream.read(64 * 1024):
                         _check_deadline(deadline)
                         copied_size += len(block)
-                        if copied_size > max_bytes:
+                        if copied_size > min(max_bytes, expected['size']):
                             raise EvidenceError("task_evidence_archive_too_large")
                         copied.update(block)
                         output_stream.write(block)
@@ -258,11 +292,13 @@ def build_task_archive(
 
 
 def _external_packages(
-    root: Path, result: dict[str, Any], deadline: float | None = None
+    root: Path, result: dict[str, Any], deadline: float | None = None, *, max_bytes: int
 ) -> list[dict[str, Any]]:
     values = []
     for artifact in result.get("artifacts", [])[:16]:
         if not isinstance(artifact, dict) or artifact.get("kind") not in {"apk", "ipa"}:
+            continue
+        if type(artifact.get('size')) is not int or not 0 < artifact['size'] <= max_bytes:
             continue
         path = artifact.get("path")
         if not isinstance(path, (str, Path)):
@@ -275,7 +311,7 @@ def _external_packages(
         try:
             candidate = source_path(root, relative)
             size, sha256 = _bounded_digest(
-                candidate, max(1, int(artifact.get("size", 0)) + 1), deadline
+                candidate, min(max_bytes, artifact['size'] + 1), deadline
             )
         except EvidenceError as error:
             if error.code == "task_evidence_seal_timeout":

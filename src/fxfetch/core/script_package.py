@@ -6,6 +6,8 @@ reachability. Only a subsequent guarded download can establish package success.
 
 from __future__ import annotations
 
+from urllib.parse import urljoin, urlsplit
+
 from .classify import classify_input
 from .discovery import Candidate
 from .errors import FxfetchError
@@ -13,8 +15,14 @@ from .script_content import _LEX, MAX_SCRIPT_BYTES, MAX_TOKENS, _literal, _Scrip
 
 
 class _PackageScripts(_Scripts):
+    def __init__(self) -> None:
+        super().__init__()
+        self.has_base = False
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         super().handle_starttag(tag, attrs)
+        if tag == "base":
+            self.has_base = True
         if tag == "script" and any(parent in {"template", "noscript", "svg"} for parent in self.budget_stack):
             self.active = False
 
@@ -74,7 +82,7 @@ def script_package_candidates(html: str, source: str, maximum: int) -> list[Cand
                 literal = _literal(tokens[index + 3])
                 if literal is not None:
                     declarations[name[1]] = (index + 1, literal)
-        if kind != "word" or index + 1 >= len(tokens) or values[index + 1] not in {";", "}"}:
+        if kind not in {"word", "string"} or index + 1 >= len(tokens) or values[index + 1] not in {";", "}"}:
             continue
         for prefix in (
             ["window", ".", "location", ".", "href", "="],
@@ -88,10 +96,25 @@ def script_package_candidates(html: str, source: str, maximum: int) -> list[Cand
                 break
 
     found: dict[str, Candidate] = {}
+    literals: list[str] = []
     for name, (declaration, literal) in declarations.items():
         uses = references.get(name, set()) - {declaration}
         if not uses or not uses.issubset(destinations):
             continue
+        literals.append(literal)
+    for index in sorted(destinations):
+        literal = _literal(tokens[index])
+        if literal is None:
+            continue
+        # A base element changes relative-navigation semantics. Absolute
+        # literals remain usable; do not guess how a relative URL resolves.
+        try:
+            if parser.has_base and not urlsplit(literal).scheme:
+                continue
+            literals.append(urljoin(source, literal))
+        except ValueError:
+            continue
+    for literal in literals:
         try:
             parsed = classify_input(literal)
         except FxfetchError:

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .task_evidence_io import build_task_archive, verify_task_archive
+from .task_evidence_tls import validate_tls_summary
+from .task_evidence_tls_policy import valid_fallback_summary
 from .web_evidence_io import check_ancestors, is_reparse
 from .web_evidence_schema import EvidenceError, strict_json
 
@@ -87,8 +89,22 @@ def package_metadata(
             summary = value.get("web_materials")
             if not _valid_material_summary(summary):
                 raise EvidenceError("data_package_metadata_invalid")
+            attachments = value.get('attachments')
+            if attachments is not None and (
+                not isinstance(attachments, dict) or set(attachments) != {'packages', 'certificates', 'bytes'}
+                or any(type(count) is not int or count < 0 for count in attachments.values())
+            ):
+                raise EvidenceError('data_package_metadata_invalid')
+            tls = value.get('tls_certificates')
+            if tls is not None and not validate_tls_summary(tls):
+                raise EvidenceError('data_package_metadata_invalid')
+            fallback = value.get('tls_fallback')
+            if fallback is not None and not valid_fallback_summary(fallback):
+                raise EvidenceError('data_package_metadata_invalid')
             return {"state": "ready", "filename": filename, "size": size, "sha256": sha256,
-                    "web_materials": summary}
+                    "web_materials": summary, **({'attachments': attachments} if attachments is not None else {}),
+                    **({'tls_certificates': tls} if tls is not None else {}),
+                    **({'tls_fallback': fallback} if fallback is not None else {})}
         if state == "failed":
             reason = value.get("reason_code")
             summary = value.get("web_materials")
@@ -122,6 +138,8 @@ def finalize_package(
     terminal_result: dict[str, Any],
     observation_path: Path,
     max_bytes: int,
+    ignore_tls_errors: bool = False,
+    tls_policy: str | None = None,
 ) -> dict[str, Any]:
     directory = package_directory(job_dir)
     try:
@@ -141,6 +159,8 @@ def finalize_package(
             result=terminal_result,
             observation_path=observation_path,
             max_bytes=max_bytes,
+            ignore_tls_errors=ignore_tls_errors,
+            tls_policy=tls_policy,
         )
         size = archive.stat().st_size
         _, actual_hash = verify_task_archive(archive, max_bytes=max_bytes)
@@ -152,6 +172,13 @@ def finalize_package(
             "size": size,
             "sha256": sha256,
             "web_materials": manifest["web_materials"],
+            "tls_certificates": manifest['tls_certificates'],
+            **({'tls_fallback': manifest['tls_fallback']} if 'tls_fallback' in manifest else {}),
+            'attachments': {
+                'packages': sum(item['kind'] == 'package' for item in manifest.get('attachments', [])),
+                'certificates': sum(item['kind'] == 'certificate' for item in manifest.get('attachments', [])),
+                'bytes': sum(item['size'] for item in manifest.get('attachments', [])),
+            },
         }
         write_package_metadata(directory, metadata)
         return metadata

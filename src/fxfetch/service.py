@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -34,6 +35,7 @@ from .core.task_evidence import (
     write_package_metadata,
 )
 from .core.task_evidence_recorder import TaskEvidenceRecorder
+from .core.tls_policy import web_tls_policy
 from .core.web_apk import WebApkBuilder, derive_names
 from .core.workflow import Workflow
 from .rejected_files import open_rejected_file, rejected_files
@@ -180,6 +182,12 @@ class JobService:
         }
 
     def create_job(self, owner: str, idem: str, value: dict) -> dict:
+        try:
+            tls_policy = web_tls_policy(value)
+        except ValueError as error:
+            raise FxfetchError('invalid_input', str(error)) from error
+        value = {key: item for key, item in value.items() if key != 'ignore_tls_errors'}
+        value['tls_policy'] = tls_policy
         existing = self.store.replay_job(owner, idem, value)
         if existing:
             return self.get_job(owner, existing["id"])
@@ -211,6 +219,7 @@ class JobService:
             source["original_input"] = source["entry_url"]
             source["entry_url"] = normalized_entry
         classified = classify_input(source["entry_url"])
+        source['tls_policy'] = tls_policy
         if classified.kind in ("unsupported", "store") or classified.request_url is None:
             raise FxfetchError("unsupported_input", "Unsupported URL type")
         # Preserve the typed source separately when a scheme was completed;
@@ -247,6 +256,8 @@ class JobService:
 
     def get_job(self, owner: str, identifier: str) -> dict:
         job = self.store.get_job(owner, identifier)
+        job['tls_policy'] = job['input'].get('tls_policy') or (
+            'legacy_ignore' if job['input'].get('ignore_tls_errors') is True else 'strict')
         job['rejected_files'] = [item.metadata for item in rejected_files(
             job, self.store.root / 'jobs' / identifier, self.settings.limits.max_package_bytes)]
         job.pop("owner", None)
@@ -318,6 +329,10 @@ class JobService:
                 active=identifier in self._data_package_active,
             )
         job["analyses"] = self.analysis.list(owner, identifier)
+        job['tls_fallback'] = job['data_package'].get('tls_fallback', {
+            'state': 'pending' if job['state'] not in TERMINAL else 'unavailable',
+            'count': 0, 'observed': False, 'reasons': [],
+        })
         return job
 
     def rejected_file(self, owner: str, identifier: str, file_id: str) -> tuple[BinaryIO, dict]:
@@ -395,10 +410,17 @@ class JobService:
             )
         return choices
 
-    def continue_job(self, owner: str, parent_id: str, idem: str, candidate_id: str) -> dict:
+    def continue_job(self, owner: str, parent_id: str, idem: str, candidate_id: str,
+                     ignore_tls_errors: bool | None = None, *, tls_policy: str | None = None) -> dict:
+        choices = {**({'ignore_tls_errors': ignore_tls_errors} if ignore_tls_errors is not None else {}),
+                   **({'tls_policy': tls_policy} if tls_policy is not None else {})}
+        try:
+            tls_policy = web_tls_policy(choices)
+        except ValueError as error:
+            raise FxfetchError('invalid_input', str(error)) from error
         with self._mutex:
             parent = self.get_job(owner, parent_id)
-            request = {"parent_job_id": parent_id, "candidate_id": candidate_id}
+            request = {"parent_job_id": parent_id, "candidate_id": candidate_id, 'tls_policy': tls_policy}
             existing = self.store.replay_job(owner, idem, request)
             if existing:
                 return self.get_job(owner, existing["id"])
@@ -432,6 +454,7 @@ class JobService:
                 "session_continuity": "independent_request_session",
                 "cookies_inherited": False,
                 "continuation_depth": depth,
+                'tls_policy': tls_policy,
             }
             job, created = self.store.create_continuation(
                 owner, parent_id, candidate_id, idem, source, self.settings.limits.max_queued_jobs
@@ -736,6 +759,8 @@ class JobService:
                 terminal_result=result,
                 observation_path=folder / "task-observations.jsonl",
                 max_bytes=self.settings.limits.max_task_bytes,
+                ignore_tls_errors=job['input'].get('ignore_tls_errors', False) is True,
+                tls_policy=job['input'].get('tls_policy'),
             )
             if package_result.get("state") == "failed":
                 log.error(
@@ -786,6 +811,10 @@ class JobService:
         except OSError:
             log.error("data_package_state_write_failed id=%s", job["id"])
         recorder = None if self._isolated_collect else TaskEvidenceRecorder(folder)
+        tls_policy = job['input'].get('tls_policy') or (
+            'auto' if job['input'].get('ignore_tls_errors') is True else 'strict')
+        if recorder is not None:
+            recorder.append('task_tls_policy', {'tls_policy': tls_policy})
         started, deadline = self._start_progress(job["id"], self.settings.limits.chain_timeout)
         value: dict[str, Any]
         if self._isolated_collect:
@@ -800,6 +829,7 @@ class JobService:
                     "limits": asdict(self.settings.limits),
                     "proxy_host": self.settings.proxy_host,
                     "proxy_port": self.settings.proxy_port,
+                    'tls_policy': tls_policy,
                 },
                 folder / "worker",
                 deadline,
@@ -812,8 +842,18 @@ class JobService:
                     recorder.observe_progress(event)
 
             try:
+                workflow = self.workflow
+                if isinstance(workflow, Workflow) and hasattr(workflow, 'client'):
+                    # Test-injected collectors remain per-task; never mutate a
+                    # shared client's TLS policy for the next queued task.
+                    workflow = copy.copy(workflow)
+                    client = getattr(workflow, 'client', None)
+                    if client is not None:
+                        workflow.client = copy.copy(client)  # type: ignore[union-attr]
+                        workflow.client.tls_policy = tls_policy  # type: ignore[union-attr]
+                        workflow.client.ignore_tls_errors = tls_policy == 'auto'  # type: ignore[union-attr]
                 value = asdict(
-                    self.workflow.run(
+                    workflow.run(
                     job["input"]["entry_url"],
                     folder,
                     cancel,
@@ -863,6 +903,7 @@ class JobService:
                 else "download_action",
                 "started": started,
                 "limits": asdict(self.settings.limits),
+                'tls_policy': tls_policy,
             },
             "input": job["input"],
             "worker_summary": value,

@@ -21,6 +21,7 @@ from playwright.sync_api import sync_playwright
 
 from fxfetch.config import Settings
 from fxfetch.core.http_client import FetchedResponse, Hop, HttpClient
+from fxfetch.core.task_evidence_io import verify_task_archive
 from fxfetch.core.web_apk import BuildCapability, BuildResult, WebApkBuilder
 from fxfetch.core.workflow import Workflow
 from fxfetch.security import password_hash
@@ -164,6 +165,18 @@ def main() -> None:
                 assert hashlib.sha256(raw).hexdigest() == before["rejected_files"][0]["sha256"]
                 assert not builds and builder.calls == 0
                 assert context.request.get(job_url).json()["outcome"] == "failed"
+                bundle_link = page.get_by_role("link", name="下载数据包", exact=True)
+                bundle_link.wait_for(state="visible")
+                assert "APK / IPA 1 个" in page.locator(".data-package").inner_text()
+                with page.expect_download() as bundled:
+                    bundle_link.click()
+                bundle_copy = output / "task.zip"
+                bundled.value.save_as(bundle_copy)
+                manifest, _ = verify_task_archive(bundle_copy, max_bytes=16 * 1024 * 1024)
+                originals = [item for item in manifest["attachments"] if item["kind"] == "package"]
+                assert len(originals) == 1 and originals[0]["validation"]["status"] == "failed"
+                with zipfile.ZipFile(bundle_copy) as archive:
+                    assert archive.read(originals[0]["path"]) == raw
                 with page.expect_response(lambda response: response.url.endswith("/web-apk-builds")
                                           and response.request.method == "POST") as built:
                     action.click()
@@ -194,6 +207,7 @@ def main() -> None:
                                generated_sha256=hashlib.sha256(builder.data).hexdigest(),
                                build_posts=1, synthetic_builds=1, external_browser_requests=0,
                                acquisition_requests=2, build_panel_before_progress=True,
+                               bundled_original_identical=True, bundled_validation="failed",
                                viewport_widths=[1280, 375])
                 context.close()
             finally:
