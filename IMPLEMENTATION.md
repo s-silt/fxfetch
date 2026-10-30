@@ -9,6 +9,26 @@
 - 本轮全量：992 passed、27 skipped、2 failed。两项失败为旧测试在 Windows 默认 cp1252 下读取 UTF-8 文件，设 `PYTHONUTF8=1` 后仅复测这两项，2 passed；未重跑全量，不能称全量全绿。
 - 已检查合成状态下的面板渲染；这不是实际登录、提交、下载的浏览器操作验收。真实站点、Android worker、NAS/Docker 未验收。
 
+### Docker fxapk 配置接缝本地验证（2026-10-30）
+
+- 修复容器入口未传递 fxapk 配置的接缝：两套 Compose 均支持部署者指定 `FXFETCH_FXAPK`，只接受容器内绝对 Linux 路径，留空默认关闭；不读取宿主 `server.json`，不自动安装或挂载程序，现有隔离配置不变。
+- 定向容器部署、Android API 启动与分析 service/API 测试：52 passed、1 skipped（可选真实 fxapk 服务集成未配置），1 条既有 Starlette/httpx deprecation warning。
+- Ruff 及 `src`、`deploy/docker/entrypoint.py` Pyright 检查通过；Pyright 均为 0 errors、0 warnings、0 informations。
+- `PYTHONUTF8=1` 且未设置 `FXAPK_EXECUTABLE` 的唯一全量回归：1007 passed、27 skipped、0 failed；1 条既有 Starlette/httpx deprecation warning。跳过项为 1 个可选服务集成、5 个 Linux 浏览器网关、15 个 PowerShell 防火墙、4 个可选 fxapk CLI 联调和 2 个 POSIX/Linux 进程限制测试。
+- 使用仓库已固定的 Python 3.12 基础镜像摘要、生产 runtime 锁文件及独立测试锁文件构建 linux/amd64 测试镜像，`pip check` 通过；没有更改依赖版本。
+- Linux 断网容器内的配置、分析 service/API 与进程限制回归：45 passed、5 skipped。容器使用非 root、只读根和源码、无 capabilities、禁止提权、3 GiB 内存及 256 PID 限制。跳过项为 4 个容器内缺少 Compose CLI 的配置测试（已在 Windows 主机通过），以及 1 个未配置真实 fxapk 的可选服务联调。
+- 该轮 Linux 测试使用合成材料及替代 fxapk runner，不代表真实 Linux fxapk、NAS 实机、Android worker 或浏览器端到端验收；后续真实 fxapk 联调见下一节。
+- 本地日志保存在 `.runtime/container-analysis-validation/`。
+
+### 真实 Linux fxapk 合成联调（2026-10-30）
+
+- 使用 Python 3.12.16 / linux/amd64，在独立 venv 中按 fxapk 提交 `1259a1c22bbb5ed9a465758ebfd4fbea38881ae8` 的完整锁文件安装 fxapk 1.21.0，安装源码使用 `--no-deps`。fxapk 源码及两侧依赖版本未改，两侧 `pip check` 均通过。
+- 断网、非 root、只读容器内，4 项 CLI 混合材料联调、1 项服务子进程联调、1 项新增认证 API 联调全部通过：6 passed、0 skipped，1 条既有 Starlette/httpx deprecation warning。各用例网络审计加载标记存在，未出现网络尝试标记。
+- 新增 API 回归通过真实 fxapk 完成提交、轮询、报告 ZIP 下载，核对报告大小/哈希、原始数据包不变、原采集 blocked 结果不被覆盖，以及新会话读取状态/报告返回 404。报告仍保留 partial 覆盖，未把分析成功写成采集完整。
+- 已人工核对保存的 API 报告：仅含 `analysis.json` 和 `report/input.json`，原生报告 offline、无 load errors；合成正文线索及明确 HTTP 跳转保留，未认证目标归属。
+- Ruff、Pyright 通过。本轮只增加可选集成测试，未重跑 Windows/全量；上一轮 1007 passed、27 skipped 为历史结果。API 使用 TestClient，不是浏览器或真实 TCP/Compose 端到端，也不代表 NAS 实机、Android worker 或真实站点验收。
+- 日志及合成产物保存在 `.runtime/container-analysis-validation/`；镜像环境仅用于本地验收，没有把 fxapk 自动装入默认生产镜像。
+
 ## fxapk 离线衔接（后续本地实现）
 
 - `prepare-analysis` 校验统一任务 ZIP 并整理独立输入；`analyze-data` 通过受限子进程调用已安装的 `fxapk analyze-web --offline --fmt json`。不修改 fxapk 源码，不改 APK/WebView 流程。
