@@ -19,6 +19,22 @@ docker compose up -d --no-build api
 
 停止用 `docker compose down`，不加 `--volumes`。状态、证据和签名在命名卷中；停止服务或通过 SQLite 备份 API 做一致性备份。重启将遗留任务标为 interrupted，不重放入口。
 
+## 可选网页离线分析
+
+默认镜像不包含 fxapk，分析默认关闭。容器入口不读取迁移来的 `server.json`（包括其中的 `fxapk_executable`），避免采用宿主的程序路径、监听地址或代理配置。
+
+部署者先在派生 API 镜像中按固定 fxapk 版本及其锁文件建立独立 Linux 环境，或只读挂载已经兼容该镜像的环境，再在 `.env` 设置：
+
+```dotenv
+FXFETCH_FXAPK=/opt/fxapk/venv/bin/fxapk
+```
+
+这是**容器内的绝对程序路径**，不是安装指令、宿主目录或 shell 命令；包含空格的路径仍作为单个文件名处理。不接受相对路径、Windows/UNC 路径和控制字符。留空关闭分析；路径不存在或不可执行时，服务仍可启动，但 `web_analysis.enabled` 为 false。
+
+设置变量不会安装或挂载 fxapk。Linux 环境须匹配镜像的 Python 3.12、CPU 架构和系统库，venv 的解释器及脚本 shebang 路径须在容器内成立；不能复用 Windows/macOS venv，也不要把 fxapk 依赖混装进 fxfetch。UID/GID 10001 需有读取/执行权限，程序环境保持只读，输出仅写入私有状态卷。镜像及挂载由部署者预置，不添加网络权限、Docker socket 或运行时下载行为。
+
+`docker compose config --quiet` 和 `api check` 只校验部署配置，不运行 fxapk。重建/更新 API 容器后，通过登录后的能力接口确认配置；能力可用只证明可执行文件能解析，仍需用合成数据包验收真实离线分析、取消和报告下载。`--offline` 契约不是操作系统断网沙箱，不能据此声称 NAS/Docker 全链路已验收。原数据包、APK/IPA 和报告分开保存，WebView APK 不参与此分析。
+
 ## 可选 APK 构建
 
 预置 **Linux** SDK 的 `platforms/android-35/android.jar` 与 `build-tools/37.0.0`，在 `.env` 设置绝对路径 `FXFETCH_LINUX_SDK`：

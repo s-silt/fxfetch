@@ -32,6 +32,8 @@ Debian 默认使用 HTTPS 官方源，保留证书、Release 签名和包摘要�
 
 打包需叠加 `compose.build.yaml`、使用 API `builder` 目标，只读挂载预置 Linux SDK 和字体，重新配置容器工具路径及原私有签名。不能直接使用 Windows SDK 或盘符路径；构建不自动下载 SDK、Chrome 或目标应用。
 
+网页离线分析由 API 容器执行，不由 Android guest 执行。在兼容该 API 镜像的独立 Linux 环境中预置 fxapk 后，可设置 `FXFETCH_FXAPK=/opt/fxapk/venv/bin/fxapk`；默认关闭，变量不会自动安装或挂载程序，也不读取宿主 `server.json`。版本、路径、权限和验收边界见[独立 Docker 的离线分析说明](../docker/README.md#可选网页离线分析)。此配置不改变 Android worker、网络防护或 WebView APK 构建。
+
 ## 网络与资源
 
 API 使用 `network_mode: service:android-worker`。QEMU guest 为 `10.0.2.15`，宿主侧 `10.0.2.2` 连接共享命名空间回环。

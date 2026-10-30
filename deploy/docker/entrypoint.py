@@ -9,7 +9,7 @@ import os
 import sys
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fxfetch.core.lan import validate_bind, validate_lan_networks
 
@@ -22,6 +22,22 @@ class Deployment:
     port: int
     allowed_hosts: tuple[str, ...]
     allowed_networks: tuple[str, ...]
+    fxapk_executable: str | None
+
+
+def analysis_executable(environ: Mapping[str, str]) -> str | None:
+    value = environ.get("FXFETCH_FXAPK", "")
+    if not value:
+        return None
+    if (
+        not PurePosixPath(value).is_absolute()
+        or value.startswith("//")
+        or "\\" in value
+        or ".." in PurePosixPath(value).parts
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError("fxapk_must_be_absolute_container_path")
+    return value
 
 
 def deployment(environ: Mapping[str, str]) -> Deployment:
@@ -43,7 +59,7 @@ def deployment(environ: Mapping[str, str]) -> Deployment:
     hosts = (f"{public}:{port}", f"{bind}:{port}")
     if public == "127.0.0.1":
         hosts += (f"localhost:{port}",)
-    return Deployment(root, bind, public, port, hosts, allowed)
+    return Deployment(root, bind, public, port, hosts, allowed, analysis_executable(environ))
 
 
 def clear_proxy_environment() -> None:
@@ -106,6 +122,7 @@ def main(arguments: list[str] | None = None) -> int:
         allowed_hosts=config.allowed_hosts,
         allowed_networks=config.allowed_networks,
         proxy_host=None,
+        fxapk_executable=config.fxapk_executable,
     )
     service = JobService(settings, builder=load_builder(config.root))
     uvicorn.run(
