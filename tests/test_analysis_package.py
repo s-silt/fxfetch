@@ -41,6 +41,17 @@ def test_projection_keeps_manifest_outside_input_and_binds_bytes(tmp_path):
     assert json.loads((output / "analysis.json").read_bytes())["state"] == "prepared"
 
 
+def test_missing_response_keeps_material_and_reports_gap(tmp_path):
+    archive = analysis_archive(tmp_path / "source", response_records=False)
+    output = tmp_path / "analysis"
+    receipt = analysis_package.prepare_analysis(archive, output, max_bytes=LIMIT)
+    material = receipt["materials"][0]
+    assert material["provenance"]["gaps"] == ["response_observation_missing"]
+    assert material["provenance"]["response_observation_sequence"] is None
+    assert material["analysis_path"].endswith(".body")
+    assert hashlib.sha256((output / material["analysis_path"]).read_bytes()).hexdigest() == material["source"]["sha256"]
+
+
 def test_existing_output_is_never_overwritten(tmp_path):
     archive = analysis_archive(tmp_path / "source")
     output = tmp_path / "analysis"

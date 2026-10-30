@@ -101,6 +101,8 @@ class MaterialSources:
                     result["gaps"].append("response_media_type_conflict")
             elif responses:
                 result["gaps"].append("response_association_ambiguous")
+            else:
+                result["gaps"].append("response_observation_missing")
         elif saved:
             result["gaps"].append("response_association_unknown")
         return result

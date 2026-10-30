@@ -7,7 +7,7 @@ from fxfetch.core.task_evidence import finalize_package
 from fxfetch.core.task_evidence_recorder import TaskEvidenceRecorder
 
 
-def analysis_archive(root: Path, *, empty: bool = False) -> Path:
+def analysis_archive(root: Path, *, empty: bool = False, response_records: bool = True) -> Path:
     root.mkdir(parents=True)
     recorder = TaskEvidenceRecorder(root)
     recorder.set_context("http", "first")
@@ -23,6 +23,8 @@ def analysis_archive(root: Path, *, empty: bool = False) -> Path:
             {"event": "response_observed", "request_ref": "two", "url": end, "status": 200},
             {"event": "acquisition_event", "url": "https://unvisited.example.test/metadata-only"},
         ):
+            if not response_records and event["event"] == "response_observed":
+                continue
             recorder.observe_transport(event)
         raw = b'<html><script>var api="https://api.example.test/v1";</script></html>'
         body = root / "page.html"

@@ -61,6 +61,21 @@ def test_partial_body_is_not_promoted_to_complete_and_dom_is_not_server_body():
     assert analysis_suffix(dom, source) == (".html", "rendered_dom")
 
 
+@pytest.mark.parametrize("mode", ["absent", "different_attempt"])
+def test_missing_response_is_explicit_even_with_script_filename(mode):
+    record, rows = facts()
+    record["path"] = rows[-1]["fields"]["path"] = "bootstrap.js"
+    if mode == "absent":
+        del rows[1]
+    else:
+        rows[1]["fields"]["attempt_id"] = "another-attempt"
+    source = MaterialSources(rows).describe(record)
+    assert source["gaps"] == ["response_observation_missing"]
+    assert source["response_observation_sequence"] is None
+    assert source["media_type"] is None
+    assert analysis_suffix(record, source) == (".body", "content_sniff")
+
+
 def test_conflicting_mime_fields_and_unhashable_unrelated_log_fields_are_safe():
     record, rows = facts()
     rows[1]["fields"]["content_type"] = "application/json"
