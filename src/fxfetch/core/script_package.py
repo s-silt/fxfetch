@@ -48,6 +48,10 @@ def script_package_candidates(html: str, source: str, maximum: int) -> list[Cand
     depth = 0
     values = [token[1] for token in tokens]
     for index, (kind, value) in enumerate(tokens):
+        if value in {"var", "let", "const", "("} and values[index + 1:index + 2] in (["{"], ["["]):
+            return []  # Destructuring/scope ambiguity requires the existing browser fallback.
+        if kind == "word" and value in {"window", "location"} and values[index + 1:index + 3] == ["=", ">"]:
+            return []  # An unparenthesized arrow parameter shadows the browser global.
         if kind == "word" and value in {"window", "location"} and index and values[index - 1] in {
             "var", "let", "const", "function", "(", ",",
         }:

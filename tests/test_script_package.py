@@ -138,3 +138,19 @@ def test_device_regex_does_not_hide_real_navigation_declaration():
     '''
     assert [candidate.kind for candidate in discover_html(document(script), ROOT).candidates] == [
         'direct_apk', 'direct_ipa']
+
+
+@pytest.mark.parametrize("script", [
+    "const a='https://synthetic.test/a.apk'; const setLocal = window => { window.location.href=a; };",
+    "const a='https://synthetic.test/a.apk'; const setLocal = location => { location.href=a; };",
+    "const a='https://synthetic.test/a.apk'; const {location} = {location:{href:''}}; location.href=a;",
+    "const a='https://synthetic.test/a.apk'; const [window] = [{location:{href:''}}]; window.location.href=a;",
+])
+def test_shadowed_navigation_does_not_request_package(script, tmp_path):
+    html = document(script)
+    assert not discover_html(html, ROOT).candidates
+    client = SyntheticClient({ROOT + '/': (200, 'text/html', html),
+                              ROOT + '/a.apk': (200, 'application/octet-stream', apk_bytes())})
+    result = Workflow(client).run(ROOT, tmp_path, threading.Event())
+    assert [call[0] for call in client.calls] == [ROOT + '/']
+    assert not result.artifacts
