@@ -1,5 +1,32 @@
 # fxfetch
 
+## 离线交给 fxapk 分析
+
+后台保存的任务 ZIP 可以直接交给离线适配入口；原 APK/IPA 仍单独处理。
+fxapk 需在另一个环境按其锁定依赖安装，本项目不安装或导入 fxapk。
+
+```bash
+fxfetch prepare-analysis task.zip --out new-analysis
+fxfetch analyze-data task.zip --out another-analysis --fxapk /path/to/fxapk
+```
+
+`prepare-analysis` 仅校验和整理，不需要安装 fxapk。`analyze-data` 在相同步骤后，通过有时间、内存及日志上限的子进程执行 `fxapk analyze-web --offline --fmt json`；不下载网页、不联网富化、不执行 APK 或网页脚本。`--fxapk` 只能是操作者信任的本地可执行文件路径或 PATH 名称，不是 shell 命令；`--timeout` 默认 300 秒，允许 1–3600 秒。输出目录必须不存在，拒绝覆盖。
+
+浏览器保存的通用 `.body` 文件，在请求、响应和保存事件能明确关联时，按响应 MIME 选择 HTML/JS/JSON 等解析器；DOM 快照单独标注为渲染材料。响应关联或 MIME 冲突时不猜类型，保留缺口并退回内容识别。文件字节不改写；回执保留原文件名、哈希、保存观察序号、响应观察序号及 frame/session/target。MIME 只是解析器选择依据，不证明内容可信，脚本中的静态跳转仍不是实际访问。
+
+输出分开保存：
+- `source.zip`：经过校验的原始数据包副本，不修改原包。
+- `input/`：正文、DOM 和派生 HAR；只有此目录交给 fxapk，任务清单和来源日志不混入正文扫描。
+- `analysis.json`：原包哈希、原 manifest、逐文件及 HAR 条目到原观察序号的映射、跳过原因、采集缺口与分析状态。报告中的 `web/material-NNNN.*` 和 `web/observed.har#/log/entries/N` 可据此回查原件。
+- `report/input.json`：fxapk 原生报告；保留其原有哈希旁文件，不重写报告。
+- `fxapk.stdout.log` / `fxapk.stderr.log`：有界执行日志。整个目录是私有材料，不能直接公开。
+
+HAR 是适配投影，不是新的浏览器抓包：仅按 collector / attempt / request 标识匹配；无响应的尝试使用状态 0，不把许可等同实际收到响应。不同会话、候选链接、未知关联及 frame 导航不拼成跳转链；未投影观察仍在原 ZIP，索引列出数量。HTTP Location 表示观察到的跳转指向，不表示目标已访问。广告和第三方请求不按域名删除。
+
+输入限制：单文件 8 MiB、总正文及 HAR 80 MiB、最多 2000 文件和 1000 HAR 请求，预算外材料留在原包并明确列出。fxapk 自身的读取缺口保留在报告和回执中。无可分析材料不返回分析成功；fxapk 缺失、失败或超时仍保留整理结果。完整性通过不证明内容真实、来源归属或采集完整，回执覆盖范围始终为 partial，外部 APK/IPA 未由此验证。
+
+本入口只接收 `fxfetch.task-evidence.v1` ZIP，不替代旧 `capture-web` / `export-web` 格式，不修改 fxapk 的 APK 流程，WebView APK 不在这条衔接链内。服务 UI 自动启动分析和真实站点验收不在本入口范围。
+
 ## 统一任务与网页材料数据包
 
 服务端每个已执行的普通下载任务只运行现有采集工作流一次，并在任务结束后离线生成独立数据包 ZIP。原 APK / IPA 仍通过原 artifact 接口单独下载；ZIP 只包含明确记录的网页响应材料、有限观察记录和清单，并以外部引用记录原始包的类型、大小、哈希、来源和校验状态，不复制 APK / IPA 字节。失败或没有网页材料的任务也会尽力生成含有结果与缺口的记录。数据包下载不访问目标站点。
