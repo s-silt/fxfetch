@@ -112,6 +112,37 @@ def test_wire_default_endpoint_and_questions():
     assert all("?dns=" in call[2] for call in calls)
 
 
+def test_excessive_wire_compression_chain_is_rejected_without_provider_fallback():
+    import base64
+    import struct
+    from urllib.parse import parse_qs, urlsplit
+
+    import dns.message
+
+    from fxfetch.core.public_dns import DefaultPublicDNSResolver
+
+    calls = []
+
+    def transport(host, address, path, timeout):
+        calls.append(host)
+        encoded = parse_qs(urlsplit(path).query)["dns"][0]
+        query = dns.message.from_wire(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        wire = bytearray(dns.message.make_response(query).to_wire())
+        struct.pack_into("!H", wire, 6, 17)
+        previous = 12  # First owner points to the question; each later owner points back one RR.
+        for _ in range(17):
+            offset = len(wire)
+            wire.extend(struct.pack("!HHHIH", 0xC000 | previous, 1, 1, 60, 4))
+            wire.extend(bytes((93, 184, 216, 34)))
+            previous = offset
+        return bytes(wire)
+
+    with pytest.raises(FxfetchError) as caught:
+        DefaultPublicDNSResolver(transport=transport).resolve("download.synthetic.test", 443)
+    assert caught.value.code == "dns_invalid_response"
+    assert calls == ["dns.alidns.com"]
+
+
 @pytest.mark.parametrize(
     "failure, expected",
     [

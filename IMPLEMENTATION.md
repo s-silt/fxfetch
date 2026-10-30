@@ -1,5 +1,12 @@
 # 实现状态与验收
 
+## dnspython 安全升级（2026-10-30）
+
+- dnspython 从 2.8.0 固定升级至 2.9.1，同步项目声明、Windows 锁文件及两套 API 镜像共用的 Docker 运行时锁。该版本包含 [GHSA-45c3-73f7-pv4m](https://github.com/rthalley/dnspython/security/advisories/GHSA-45c3-73f7-pv4m) 的 DNS 名称解压缩 CPU 消耗修复，Python 最低版本仍为 3.11，没有新增必需依赖。
+- 新增固定 17 层压缩指针链的合成 DNS 报文，经 `DefaultPublicDNSResolver.resolve` 真实解析入口验证：2.8.0 下测试失败，2.9.1 下返回 `dns_invalid_response`，且不调用备用服务商；测试不连接外部 DNS 或目标。
+- 升级后 DNS 定向 **74 passed**；Windows / Python 3.12、UTF-8 模式全量 **1456 passed、23 skipped、0 failed**。Ruff、Pyright 和 `pip check` 通过，跳过项与上一轮相同，保留既有 Starlette/httpx 弃用提示。
+- Docker 锁已同步，但本轮没有重新构建镜像、重启服务或验收 Android worker；运行中容器需另行部署才能使用新版依赖。
+
 ## GitHub 集成复核（2026-10-30）
 
 - 已核对 14:13 追加交付 ZIP 及 269 个文件摘要，在上游 `f694f67` 基线上同步；保留 `48b38a4` 局部导航对象修复及四个回归用例。交付原包摘要见 [SOURCE_RELEASE.md](SOURCE_RELEASE.md)。
