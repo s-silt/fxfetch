@@ -32,3 +32,7 @@ class Limits:
     build_memory_bytes: int = 2 * 1024 * 1024 * 1024
     max_build_scratch_bytes: int = 8 * 1024 * 1024 * 1024
     max_task_bytes: int = 2 * 1024 * 1024 * 1024
+    analysis_timeout: int = 360
+    analysis_queue_timeout: int = 600
+    max_queued_analyses: int = 10
+    max_analyses_per_job: int = 10

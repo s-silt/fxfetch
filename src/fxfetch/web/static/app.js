@@ -5,6 +5,12 @@
   const activeStates = new Set(["queued", "running", "building", "awaiting_human", "awaiting_selection"]);
   const labels = {queued:"排队中",running:"采集中",building:"正在打包",completed:"采集结束",cancelled:"已取消",interrupted:"已中断",awaiting_selection:"等待选择",awaiting_human:"等待本机处理",downloaded:"已取得原包",not_found:"本次范围内未找到包",blocked:"访问受阻",failed:"未完成",built:"APK 已生成",disabled:"暂不可用",partial:"覆盖不完整",complete:"本次范围已完成",not_started:"尚未执行"};
   const messages = {
+    analysis_unavailable:"后端 fxapk 未配置或不可用，请联系主机管理员。",analysis_source_unavailable:"数据包尚未就绪或不可用，不能启动分析。",
+    analysis_active:"本任务已有离线分析正在进行，请等待结束。",analysis_queue_full:"离线分析队列已满，请稍后重试。",analysis_limit:"此任务的分析次数已达上限。",
+    analysis_timeout:"离线分析达到时间限制，已停止，未交付完整报告。",analysis_queue_timeout:"分析排队超时，尚未执行。",
+    fxapk_timeout:"fxapk 分析超时，未交付完整报告。",fxapk_executable_unavailable:"后端 fxapk 程序不可用。",fxapk_analysis_failed:"fxapk 分析失败，后台保留已有材料。",
+    no_analyzable_web_material:"数据包没有可供分析的网页正文或请求材料。",service_restarted:"服务已重启，未完成的任务已中断；不会自动重跑。",
+    fxapk_report_contract_invalid:"分析报告未通过格式校验，不能下载。",fxapk_report_unavailable:"未取得有效分析报告。",fxapk_report_empty:"分析未产生有效网页报告。",
     invalid_credentials:"密码不正确，请重新输入。",login_rate_limited:"尝试次数较多，请稍后再登录。",
     authentication_required:"会话已过期，请重新登录。",invalid_csrf:"登录状态已变化，请刷新后重新登录。",
     invalid_url:"请检查网址格式，可直接粘贴域名或完整的 HTTP/HTTPS 网址。",unsupported_input:"此入口协议或类型暂不支持，请使用 HTTP/HTTPS 网页或有效的 IPA 描述文件入口。",
@@ -59,7 +65,7 @@
     build_command_failed:"本机构建工具执行失败。",build_timed_out:"APK 构建超时。"
   };
   const state = {csrf:null, authenticated:false, capabilities:null, jobs:[], current:null, job:null, image:null,
-    selectedQR:null, previewURL:null, pendingJob:null, pendingBuilds:new Map(), pendingContinuations:new Map(), selectedContinuations:new Map(), progressExpanded:new Set(), submitting:false, uploading:false,
+    selectedQR:null, previewURL:null, pendingJob:null, pendingBuilds:new Map(), pendingAnalyses:new Map(), pendingContinuations:new Map(), selectedContinuations:new Map(), progressExpanded:new Set(), submitting:false, uploading:false,
     epoch:0, clearing:false, mutations:new Set(), pollTimer:null, pollController:null, polling:false, pollDelay:1500, loading:false, activeBuildJobs:new Set(),
     capabilityTimer:null, capabilityController:null, capabilityGeneration:0, capabilityAttempts:0, capabilityDeadline:0, capabilityStatus:"idle"};
 
@@ -91,7 +97,7 @@
     state.current = null;
     state.job = null;
     state.pendingJob = null;
-    state.pendingBuilds.clear(); state.pendingContinuations.clear(); state.selectedContinuations.clear(); state.progressExpanded.clear();
+    state.pendingBuilds.clear(); state.pendingAnalyses.clear(); state.pendingContinuations.clear(); state.selectedContinuations.clear(); state.progressExpanded.clear();
     state.activeBuildJobs.clear();
     stopPolling();
     stopCapabilityPolling();
@@ -149,8 +155,8 @@
     return Array.from(crypto.getRandomValues(new Uint8Array(24)), (value) => value.toString(16).padStart(2,"0")).join("");
   }
   function bytes(value) { if (!Number.isFinite(value)) return ""; return value >= 1048576 ? `${(value/1048576).toFixed(1)} MiB` : `${(value/1024).toFixed(1)} KiB`; }
-  function busy(job) { return !!job && (activeStates.has(job.state) || FxfetchDataPackage.isPending(job) || (job.builds || []).some((build) => activeStates.has(build.state))); }
-  function hasActive() { return state.jobs.some((job) => activeStates.has(job.state) || job.active_builds > 0) || busy(state.job) || state.activeBuildJobs.size > 0; }
+  function busy(job) { return !!job && (activeStates.has(job.state) || FxfetchDataPackage.isPending(job) || FxfetchAnalysis.isPending(job) || (job.builds || []).some((build) => activeStates.has(build.state))); }
+  function hasActive() { return state.jobs.some((job) => activeStates.has(job.state) || job.active_builds > 0 || job.active_analyses > 0) || busy(state.job) || state.activeBuildJobs.size > 0; }
   function schedule() {
     clearTimeout(state.pollTimer);
     if (!state.authenticated || state.clearing || document.hidden || !hasActive()) return;
@@ -174,6 +180,7 @@
     region.append(node("p", "", chromeText));
     region.append(node("p", "", "默认直连"));
     region.append(node("p", "", !cap ? state.capabilityStatus === "checking" ? "正在检查本机 APK 打包能力…" : "本机 APK 打包状态暂不可用。" : cap.web_apk?.enabled ? "本机 APK 打包已就绪" : "本机 APK 打包尚未就绪，请由后端主机配置工具链。"));
+    region.append(node("p", "", cap?.web_analysis?.enabled ? "fxapk 离线分析已配置，点击分析才会执行。" : "fxapk 离线分析尚未启用；不影响采集和数据包下载。"));
   }
   function stopCapabilityPolling() {
     clearTimeout(state.capabilityTimer); state.capabilityTimer = null;
@@ -385,6 +392,12 @@
     }
     renderProgress(job, content);
     FxfetchDataPackage.render(job, content, {node, bytes, friendly});
+    FxfetchAnalysis.render(job, content, {
+      node, friendly, capability:state.capabilities?.web_analysis,
+      submitting:!!state.pendingAnalyses.get(job.id)?.busy,
+      onStart:(button) => submitAnalysis(job, button),
+      onCancel:(id, button) => cancelAnalysis(job.id, id, button)
+    });
     const result = job.result || {};
     if ((result.network_attempts || []).length) {
       const network = node("section", "details network-attempts");
@@ -696,6 +709,34 @@
       if (state.authenticated) notice(error.message + (state.pendingBuilds.has(mapKey) ? " 可再次点击打包按钮重试同一操作。" : ""),true);
     } finally { pending.busy = false; if (state.job?.id === job.id) renderJob(); schedule(); }
   }
+  async function submitAnalysis(job, button) {
+    if (state.clearing || !state.authenticated) return;
+    const epoch = state.epoch;
+    let pending = state.pendingAnalyses.get(job.id);
+    if (!pending) { pending = {key:idempotencyKey(),busy:false}; state.pendingAnalyses.set(job.id,pending); }
+    if (pending.busy) return;
+    pending.busy = true; button.disabled = true;
+    try {
+      await api(`/api/jobs/${encodeURIComponent(job.id)}/analyses`, {method:"POST",body:{},headers:{"Idempotency-Key":pending.key}});
+      if (epoch !== state.epoch || !state.authenticated) return;
+      state.pendingAnalyses.delete(job.id); state.pollDelay = 1500;
+      await loadJobs(); notice("离线分析已提交，原采集结果不变。刷新清空会取消本会话未完成的分析。");
+    } catch (error) {
+      if (epoch !== state.epoch || !state.authenticated) return;
+      if (error.status && error.status < 500) state.pendingAnalyses.delete(job.id);
+      notice(error.message + (state.pendingAnalyses.has(job.id) ? " 再次点击将重试同一次提交，不会重复创建分析。" : ""),true);
+    } finally { pending.busy = false; if (state.job?.id === job.id) renderJob(); schedule(); }
+  }
+  async function cancelAnalysis(job, id, button) {
+    if (state.clearing || !state.authenticated) return;
+    const epoch = state.epoch;
+    button.disabled = true;
+    try {
+      await api(`/api/jobs/${encodeURIComponent(job)}/analyses/${encodeURIComponent(id)}/cancel`, {method:"POST"});
+      if (epoch === state.epoch && state.authenticated) await loadJobs();
+    } catch (error) { if (epoch === state.epoch && state.authenticated) notice(error.message,true); }
+    finally { button.disabled = false; schedule(); }
+  }
   async function cancelJob(id, button) {
     button.disabled = true;
     try { await api(`/api/jobs/${encodeURIComponent(id)}/cancel`, {method:"POST"}); await loadJobs(); }
@@ -748,7 +789,7 @@
     stopPolling();
     $("refresh").disabled = true;
     state.jobs = []; state.current = null; state.job = null;
-    state.pendingJob = null; state.pendingBuilds.clear(); state.pendingContinuations.clear(); state.selectedContinuations.clear(); state.progressExpanded.clear(); state.activeBuildJobs.clear();
+    state.pendingJob = null; state.pendingBuilds.clear(); state.pendingAnalyses.clear(); state.pendingContinuations.clear(); state.selectedContinuations.clear(); state.progressExpanded.clear(); state.activeBuildJobs.clear();
     state.submitting = false; state.uploading = false;
     clearImage(); $("url").value = ""; updateHost(); rememberJob(null);
     $("job-picker").replaceChildren(new Option("还没有任务", "")); renderJob(); updateInput();

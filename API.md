@@ -109,7 +109,7 @@ HTTP 优先；需要动态处理或收到 403/429/502/503 时最多尝试一次�
 
 `capabilities.chrome` 使用后台只读探测，每实例最多一个探测，完成后缓存 30 秒。`checking` 表示检查中，`cached` 表示展示缓存；探测不导航目标，实际任务仍需新 lease 和实时环境证明。`android-worker.json` 是服务端私有配置。
 
-`server.json` 仅接受 `host,port,allowed_networks,proxy_host,proxy_port`；绑定具体 RFC1918/IPv4 回环地址，按真实 socket peer 校验，不信任转发头。当前部署 `proxy_host=null`，仅直连。DNS 默认 AliDNS 223.5.5.5，服务/传输失败才回退 DNSPod 119.29.29.29。
+`server.json` 仅接受 `host,port,allowed_networks,proxy_host,proxy_port,fxapk_executable`；绑定具体 RFC1918/IPv4 回环地址，按真实 socket peer 校验，不信任转发头。`fxapk_executable` 默认 null（不启用离线分析），只能由后端配置可信程序；`serve --fxapk` 可覆盖本次启动。当前部署 `proxy_host=null`，仅直连。DNS 默认 AliDNS 223.5.5.5，服务/传输失败才回退 DNSPod 119.29.29.29。
 
 兼容的代理候补只允许服务端显式配置回环 CONNECT 地址：初始传输失败且无响应/会话推进时，最多一次独立尝试，共享总预算；访问控制、证书、守卫失败或覆盖缺口不触发切换。`capabilities.network_policy` 声明模式；`network_mode,network_attempts` 和 `network_attempt_started,network_fallback,network_attempt_completed` 保留各次结果。兼容字段不表示当前启用代理。
 
@@ -122,6 +122,27 @@ HTTP 优先；需要动态处理或收到 403/429/502/503 时最多尝试一次�
 可选 `offline-font.json` 仅含 `path,license_path,size,sha256,git_blob_sha1,license_sha256`。绝对本机路径、固定 Noto Sans CJK SC Sans2.004 字体及许可摘要均需校验，拒绝重解析点。结果 `font_applied,font_reason` 记录实际应用及失败/跳过原因。
 
 构建结果包含 `offline_content_kind`（`site_snapshot` / `connection_page`）、`offline_content_reason,resource_bytes,resource_files,size`。resource_bytes 为离线资源及许可的未压缩总量，size 为成品大小。离线资源上限 28 MiB，APK 上限 30,000,000 字节。无快照时只提供联网指引，不修改原采集结果。
+
+## 离线网页分析
+
+以下接口只使用该任务后台已就绪的 `fxfetch.task-evidence.v1` ZIP，不接受用户文件路径、URL、程序路径或执行参数。所有接口检查当前会话及父任务归属；父任务归档后返回 404。写接口沿用 Origin、CSRF；创建还必须提供 Idempotency-Key。
+
+| 方法 / 路径 | 行为 |
+| --- | --- |
+| `POST /api/jobs/{id}/analyses` | 空 JSON `{}`，202 返回独立分析任务；同键重试返回同一记录 |
+| `GET /api/jobs/{id}/analyses/{analysis_id}` | 读取状态，不执行分析 |
+| `POST /api/jobs/{id}/analyses/{analysis_id}/cancel` | 取消排队或运行中的分析，阻止迟到成功发布报告 |
+| `GET /api/jobs/{id}/analyses/{analysis_id}/report.zip` | 仅完成状态可下载；再次核对文件路径、大小及 SHA-256，附件响应 no-store |
+
+`capabilities.web_analysis` 包含 `enabled,reason_code,online:false,timeout_seconds,queue_timeout_seconds`；不返回程序路径。任务详情增加 `analyses[]`，列表增加 `active_analyses`。状态为 `queued,running,completed,failed,not_analyzed,cancelled,interrupted`；公开记录含 ID、状态、时间、原因码和 `report_ready`，不含原报告、命令、日志或宿主路径。原采集结论保持不变，`coverage=partial`。
+
+每个任务同时最多一个活动分析，全局排队最多 10 个，每任务累计最多 10 次；来源不可用、已有活动分析、额度超限返回 409，fxapk 未配置或不可用返回 503。无可分析材料为 `not_analyzed`，不能当成功。排队期限 600 秒，整个子进程（含校验、材料准备）执行期限 360 秒、内存 2 GiB；达到期限或取消终止进程树，不发布迟到报告。
+
+提交不解析 ZIP，只固定已就绪归档的来源路径、大小和 SHA-256。完整校验及报告整理由后台受限进程完成；损坏或摘要不匹配会异步失败，而非在 POST 请求线程展开材料。
+
+报告 ZIP 只含 `analysis.json` 与 `report/input.json`，原件按回执映射从独立数据包回查；不包含 APK/IPA、原始 ZIP 或执行日志，回执中的程序路径和命令不导出。原生报告仍可能包含敏感线索及 `meta.web_evidence.source_dir` 主机材料目录，不在网页中直接渲染；普通状态 JSON 不暴露这些内容。
+
+服务重启将未完成分析置为 `interrupted/service_restarted`，不自动重试。刷新清空取消并隐藏当前会话分析，保留后台原文件，跨会话不可访问。
 
 ## 刷新与清空
 

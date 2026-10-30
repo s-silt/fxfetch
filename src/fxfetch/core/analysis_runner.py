@@ -36,11 +36,25 @@ def _report_receipt(output: Path) -> dict[str, Any]:
 
 def analyze_archive(
     archive: Path, output: Path, *, max_bytes: int, executable: str = "fxapk", timeout: float = 300.0,
+    expected_size: int | None = None, expected_sha256: str | None = None,
 ) -> dict[str, Any]:
     if not 1 <= timeout <= 3600:
         raise EvidenceError("analysis_timeout_invalid")
     receipt = prepare_analysis(archive, output, max_bytes=max_bytes)
     analysis = receipt["analysis"]
+    copied = output / "source.zip"
+    size_mismatch = (
+        expected_size is not None and copied.stat().st_size != expected_size
+    )
+    hash_mismatch = (
+        expected_sha256 is not None
+        and receipt["source_archive"]["sha256"] != expected_sha256
+    )
+    if size_mismatch or hash_mismatch:
+        analysis.update(state="failed", reason_code="analysis_source_mismatch")
+        receipt["state"] = "failed"
+        write_receipt(output, receipt)
+        return receipt
     inputs = output / "input"
     if not receipt["har"]["entries"] and not any(item["analysis_path"] for item in receipt["materials"]):
         analysis.update(state="not_run", reason_code="no_analyzable_web_material")

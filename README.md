@@ -25,7 +25,25 @@ HAR 是适配投影，不是新的浏览器抓包：仅按 collector / attempt /
 
 输入限制：单文件 8 MiB、总正文及 HAR 80 MiB、最多 2000 文件和 1000 HAR 请求，预算外材料留在原包并明确列出。fxapk 自身的读取缺口保留在报告和回执中。无可分析材料不返回分析成功；fxapk 缺失、失败或超时仍保留整理结果。完整性通过不证明内容真实、来源归属或采集完整，回执覆盖范围始终为 partial，外部 APK/IPA 未由此验证。
 
-本入口只接收 `fxfetch.task-evidence.v1` ZIP，不替代旧 `capture-web` / `export-web` 格式，不修改 fxapk 的 APK 流程，WebView APK 不在这条衔接链内。服务 UI 自动启动分析和真实站点验收不在本入口范围。
+本入口只接收 `fxfetch.task-evidence.v1` ZIP，不替代旧 `capture-web` / `export-web` 格式，不修改 fxapk 的 APK 流程，WebView APK 不在这条衔接链内。
+
+### 网页端手动离线分析
+
+后端需先独立安装 fxapk，再在原有 `serve` 命令追加 `--fxapk`，例如 Windows：
+
+```powershell
+.\.venv\Scripts\python.exe -m fxfetch serve --out .runtime/service --fxapk "C:\Tools\fxapk\Scripts\fxapk.exe"
+```
+
+也可在服务根的 `server.json` 配置 `fxapk_executable`。默认未启用；网页不能指定可执行文件、参数或材料路径，能力检查只确认程序可解析，不证明已实测可用，也不自动安装。
+
+数据包就绪后，点击「离线分析数据包」启动独立后台任务。页面加载、轮询和下载不会启动分析；失败、取消或重启后不自动重跑。原采集的 blocked/failed 结论不因分析完成而改变。支持取消；刷新清空取消本会话未完成分析并隐藏历史，后台文件保留，其他会话不受影响。
+
+报告 ZIP 与 APK/IPA、原始数据包分开下载，仅包含原生 JSON 报告及来源回执，不包含原始数据包、安装包、执行命令和执行日志。回查原件需同时保存原始数据包；原生报告也可能含敏感线索及 fxapk 记录的主机材料目录，下载前注意保密。页面不渲染目标 HTML 或报告正文。
+
+提交时只检查任务归属和归档就绪元数据，固定该归档的路径、大小与哈希；完整 ZIP 校验、材料准备和报告整理都在可取消的受限后台进程执行。归档内容损坏或与已保存摘要不符会令分析失败，不会发布报告。
+
+分析串行执行：最多 10 个排队任务，每个采集任务最多 10 次分析、同时最多一次；排队上限 600 秒，执行总期限默认 360 秒（含材料准备），内存限制 2 GiB。时间和内存限制不是操作系统断网沙箱；离线性依赖明确传入 fxapk 的 `--offline` 契约。真实站点、Android worker 与 NAS/Docker 需另行验收。
 
 ## 统一任务与网页材料数据包
 
