@@ -6,7 +6,7 @@ const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../src/fxfetch/web/static/app.js"), "utf8")
   .replace(/^\s*api\("\/api\/session"\).*$/m, "")
-  .replace(/\}\)\(\);\s*$/, "globalThis.test = {state, authenticated, pollCapabilities, signedOut, busy, hasActive, submitAnalysis, cancelAnalysis};})();");
+  .replace(/\}\)\(\);\s*$/, "globalThis.test = {state, authenticated, pollCapabilities, signedOut, busy, hasActive, submitAnalysis, cancelAnalysis, submitJob, submitContinuation, clearRecords, renderJob, eventText};})();");
 
 function harness(capability, responder = () => ({})) {
   const elements = new Map(), events = new Map(), timers = new Map(), calls = [];
@@ -54,6 +54,94 @@ function harness(capability, responder = () => ({})) {
 }
 
 async function main() {
+  {
+    const ui = harness(() => ({}));
+    const text = ui.test.eventText({event:"dns_resolution_observed", provider:"dnspod", query_type:"AAAA", reason_code:"dns_unsafe_answer", dns_record:{answers:["private diagnostic"]}});
+    assert.match(text, /DNSPod AAAA/);
+    assert.match(text, /非公网或特殊地址，未连接该目标/);
+    assert.doesNotMatch(text, /private diagnostic|无 APK|没有 APK/);
+    for (const reason_code of ["dns_nxdomain", "dns_no_addresses", "dns_invalid_response", "dns_diagnostics_unavailable", "task_timeout", "chain_timeout"]) {
+      const failure = ui.test.eventText({event:"dns_resolution_failed", reason_code});
+      assert.notEqual(failure, "DNS：解析未完成");
+      assert.doesNotMatch(failure, /无 APK|没有 APK|解析完成/);
+    }
+    for (const event of ["browser_connection_failed", "browser_transport_failed", "browser_connection_cancelled", "browser_budget_exhausted"]) {
+      assert.doesNotMatch(ui.test.eventText({event}), /公网|被拒绝/);
+      assert.notEqual(ui.test.eventText({event}), "状态已更新");
+    }
+    assert.match(ui.test.eventText({event:"browser_connection_blocked"}), /被拒绝/);
+  }
+  {
+    const submissions = [], jobs = new Map();
+    let loseReply = false;
+    const ui = harness(() => ({}), (url, options) => {
+      if (url === "/api/preview") return {request_url:"https://synthetic.test/", url:"https://synthetic.test/", kind:"web"};
+      if (options.method === "POST" && (url === "/api/jobs" || url.endsWith("/continue"))) {
+        const body = JSON.parse(options.body); submissions.push(body);
+        if (loseReply) { loseReply = false; throw new Error("synthetic connection lost"); }
+        const job = {id:`job-${submissions.length}`, state:"completed", outcome:"failed", input:{entry_url:"https://synthetic.test/", tls_policy:body.tls_policy}};
+        jobs.set(job.id, job); return job;
+      }
+      if (url === "/api/jobs") return {jobs:options.method === "DELETE" ? [] : [...jobs.values()]};
+      return jobs.get(url.split("/").at(-1)) || {};
+    });
+    const policy = ui.document.getElementById("tls-policy");
+    const entry = ui.document.getElementById("url");
+    const event = {preventDefault() {}};
+    ui.test.state.authenticated = true;
+    assert.equal(policy.value, "auto", "Web task starts strict with conditional fallback enabled");
+    assert.equal(ui.document.getElementById("advanced-settings").open, false);
+    assert.equal(ui.document.getElementById("tls-policy-summary").textContent, "证书：自动处理");
+    entry.value = "https://synthetic.test/"; policy.value = "strict";
+    policy.onchange();
+    assert.equal(ui.document.getElementById("tls-policy-summary").textContent, "证书：严格验证");
+    await ui.test.submitJob(event);
+    assert.equal(submissions.at(-1).tls_policy, "strict");
+    assert.equal(policy.value, "auto", "Acknowledged submission resets next task policy");
+    assert.equal(ui.document.getElementById("tls-policy-summary").textContent, "证书：自动处理");
+    await ui.test.submitJob(event);
+    assert.equal(submissions.at(-1).tls_policy, "auto");
+    policy.value = "strict"; loseReply = true;
+    await ui.test.submitJob(event);
+    assert.equal(ui.test.state.pendingJob.body.tls_policy, "strict");
+    assert.equal(policy.disabled, true, "Ambiguous retry cannot change frozen task options");
+    policy.value = "auto";
+    await ui.test.submitJob(event);
+    assert.equal(submissions.at(-1).tls_policy, "strict");
+    assert.equal(policy.value, "auto");
+    const parent = {id:"parent", input:{tls_policy:"strict"}, download_candidates:[{id:"choice"}]};
+    ui.test.state.selectedContinuations.set(parent.id, "choice");
+    await ui.test.submitContinuation(parent);
+    assert.equal(submissions.at(-1).tls_policy, "auto", "Child starts with its own default policy");
+    const second = {...parent,id:"second"};
+    ui.test.state.selectedContinuations.set(second.id, "choice");
+    ui.test.state.continuationTls.set(second.id, "strict");
+    await ui.test.submitContinuation(second);
+    assert.equal(submissions.at(-1).tls_policy, "strict");
+    assert.equal(ui.test.state.continuationTls.has(second.id), false);
+    policy.value = "strict"; ui.test.state.continuationTls.set("draft", "strict");
+    await ui.test.clearRecords();
+    assert.equal(policy.value, "auto"); assert.equal(ui.test.state.continuationTls.size, 0);
+    policy.value = "strict"; ui.test.signedOut(); assert.equal(policy.value, "auto");
+
+  }
+  {
+    const ui = harness(() => ({}));
+    const flatten = element => [element, ...element.children.flatMap(flatten)];
+    const job = {id:"tls", state:"completed", outcome:"downloaded", input:{tls_policy:"auto"}, tls_policy:"auto",
+      tls_fallback:{state:"recorded", count:0, observed:false, reasons:[]}};
+    const warnings = () => flatten(ui.document.getElementById("job-content")).filter(e => e.className === "tls-warning");
+    ui.test.state.job = job; ui.test.renderJob();
+    assert.equal(warnings().length, 0, "Auto policy alone is not evidence of ignored certificates");
+    job.tls_fallback = {state:"recorded", count:1, observed:true, reasons:["self_signed_certificate"]};
+    ui.test.renderJob(); assert.match(warnings()[0].textContent, /服务器身份未经验证/);
+    job.tls_fallback.state = "unavailable";
+    ui.test.renderJob(); assert.match(warnings()[0].textContent, /另有未能确认/);
+    job.tls_fallback = {state:"unavailable", count:0, observed:false, reasons:[]};
+    ui.test.renderJob(); assert.match(warnings()[0].textContent, /不能确认/);
+    delete job.tls_policy; delete job.tls_fallback; job.input = {ignore_tls_errors:true};
+    ui.test.renderJob(); assert.match(warnings()[0].textContent, /历史任务/);
+  }
   {
     for (const background of [false, true]) {
       const job = {id:"job", state:"completed", outcome:"blocked", data_package:{state:"ready"}, analyses:[]};
@@ -179,7 +267,35 @@ async function main() {
     assert.equal(links.length, 1);
     assert.equal(links[0].href, "/api/jobs/synthetic-job/data-package");
     assert.equal(links[0].textContent, "下载数据包");
-    assert.ok(nodes.some(element => element.textContent?.includes("APK / IPA 单独下载")));
+    assert.ok(nodes.some(element => element.textContent?.includes("此旧版数据包")));
+    job.data_package.attachments = {packages:1, certificates:2, bytes:789};
+    const upgraded = node("div", "", "");
+    ui.bundle.render(job, upgraded, helpers);
+    assert.ok(flatten(upgraded).some(element => element.textContent?.includes("APK / IPA 1 个，TLS 证书 2 份")));
+    assert.ok(flatten(upgraded).some(element => element.textContent?.includes("归档成功不代表 APK 校验通过")));
+    job.data_package.tls_certificates = {state:"saved", http_certificates:0, chrome_certificates:2,
+      association_limited:true, reasons:[]};
+    const tlsPanel = node("div", "", "");
+    ui.bundle.render(job, tlsPanel, helpers);
+    assert.ok(flatten(tlsPanel).some(element => element.textContent?.includes("HTTP 0 份，Chrome 2 份")));
+    assert.ok(flatten(tlsPanel).some(element => element.textContent?.includes("不能据此确认属于某一次具体连接")));
+    job.data_package.tls_certificates = {state:"not_captured", http_certificates:0, chrome_certificates:0,
+      association_limited:false, reasons:["browser_tls_query_timeout"]};
+    const tlsGap = node("div", "", "");
+    ui.bundle.render(job, tlsGap, helpers);
+    assert.ok(flatten(tlsGap).some(element => element.textContent?.includes("TLS 证书原件未取得")));
+    assert.ok(flatten(tlsGap).some(element => element.textContent?.includes("Chrome 读取证书超时")));
+    job.data_package.tls_certificates = {state:"partial", http_certificates:0, chrome_certificates:1,
+      association_limited:true, reasons:["browser_tls_trace_data_loss"]};
+    const tlsPartial = node("div", "", "");
+    ui.bundle.render(job, tlsPartial, helpers);
+    assert.ok(flatten(tlsPartial).some(element => element.textContent?.includes("部分证书或链成员未取得")));
+    assert.ok(flatten(tlsPartial).some(element => element.textContent?.includes("缓冲区存在丢失")));
+    job.data_package.tls_certificates = {state:"not_applicable", http_certificates:0, chrome_certificates:0,
+      association_limited:false, reasons:[]};
+    const noTls = node("div", "", "");
+    ui.bundle.render(job, noTls, helpers);
+    assert.ok(flatten(noTls).some(element => element.textContent?.includes("本次没有可导出证书的 HTTPS 观察记录")));
     assert.ok(nodes.some(element => element.textContent?.includes("已保存 2 项")));
     assert.equal(ui.test.busy(job), false);
     for (const state of ["pending", "building", "failed", "unavailable"]) {

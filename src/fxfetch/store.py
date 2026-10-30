@@ -186,6 +186,10 @@ class Store:
     def create_job(
         self, owner: str, idem: str, value: dict, max_queue: int, request_value: dict | None = None
     ) -> tuple[dict, bool]:
+        if type(value.get('ignore_tls_errors', False)) is not bool or (
+            'tls_policy' in value and value['tls_policy'] not in ('auto', 'strict')
+        ):
+            raise FxfetchError('invalid_input', 'ignore_tls_errors must be boolean')
         digest = hashlib.sha256(
             json_text(request_value if request_value is not None else value).encode()
         ).hexdigest()
@@ -231,7 +235,10 @@ class Store:
     def create_continuation(
         self, owner: str, parent_id: str, candidate_id: str, idem: str, source: dict, max_queue: int
     ) -> tuple[dict, bool]:
-        request = {"parent_job_id": parent_id, "candidate_id": candidate_id}
+        tls_policy = source.get('tls_policy', 'auto')
+        if tls_policy not in ('auto', 'strict'):
+            raise FxfetchError('invalid_input', 'Invalid TLS policy')
+        request = {"parent_job_id": parent_id, "candidate_id": candidate_id, 'tls_policy': tls_policy}
         digest = hashlib.sha256(json_text(request).encode()).hexdigest()
         with self.connect() as db:
             parent = db.execute(
@@ -403,6 +410,29 @@ class Store:
                 )
                 if key in value
             }
+            if event.get("event") in {
+                "dns_resolution_observed", "dns_resolution_failed", "dns_resolution_success"
+            }:
+                # Full DNS answers belong to the private observation journal, never progress.
+                record = value.get("dns_record")
+                record = record if isinstance(record, dict) else value
+                event = {
+                    key: event[key] for key in ("event", "url", "network_mode", "attempt_id")
+                    if key in event
+                }
+                if record.get("provider") in ("alidns", "dnspod", "cloudflare", "google"):
+                    event["provider"] = record["provider"]
+                if record.get("query_type") in ("A", "AAAA"):
+                    event["query_type"] = record["query_type"]
+                if record.get("reason_code") in (
+                    "dns_answer_accepted", "dns_unsafe_answer", "dns_failed", "dns_timeout",
+                    "dns_tls_verification_failed", "target_not_public", "cancelled",
+                    "dns_nxdomain", "dns_no_addresses", "dns_invalid_response",
+                    "dns_diagnostics_unavailable", "task_timeout", "chain_timeout",
+                ):
+                    event["reason_code"] = record["reason_code"]
+            if value.get("connection_phase") in ("before_connect", "established"):
+                event["connection_phase"] = value["connection_phase"]
             now = time.time()
             if event.get("event"):
                 event.update(seq=previous.get("seq", 0) + 1, at=now)

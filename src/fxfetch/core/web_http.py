@@ -42,6 +42,17 @@ def observe_transport(
         for key, value in event.items()
         if key != "kind"
     }
+    if kind == "tls_certificate_saved":
+        try:
+            fields["path"] = Path(str(fields["path"])).absolute().relative_to(
+                journal.path.parent.absolute()
+            ).as_posix()
+        except (KeyError, TypeError, ValueError):
+            gaps.append("tls_certificate_not_captured")
+            journal.append("gap", {"code": "tls_certificate_not_captured",
+                                   "reason_code": "tls_certificate_path_invalid",
+                                   "request_ref": fields.get("request_ref")})
+            return
     if kind == "request_attempted":
         reference = event.get("request_ref")
         if isinstance(reference, str):

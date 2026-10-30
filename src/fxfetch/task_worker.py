@@ -12,6 +12,7 @@ from .core.limits import Limits
 from .core.network import AcquisitionPolicy
 from .core.proxy import LocalConnectProxy
 from .core.task_evidence_recorder import TaskEvidenceRecorder
+from .core.tls_policy import web_tls_policy
 from .core.web_apk import WebApkBuilder, WebApkSettings
 from .store import Store, json_text
 
@@ -52,12 +53,15 @@ def main() -> int:
             on_event=progress,
         )
     else:
+        tls_policy = web_tls_policy({key: request[key] for key in ('tls_policy', 'ignore_tls_errors') if key in request}
+                                    or {'tls_policy': 'strict'})
         limits = Limits(**request["limits"])
         output_dir = Path(request["output_dir"])
         recorder = TaskEvidenceRecorder(
             output_dir,
             Path(request["observation_path"]) if request.get("observation_path") else None,
         )
+        recorder.append('task_tls_policy', {'tls_policy': tls_policy})
         proxy = (
             LocalConnectProxy(request["proxy_host"], request["proxy_port"])
             if request.get("proxy_host")
@@ -67,6 +71,7 @@ def main() -> int:
             limits, proxy, browser_root=Path(request["root"]),
             android_lease_id=request.get("android_lease_id"),
             transport_observer=recorder,
+            tls_policy=tls_policy,
         )
         try:
             result = workflow.run(request["url"], output_dir, threading.Event(), progress)

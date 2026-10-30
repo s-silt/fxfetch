@@ -99,3 +99,36 @@ def test_command_failure_keeps_method_but_not_remote_error_secrets(tmp_path):
     text = (tmp_path / "capture-diagnostic.json").read_text()
     assert "Fetch.failRequest" in text and "interception_gone" in text
     assert "secret" not in text and "https" not in text and "token" not in text
+
+
+def test_cleanup_is_fixed_control_plane_only_and_has_independent_deadline():
+    async def exercise():
+        mux = object.__new__(CDPMux)
+        calls = []
+
+        async def send(session, method, params, check, timeout):
+            check()
+            calls.append((session, method, params, timeout))
+            return {}
+
+        mux._send = send
+        for method in ["Page.navigate", "Fetch.continueRequest", "IO.read", "Tracing.start"]:
+            with pytest.raises(ValueError):
+                await mux.send_cleanup(method)
+        with pytest.raises(ValueError):
+            await mux.send_cleanup("IO.close")
+        with pytest.raises(ValueError):
+            await mux.send_cleanup("Tracing.end", stream="foreign")
+        await mux.send_cleanup("Tracing.end")
+        await mux.send_cleanup("IO.close", stream="owned")
+        assert calls == [(None, "Tracing.end", {}, 1.0), (None, "IO.close", {"handle": "owned"}, 1.0)]
+        with pytest.raises(ValueError):
+            await mux.restore_tls_verification("")
+        await mux.restore_tls_verification("owned-session")
+        assert calls[-2] == ("owned-session", "Security.setOverrideCertificateErrors", {"override": False}, 1.0)
+        assert calls[-1] == ("owned-session", "Security.setIgnoreCertificateErrors", {"ignore": False}, 1.0)
+        with pytest.raises(ValueError):
+            await mux.cancel_certificate_error("owned-session", True)
+        await mux.cancel_certificate_error("owned-session", 7)
+        assert calls[-1] == ("owned-session", "Security.handleCertificateError", {"eventId": 7, "action": "cancel"}, 1.0)
+    asyncio.run(exercise())

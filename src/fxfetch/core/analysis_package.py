@@ -126,6 +126,12 @@ def prepare_analysis(
             "coverage": "partial",
             "authenticity_claimed": False,
             "external_packages_verified": False,
+            'attachments': {
+                'count': len(manifest.get('attachments', [])),
+                'bytes': sum(item['size'] for item in manifest.get('attachments', [])),
+                'byte_integrity_verified': True,
+                'included_in_web_analysis': False,
+            },
             "target_app_attribution_verified": False,
         }
         write_receipt(output, receipt)

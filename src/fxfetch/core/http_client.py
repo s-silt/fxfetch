@@ -25,6 +25,13 @@ from .errors import FxfetchError
 from .guard import is_public, resolve_public, validate_url
 from .limits import Limits
 from .proxy import LocalConnectProxy
+from .public_dns import bounded_dns_records
+from .tls_evidence import (
+    MAX_CERTIFICATE_BYTES,
+    MAX_CERTIFICATE_CONNECTIONS,
+    MAX_CERTIFICATE_TOTAL,
+    save_leaf_der,
+)
 
 _DEFAULT_LIMITS = Limits()
 MAX_RESPONSE_HEADER_BYTES = 64 * 1024
@@ -65,6 +72,7 @@ class Hop:
     connection_source: str = "direct"
     requested_ip: str | None = None
     connection_attempts: tuple[dict[str, str], ...] = ()
+    tls_verification: str = "not_applicable"
 
 
 @dataclass(frozen=True)
@@ -88,12 +96,24 @@ class HttpClient:
         proxy: LocalConnectProxy | None = None,
         dns_timeout: float | None = None,
         transport_observer: Callable[[dict[str, object]], None] | None = None,
+        ignore_tls_errors: bool = False,
+        tls_policy: str = "strict",
+        dns_records: Callable[[], object] | None = None,
     ) -> None:
         self.limits = limits
         self.resolver = resolver
         self.proxy = proxy
         self.dns_timeout = limits.connect_timeout if dns_timeout is None else dns_timeout
         self.transport_observer = transport_observer
+        self.dns_records = dns_records
+        if type(ignore_tls_errors) is not bool:
+            raise ValueError("ignore_tls_errors must be boolean")
+        if not isinstance(tls_policy, str) or tls_policy not in {"strict", "auto"}:
+            raise ValueError("Unsupported TLS policy")
+        self.tls_policy = "auto" if ignore_tls_errors else tls_policy
+        # Compatibility means permission to retry a confirmed certificate
+        # failure, never an unconditional unverified first connection.
+        self.ignore_tls_errors = self.tls_policy == "auto"
 
     def _resolve(self, host: str, port: int) -> tuple[str, ...]:
         try:
@@ -117,6 +137,16 @@ class HttpClient:
         return ssl.create_default_context()
 
     def _connect(self, host: str, port: int, address: str, secure: bool, timeout: float) -> socket.socket:
+        return self._connect_context(host, port, address, secure, timeout, None)
+
+    def _connect_unverified(self, host: str, port: int, address: str, timeout: float) -> socket.socket:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return self._connect_context(host, port, address, True, timeout, context)
+
+    def _connect_context(self, host: str, port: int, address: str, secure: bool, timeout: float,
+                         context: ssl.SSLContext | None) -> socket.socket:
         family = socket.AF_INET6 if ":" in address else socket.AF_INET
         started = time.monotonic()
         sock = (
@@ -136,7 +166,11 @@ class HttpClient:
             ):
                 raise FxfetchError("peer_mismatch", "Connected peer differs from validated address")
             if secure:
-                return self._tls_context().wrap_socket(sock, server_hostname=host)
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise TimeoutError("TLS connection time budget exceeded")
+                sock.settimeout(remaining)
+                return (context or self._tls_context()).wrap_socket(sock, server_hostname=host)
             return sock
         except (OSError, FxfetchError):
             sock.close()
@@ -164,13 +198,20 @@ class HttpClient:
         start = time.monotonic()
         hops: list[Hop] = []
         visited: set[str] = set()
+        active_tls_fields: dict[str, object] = {}
 
         def emit(event: str, **details: object) -> None:
             if on_event is not None:
                 on_event({"event": event, "url": current, **details})
 
         def emit_transport(event: str, **details: object) -> None:
-            value: dict[str, object] = {"kind": event, **details}
+            # Deferred originals can belong to an earlier verified connection.
+            # Its metadata must not inherit the final redirect's fallback ID.
+            tls_fields = {} if details.get("tls_verification") in ("verified", "not_applicable") else active_tls_fields
+            value: dict[str, object] = {
+                "kind": event, "ignore_tls_errors": self.ignore_tls_errors,
+                "tls_policy": self.tls_policy, "tls_verification": "required", **tls_fields, **details,
+            }
             observer = self.transport_observer
             if observer is not None:
                 try:
@@ -213,6 +254,7 @@ class HttpClient:
             completed = threading.Event()
             result: list[tuple[str, ...]] = []
             errors: list[Exception] = []
+            observations: list[dict[str, object]] = []
 
             def run() -> None:
                 try:
@@ -220,16 +262,45 @@ class HttpClient:
                 except Exception as exc:
                     errors.append(exc)
                 finally:
+                    try:
+                        values = getattr(errors[0], "dns_records", None) if errors else None
+                        if values is None and self.dns_records is not None:
+                            values = self.dns_records()
+                        observations.extend(row for row in bounded_dns_records(values)
+                                            if row.get("host") == host.rstrip("."))
+                    except Exception:
+                        # An optional diagnostic supplier cannot change the
+                        # guarded resolver's success/failure or leak raw text.
+                        observations.append({"host": host, "status": "failed",
+                                             "reason_code": "dns_diagnostics_unavailable"})
                     completed.set()
 
             threading.Thread(target=run, daemon=True, name="fxfetch-dns").start()
             deadline = time.monotonic() + self.dns_timeout
-            while not completed.wait(0.05):
+            try:
+                while not completed.wait(0.05):
+                    check()
+                    if time.monotonic() >= deadline:
+                        raise FxfetchError("dns_timeout", "DNS resolution exceeded time budget")
                 check()
                 if time.monotonic() >= deadline:
                     raise FxfetchError("dns_timeout", "DNS resolution exceeded time budget")
-            check()
+            except FxfetchError as error:
+                # Do not read a still-running resolver's mutable records or
+                # describe a late answer as a successful resolution.
+                emit_transport("dns_resolution_observed", request_ref=active_request_ref, url=current, host=host,
+                               dns_record={"host": host, "status": "failed", "reason_code": error.code})
+                emit("dns_resolution_failed", reason_code=error.code)
+                raise
+            for row in observations:
+                emit_transport("dns_resolution_observed", request_ref=active_request_ref, url=current,
+                               host=host, dns_record=row)
             if errors:
+                error = errors[0]
+                reason = error.code if isinstance(error, FxfetchError) else "dns_failed"
+                last = observations[-1] if observations else {}
+                emit("dns_resolution_failed", provider=last.get("provider", last.get("endpoint")),
+                     query_type=last.get("query_type"), reason_code=reason)
                 raise errors[0]
             return result[0]
 
@@ -241,6 +312,17 @@ class HttpClient:
         active_digest: Any = None
         active_size = 0
         active_package_stream = False
+        # Defer certificate persistence until body transfer has finished. A
+        # secondary evidence write must not consume the original download's
+        # byte allowance or turn its successful transfer into a failure.
+        certificates: list[tuple[bytes, dict[str, object]]] = []
+        certificate_bytes = 0
+
+        def certificate_gap(reason: str, **fields: object) -> None:
+            emit_transport("gap", code="tls_certificate_not_captured", reason_code=reason,
+                           representation="tls_certificate_der", complete=False,
+                           capture_status="not_captured", **fields)
+
         try:
             for index in range(min(self.limits.max_redirects + 1, self.limits.max_requests)):
                 check()
@@ -254,6 +336,7 @@ class HttpClient:
                 active_digest = None
                 active_size = 0
                 active_package_stream = False
+                active_tls_fields = {}
                 emit("request", request_id=request_id)
                 emit_transport(
                     "request_attempted", request_ref=request_id, url=current, method="GET"
@@ -272,17 +355,51 @@ class HttpClient:
                 selected_address = addresses[0]
                 for address in tuple(dict.fromkeys(addresses))[:4]:
                     selected_address = address
+                    connection_started = time.monotonic()
                     try:
                         sock = self._connect(
                             host, port, address, secure, min(check(), self.limits.connect_timeout)
                         )
                         connection_attempts.append({"ip": address, "outcome": "connected"})
                         break
-                    except ssl.SSLCertVerificationError:
-                        # Identity verification must never be relaxed or retried
-                        # through another endpoint. A plain handshake interruption
-                        # is handled below as a connection failure before any GET.
-                        raise
+                    except ssl.SSLCertVerificationError as error:
+                        # No HTTP request has been sent. Only this explicit
+                        # certificate failure can authorize one handshake retry,
+                        # pinned to the same previously validated IP and SNI.
+                        verify_code = getattr(error, "verify_code", None)
+                        verify_code = verify_code if type(verify_code) is int and 0 <= verify_code <= 2**31 - 1 else 0
+                        reason = {9: "certificate_not_yet_valid", 10: "certificate_expired",
+                                  18: "self_signed_certificate", 19: "self_signed_chain",
+                                  20: "issuer_unavailable", 21: "issuer_unverified",
+                                  23: "certificate_revoked", 62: "hostname_mismatch",
+                                  64: "ip_address_mismatch"}.get(verify_code, "certificate_verification_failed")
+                        failure_fields = {"request_ref": request_id, "source_url": current, "url": current,
+                                          "connection_ip": address, "tls_verify_code": verify_code,
+                                          "tls_verify_reason": reason}
+                        fallback_id = uuid.uuid4().hex if self.tls_policy == "auto" and secure else None
+                        if fallback_id is not None:
+                            failure_fields["tls_fallback_id"] = fallback_id
+                        emit_transport("tls_verification_failed", **failure_fields)
+                        emit("tls_certificate_error", tls_verify_code=verify_code, tls_verify_reason=reason,
+                             request_ref=request_id, tls_fallback_id=fallback_id)
+                        if fallback_id is None:
+                            raise
+                        remaining_connect = min(check(), self.limits.connect_timeout - (time.monotonic() - connection_started))
+                        if remaining_connect <= 0:
+                            raise TimeoutError("TLS retry connection budget exhausted") from error
+                        try:
+                            sock = self._connect_unverified(host, port, address, remaining_connect)
+                        except (OSError, FxfetchError):
+                            emit_transport("tls_fallback_failed", **failure_fields, fallback_state="failed")
+                            certificate_gap("tls_fallback_handshake_failed", **failure_fields)
+                            raise
+                        active_tls_fields = {**failure_fields, "tls_verification": "ignored"}
+                        emit_transport("tls_verification_fallback", **failure_fields)
+                        emit("tls_fallback_continued", tls_verify_code=verify_code, tls_verify_reason=reason,
+                             request_ref=request_id, tls_fallback_id=fallback_id)
+                        connection_attempts.append({"ip": address, "outcome": "connected",
+                                                    "reason_code": "tls_certificate_fallback"})
+                        break
                     except FxfetchError:
                         raise
                     except OSError as error:
@@ -321,9 +438,29 @@ class HttpClient:
                 response: http.client.HTTPResponse | None = None
                 try:
                     connection_ip = sock.getpeername()[0]
-                    certificate = (
-                        sock.getpeercert(binary_form=True) if isinstance(sock, ssl.SSLSocket) else None
-                    )
+                    certificate = None
+                    if secure:
+                        certificate_fields: dict[str, object] = {
+                            "url": current, "source_url": current, "request_ref": request_id,
+                            "connection_ip": connection_ip,
+                            **active_tls_fields,
+                            "tls_verification": "ignored" if active_tls_fields else "verified",
+                        }
+                        try:
+                            if (not isinstance(sock, ssl.SSLSocket) or (not active_tls_fields and (
+                                    sock.context.verify_mode != ssl.CERT_REQUIRED
+                                    or not sock.context.check_hostname))):
+                                raise ValueError("verified TLS socket unavailable")
+                            certificate = sock.getpeercert(binary_form=True)
+                            if (not certificate or len(certificate) > MAX_CERTIFICATE_BYTES
+                                    or certificate_bytes + len(certificate) > MAX_CERTIFICATE_TOTAL
+                                    or len(certificates) >= MAX_CERTIFICATE_CONNECTIONS):
+                                certificate_gap("tls_certificate_size_limit", **certificate_fields)
+                            else:
+                                certificates.append((certificate, certificate_fields))
+                                certificate_bytes += len(certificate)
+                        except (OSError, ValueError):
+                            certificate_gap("tls_certificate_read_failed", **certificate_fields)
                     sock.settimeout(min(check(), self.limits.read_timeout))
                     request = Request(
                         current, headers={"User-Agent": user_agent, "Accept-Encoding": "identity"}
@@ -354,6 +491,7 @@ class HttpClient:
                             "explicit_proxy_connect" if self.proxy else "direct",
                             selected_address,
                             tuple(connection_attempts),
+                            ("ignored" if active_tls_fields else "verified") if secure else "not_applicable",
                         )
                     )
                     raw_headers = response.getheaders()
@@ -386,6 +524,7 @@ class HttpClient:
                         "explicit_proxy_connect" if self.proxy else "direct",
                         selected_address,
                         tuple(connection_attempts),
+                        ("ignored" if active_tls_fields else "verified") if secure else "not_applicable",
                     )
                     raw_location = response.getheader("Location")
                     resolved_location = None
@@ -401,6 +540,7 @@ class HttpClient:
                             connection_ip=connection_ip,
                             requested_ip=selected_address,
                             tls_der_sha256=hashlib.sha256(certificate).hexdigest() if certificate else None,
+                            tls_verification=("ignored" if active_tls_fields else "verified") if secure else "not_applicable",
                             location_raw=raw_location,
                             location_resolved=None,
                         )
@@ -588,6 +728,8 @@ class HttpClient:
             error.__dict__["request_ref"] = active_request_ref
             raise error from exc
         except ssl.SSLCertVerificationError as exc:
+            certificate_gap("tls_certificate_unverified", request_ref=active_request_ref,
+                            url=current, source_url=current)
             error = FxfetchError("tls_verification_failed", "TLS certificate verification failed")
             error.__dict__["hops"] = tuple(hops)
             error.__dict__["request_ref"] = active_request_ref
@@ -628,3 +770,31 @@ class HttpClient:
                 )
             if active_progress is not None and not transfer_complete:
                 active_progress()
+            budget_root = destination.parent
+            for observer in (self.transport_observer, on_transport_event):
+                owner = getattr(observer, "__self__", observer)
+                candidate_root = getattr(owner, "root", None)
+                if isinstance(candidate_root, Path):
+                    budget_root = candidate_root
+                    break
+            remaining_certificate_bytes = max(0, min(
+                self.limits.max_task_bytes,
+                self.limits.max_package_bytes - active_size,
+            ))
+            for certificate, certificate_fields in certificates:
+                try:
+                    if cancel.is_set() or time.monotonic() >= start + self.limits.chain_timeout:
+                        certificate_gap("tls_certificate_capture_deadline", **certificate_fields)
+                        continue
+                    metadata, written = save_leaf_der(
+                        destination.parent / "tls", certificate, root=budget_root,
+                        max_task_bytes=self.limits.max_task_bytes,
+                        remaining_bytes=remaining_certificate_bytes,
+                        deadline=start + self.limits.chain_timeout,
+                        tls_verification=str(certificate_fields["tls_verification"]),
+                    )
+                    remaining_certificate_bytes -= written
+                    emit_transport("tls_certificate_saved", **{**certificate_fields, **metadata})
+                except (OSError, ValueError) as error:
+                    reason = getattr(error, "code", "tls_certificate_write_failed")
+                    certificate_gap(str(reason), **certificate_fields)

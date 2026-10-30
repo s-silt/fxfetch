@@ -21,7 +21,7 @@ from .web_journal import EvidenceJournal
 from .workflow import Artifact, Attempt, Workflow, WorkflowResult
 
 _TERMINATION_REASONS = {"cancelled", "task_timeout", "chain_timeout", "browser_read_timeout"}
-_GUARD_REASONS = {"target_not_public", "browser_wire_limit", "request_limit", "invalid_url"}
+_GUARD_REASONS = {"target_not_public", "dns_unsafe_answer", "browser_wire_limit", "request_limit", "invalid_url"}
 
 
 def apply_gateway_errors(result: WorkflowResult, errors: list[dict]) -> None:
@@ -87,11 +87,19 @@ class BrowserWorkflow:
         *, lease_id: str | None = None,
         http_first: bool = False,
         journal: EvidenceJournal | None = None,
+        ignore_tls_errors: bool = False,
+        tls_policy: str = 'strict',
     ) -> None:
         self.static, self.config, self.limits = static, config, limits
         self.lease_id = lease_id
         self.http_first = http_first
         self.journal = journal
+        if type(ignore_tls_errors) is not bool:
+            raise ValueError('ignore_tls_errors must be boolean')
+        self.ignore_tls_errors = ignore_tls_errors
+        if tls_policy not in ('auto', 'strict'):
+            raise ValueError('Invalid TLS policy')
+        self.tls_policy = 'auto' if ignore_tls_errors else tls_policy
         self._browser_attempts = 0
 
     def run(
@@ -188,6 +196,7 @@ class BrowserWorkflow:
                             limits=replace(limits, chain_timeout=remaining),
                             on_event=on_event,
                             journal=self.journal,
+                            tls_policy=self.tls_policy,
                             observation_context={
                                 "collector_id": "browser",
                                 "attempt_id": f"{parent_attempt}/browser-android-{self._browser_attempts}",

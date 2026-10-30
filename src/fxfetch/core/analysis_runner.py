@@ -7,6 +7,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from .analysis_evidence_filter import filter_report
+from .analysis_har import json_bytes
 from .analysis_package import prepare_analysis, write_receipt
 from .process_limits import run_limited
 from .web_evidence_io import check_ancestors, is_reparse, read_json_object
@@ -30,26 +32,31 @@ def _report_receipt(output: Path) -> dict[str, Any]:
         raise EvidenceError("fxapk_report_contract_invalid")
     if type(web.get("file_count")) is not int or web["file_count"] <= 0:
         raise EvidenceError("fxapk_report_empty")
-    return {"path": "report/input.json", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "load_errors": errors, "file_count": web["file_count"]}
+    return {
+        "path": "report/input.json",
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "load_errors": errors,
+        "file_count": web["file_count"],
+    }
 
 
 def analyze_archive(
-    archive: Path, output: Path, *, max_bytes: int, executable: str = "fxapk", timeout: float = 300.0,
-    expected_size: int | None = None, expected_sha256: str | None = None,
+    archive: Path,
+    output: Path,
+    *,
+    max_bytes: int,
+    executable: str = "fxapk",
+    timeout: float = 300.0,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any]:
     if not 1 <= timeout <= 3600:
         raise EvidenceError("analysis_timeout_invalid")
     receipt = prepare_analysis(archive, output, max_bytes=max_bytes)
     analysis = receipt["analysis"]
     copied = output / "source.zip"
-    size_mismatch = (
-        expected_size is not None and copied.stat().st_size != expected_size
-    )
-    hash_mismatch = (
-        expected_sha256 is not None
-        and receipt["source_archive"]["sha256"] != expected_sha256
-    )
+    size_mismatch = expected_size is not None and copied.stat().st_size != expected_size
+    hash_mismatch = expected_sha256 is not None and receipt["source_archive"]["sha256"] != expected_sha256
     if size_mismatch or hash_mismatch:
         analysis.update(state="failed", reason_code="analysis_source_mismatch")
         receipt["state"] = "failed"
@@ -67,16 +74,29 @@ def analyze_archive(
         receipt["state"] = "failed"
         write_receipt(output, receipt)
         return receipt
-    command = [str(Path(resolved).resolve()), "analyze-web", str(inputs.resolve()),
-               "--offline", "--fmt", "json", "--out", str((output / "report").resolve())]
+    command = [
+        str(Path(resolved).resolve()),
+        "analyze-web",
+        str(inputs.resolve()),
+        "--offline",
+        "--fmt",
+        "json",
+        "--out",
+        str((output / "report").resolve()),
+    ]
     analysis.update(state="running", executable=command[0], command=command)
     write_receipt(output, receipt)
-    result = run_limited(command, timeout=timeout, memory_bytes=2 * 1024**3,
-                         cwd=output.resolve(), max_output_bytes=1024 * 1024)
+    result = run_limited(
+        command, timeout=timeout, memory_bytes=2 * 1024**3, cwd=output.resolve(), max_output_bytes=1024 * 1024
+    )
     (output / "fxapk.stdout.log").write_bytes(result.stdout)
     (output / "fxapk.stderr.log").write_bytes(result.stderr)
-    analysis.update(returncode=result.returncode, output_truncated=result.output_truncated,
-                    limit_method=result.limit_method, timed_out=result.timed_out)
+    analysis.update(
+        returncode=result.returncode,
+        output_truncated=result.output_truncated,
+        limit_method=result.limit_method,
+        timed_out=result.timed_out,
+    )
     reason = result.reason_code
     if result.timed_out:
         reason = "fxapk_timeout"
@@ -86,12 +106,40 @@ def analyze_archive(
         analysis.update(state="failed", reason_code=reason)
     else:
         try:
+            native = _report_receipt(output)
+            report_path = output / "report" / "input.json"
+            report = read_json_object(report_path, MAX_REPORT_BYTES)
+            published, filter_stats = filter_report(report, output, receipt)
+            raw_directory = output / "native-report"
+            check_ancestors(raw_directory)
+            raw_directory.mkdir(mode=0o700, exist_ok=False)
+            raw_path = raw_directory / "input.json"
+            with raw_path.open("xb") as stream:
+                stream.write(report_path.read_bytes())
+            # The native sidecar describes the original, never the filtered publication.
+            sidecar = report_path.with_name("input.json.sha256")
+            if sidecar.exists() or sidecar.is_symlink():
+                check_ancestors(sidecar)
+                if not sidecar.is_file() or is_reparse(sidecar) or sidecar.stat().st_size > 4096:
+                    raise EvidenceError("fxapk_report_contract_invalid")
+                sidecar.replace(raw_directory / "input.json.sha256")
+            pending = report_path.with_suffix(".filtered.pending")
+            with pending.open("xb") as stream:
+                stream.write(json_bytes(published))
+            pending.replace(report_path)
+            analysis["native_report"] = {
+                "path": "native-report/input.json",
+                "sha256": native["sha256"],
+                "publication_included": False,
+            }
+            analysis["evidence_filter"] = filter_stats
             analysis["report"] = _report_receipt(output)
             analysis["state"] = "completed"
         except (OSError, ValueError) as error:
-            analysis.update(state="failed", reason_code=(
-                error.code if isinstance(error, EvidenceError) else "fxapk_report_unavailable"
-            ))
+            analysis.update(
+                state="failed",
+                reason_code=(error.code if isinstance(error, EvidenceError) else "fxapk_report_unavailable"),
+            )
     receipt["state"] = analysis["state"]
     write_receipt(output, receipt)
     return receipt

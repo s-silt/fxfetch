@@ -365,6 +365,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "files": len(manifest["files"]),
                     "web_materials": manifest["web_materials"],
                     "external_packages_verified": False,
+                    "attachment_bytes_verified": len(manifest.get("attachments", [])),
+                    "application_validation_performed": False,
                 }
             )
             return 0

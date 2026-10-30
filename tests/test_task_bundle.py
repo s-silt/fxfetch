@@ -209,9 +209,11 @@ def test_archive_keeps_web_material_separate_from_external_package(tmp_path: Pat
     with zipfile.ZipFile(archive) as bundle:
         assert "web/index.html" in bundle.namelist()
         assert all("original.apk" not in name for name in bundle.namelist())
-        assert b"synthetic-original-package" not in b"".join(
-            bundle.read(name) for name in bundle.namelist()
-        )
+        attachment = manifest['attachments'][0]
+        assert attachment['kind'] == 'package' and attachment['validation']['status'] == 'passed'
+        assert bundle.read(attachment['path']) == b'synthetic-original-package'
+        assert bundle.getinfo(attachment['path']).compress_type == zipfile.ZIP_STORED
+        assert manifest['external_packages'][0]['embedded_path'] == attachment['path']
 
 
 def test_http_and_browser_coverage_gaps_are_retained(tmp_path: Path) -> None:
@@ -269,12 +271,12 @@ def test_source_mutation_before_seal_is_rejected(tmp_path: Path) -> None:
 def test_valid_small_zip64_archive_is_verified(tmp_path: Path) -> None:
     archive = _archive(tmp_path)
     archive.write_bytes(
-        _zip64_archive(archive.read_bytes(), entries=3, sentinels=False)
+        _zip64_archive(archive.read_bytes(), entries=4, sentinels=False)
     )
 
     manifest, _ = verify_task_archive(archive, max_bytes=32 * 1024 * 1024)
 
-    assert manifest["schema_version"] == "fxfetch.task-evidence.v1"
+    assert manifest["schema_version"] == "fxfetch.task-evidence.v2"
 
 
 def test_valid_ordinary_zip_comment_is_verified(tmp_path: Path) -> None:
@@ -283,7 +285,7 @@ def test_valid_ordinary_zip_comment_is_verified(tmp_path: Path) -> None:
 
     manifest, _ = verify_task_archive(archive, max_bytes=32 * 1024 * 1024)
 
-    assert manifest["schema_version"] == "fxfetch.task-evidence.v1"
+    assert manifest["schema_version"] == "fxfetch.task-evidence.v2"
 
 
 def test_fake_eocd_in_comment_is_rejected_before_zipfile(

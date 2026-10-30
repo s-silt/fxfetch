@@ -6,6 +6,7 @@ import pytest
 import qrcode
 from test_workflow import ROOT, SyntheticClient, apk_bytes, ipa_bytes
 
+from fxfetch.core.errors import FxfetchError
 from fxfetch.core.page_qr import discover_images
 from fxfetch.core.workflow import ANDROID_UA, IPHONE_UA, Workflow
 
@@ -62,6 +63,19 @@ def test_unscanned_image_never_no_package(tmp_path, status, expected):
     assert result.outcome == expected
     assert len(client.calls) == 2
     assert result.coverage == "partial"
+
+
+@pytest.mark.parametrize("code", ["dns_unsafe_answer", "dns_tls_verification_failed"])
+def test_qr_resource_dns_security_rejection_preserves_failure(tmp_path, code):
+    class RejectedImageClient(SyntheticClient):
+        def fetch(self, url, *args, **kwargs):
+            if url.endswith("/one"):
+                raise FxfetchError(code, "Synthetic DNS security rejection")
+            return super().fetch(url, *args, **kwargs)
+
+    client = RejectedImageClient({ROOT + "/": (200, "text/html", b'<img src="/one">')})
+    result = Workflow(client).run(ROOT, tmp_path, threading.Event())
+    assert (result.outcome, result.reason_code, result.coverage) == ("failed", code, "partial")
 
 
 def test_tracking_skip_and_limit():

@@ -13,11 +13,12 @@ def test_explicit_pinned_queries_and_metadata():
     def transport(host, address, path, timeout):
         calls.append((host, address, path, timeout))
         record = (
-            {"type": 1, "data": "93.184.216.34"}
+            {"name": "alias.example.", "type": 1, "data": "93.184.216.34"}
             if "type=A&" in path or path.endswith("type=A")
-            else {"type": 28, "data": "2606:2800:220:1:248:1893:25c8:1946"}
+            else {"name": "alias.example.", "type": 28, "data": "2606:2800:220:1:248:1893:25c8:1946"}
         )
-        return json.dumps({"Status": 0, "Answer": [{"type": 5, "data": "alias.example"}, record]}).encode()
+        return json.dumps({"Status": 0, "Question": [{"name": "download.example.", "type": record["type"]}],
+                           "Answer": [{"name": "download.example.", "type": 5, "data": "alias.example"}, record]}).encode()
 
     resolver = PublicDNSResolver("google", transport=transport)
     result = resolver.resolve("download.example", 443)
@@ -117,7 +118,7 @@ def test_wire_default_endpoint_and_questions():
         ("network", "success"),
         ("servfail", "success"),
         ("nxdomain", "dns_nxdomain"),
-        ("unsafe", "target_not_public"),
+        ("unsafe", "dns_unsafe_answer"),
         ("mismatch", "dns_invalid_response"),
         ("empty", "dns_no_addresses"),
     ],

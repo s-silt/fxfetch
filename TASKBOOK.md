@@ -2,7 +2,7 @@
 
 ## 第一阶段独立网页采集
 
-独立网页能力由 `fxfetch capture-web`、追加式 provenance 与离线 `fxfetch export-web` / `fxfetch verify-web` 提供；既有 `fxfetch.web-evidence.v1` 合同保持不变。普通任务使用现有单次下载工作流，并在结束后另行离线生成 `fxfetch.task-evidence.v1` ZIP。原 APK / IPA 仍单独保存及下载；ZIP 只纳入明确记录的网页材料、有限观察与外部原包引用，不复制原包字节。ZIP 失败不得改变原任务结果。`verify-data` 离线验证 ZIP，不验证外部原包。覆盖始终为 partial；独立网页采集保持被动、有界，不点击、遍历链接、跟随二维码或声称验证整站。fxapk 和 WebView 行为不在此变更范围内。
+独立网页能力由 `fxfetch capture-web`、追加式 provenance 与离线 `fxfetch export-web` / `fxfetch verify-web` 提供；既有 `fxfetch.web-evidence.v1` 合同保持不变。普通任务使用现有单次下载工作流，并在结束后另行离线生成 `fxfetch.task-evidence.v2` ZIP。原 APK / IPA 仍可单独下载；ZIP 同时纳入已完整接收的原文件、HTTP 实际连接证书与 Chrome 明确标明浏览器网络事件或 origin 快照范围的 TLS DER 证书、网页材料与有限观察。附件独立于网页材料，校验失败的完整原包保留失败状态；指纹不能还原历史证书。ZIP 失败不得改变原任务结果。`verify-data` 离线验证 ZIP 内列明附件的原字节及绑定，不重跑 APK 结构或签名验证；继续兼容旧 v1 清单。覆盖始终为 partial；独立网页采集保持被动、有界，不点击、遍历链接、跟随二维码或声称验证整站。fxapk 和 WebView 行为不在此变更范围内。
 
 本文定义范围和验收要求，不代表功能全部完成。当前状态见 [IMPLEMENTATION.md](IMPLEMENTATION.md)，接口合同见 [API.md](API.md)，执行约定见 [AGENTS.md](AGENTS.md)。
 
@@ -36,7 +36,7 @@
 
 - 后端采用 Python 3.11+、FastAPI/Uvicorn、SQLite 和独立受限 worker；前端为无 CDN 的原生 HTML/CSS/JavaScript。
 - 图片由 Pillow 与 ZXing-C++ 在本机受限进程解码，只识别 QR；验证真实格式，不执行二维码自定义协议。
-- HTTP 每跳校验公网地址、固定已验证连接 IP、保留 Host/SNI 和证书校验；不信任环境代理或转发头。
+- HTTP 每跳校验公网地址、固定已验证连接 IP、保留 Host/SNI，默认校验证书；不信任环境代理或转发头。新网页任务默认允许证书校验失败后的有界继续，只有捕获到真实证书错误才能降级；每次连接仍先严格校验，其他连接错误不放行。可选择严格模式停止，候选子任务独立选择。分别记录策略、实际错误及继续访问风险，不能仅因自动策略标记身份未验证。不能放宽公网检查、下载预算或包结构校验，不能修改系统信任或生成 APK 的 TLS 设置。
 - Chrome 使用固定配置与独立任务会话。启用前验收连接前出站隔离、真实浏览器身份、独立数据卷和 guest 原生期限；响应后 peer 检查不足以防 SSRF。
 - 正常页面必要资源、API、重定向、按钮和下载受原预算约束；不枚举目录、猜接口或提交业务表单。
 - 验证页面已下发的明确文件锚点可沿原会话下载；无文件锚点时可静态提取内联脚本字面量 HTML GET 地址。禁止求值动态表达式、调用受保护函数、重放 POST 或伪造设备标识。

@@ -48,3 +48,20 @@ fxapk 的离线 APK 分析可提取生成包的入口、Manifest 和 WebView 结
 ## 验证原则
 
 桌面 Chrome 合成捕获、Android worker 隔离、网页任务到附件、手机安装和第二台 LAN 设备分别验收。任何一项通过都不能替代其他项，也不能推导真实站点成功率或通用验证码能力。
+
+## Chrome 证书原件（2026-10-30）
+
+单次任务的显式证书例外使用 [CDP Security.setIgnoreCertificateErrors](https://raw.githubusercontent.com/ChromeDevTools/devtools-protocol/master/pdl/domains/Security.pdl)。协议允许打开/关闭忽略证书错误；实现只在独立采集会话内设置，每个目标导航前明确设置，退出时恢复 false，后续默认任务再次设置 false。HTTP 使用任务独立 SSLContext，不修改系统信任，不将忽略验证写成已验证身份。作用范围和实际任务隔离仍以连续默认/忽略/默认的真实 Chrome 验收为准。
+
+[CDP Network.getCertificate](https://raw.githubusercontent.com/ChromeDevTools/devtools-protocol/master/pdl/domains/Network.pdl) 按 origin 返回 DER 证书；参数没有 requestId，不能把它当成某次请求同连接证书。实现将当前会话已观测 HTTPS 响应作为查询触发，保存返回的原 DER、链序号及观察范围，不新增目标请求；空结果、版本不支持和预算耗尽均保留缺口。HTTP socket 原件与 Chrome origin 快照使用不同来源字段。[Security 的页面证书事件](https://raw.githubusercontent.com/ChromeDevTools/devtools-protocol/master/pdl/domains/Security.pdl) 也没有逐请求绑定，不据此升级证据级别。
+
+实际流式接管（Fetch.takeResponseBodyAsStream + fulfillRequest）会令 renderer 证书缓存缺失，故不能只依赖 getCertificate。采用 [Chromium 默认模式 NetLog 证书事件](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/docs/net-log.md) 的被动备选：通过 CDP Tracing 的普通 netlog 类别限额观察 `SSL_CERTIFICATES_RECEIVED`。只保存该事件的公开证书原 DER 与允许列表元数据，不落原 trace、不启用 sensitive 类别；source id/PID/时间不等于具体 URL 请求绑定，缺少可证关联时按浏览器网络事件范围保存。`chain_complete` 只表示该事件中列出的成员完整保存，不表示 PKI 验证通过或信任路径完整。
+
+
+## 2026-10-30：严格校验后按错误自动继续
+
+Python 以 [`SSLCertVerificationError`](https://docs.python.org/3/library/ssl.html#ssl.SSLCertVerificationError) 区分证书验证失败和一般 TLS/网络错误，严格与补偿握手共用连接预算，目标 IP 与 Host/SNI 不变，尚未发送 HTTP 请求时才允许一次重握手。每个后续连接重新验证。
+
+Chrome 采用 [Security 协议](https://raw.githubusercontent.com/ChromeDevTools/devtools-protocol/master/pdl/domains/Security.pdl) 的 `setOverrideCertificateErrors`、`certificateError` 与 `handleCertificateError` 逐事件处理，不全局 `setIgnoreCertificateErrors(true)`。这些错误事件接口已标 deprecated，是否可用需在已安装 Chrome 版本上实测；内部允许的错误不保证发出事件，不能把缺少事件推断为每张观察证书均验证成功。只继续已通过请求守卫的匹配请求，保留错误、继续记录与证书原件的真实关联范围，未知/缺失记为缺口。当前实现与实测版本以 IMPLEMENTATION 最新章节为准。
+
+跨任务隔离不只依赖恢复 CDP 设置。[Chromium SecurityHandler](https://raw.githubusercontent.com/chromium/chromium/main/content/browser/devtools/protocol/security_handler.cc) 在关闭 override 时取消挂起的证书错误，但接口存在 target 类型限制；[SSLManager](https://raw.githubusercontent.com/chromium/chromium/main/content/browser/ssl/ssl_manager.cc) 的 DevTools 继续路径也不能证明所有连接缓存均被清除。生产 Android lease 每次从受验只读基线复制独立数据分区，启动新的容器与 Chrome 进程，结束后清理该 lease。实际接口版本、页面/iframe 行为和跨任务拒绝均须以合成测试验收。

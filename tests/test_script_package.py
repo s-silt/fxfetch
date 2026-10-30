@@ -154,3 +154,19 @@ def test_shadowed_navigation_does_not_request_package(script, tmp_path):
     result = Workflow(client).run(ROOT, tmp_path, threading.Event())
     assert [call[0] for call in client.calls] == [ROOT + '/']
     assert not result.artifacts
+
+
+@pytest.mark.parametrize("script", [
+    'class Demo { #location={}; f(){ this.#location.href="/a.apk"; } }',
+    'class Demo { #window={location:{}}; f(){ this.#window.location.href="/a.apk"; } }',
+    '{ class location {} location.href="/a.apk"; }',
+    '{ class window {} window.location="/a.apk"; }',
+])
+def test_private_or_class_navigation_does_not_request_package(script, tmp_path):
+    html = document(script)
+    assert not discover_html(html, ROOT).candidates
+    client = SyntheticClient({ROOT + '/': (200, 'text/html', html),
+                              ROOT + '/a.apk': (200, 'application/octet-stream', apk_bytes())})
+    result = Workflow(client).run(ROOT, tmp_path, threading.Event())
+    assert [call[0] for call in client.calls] == [ROOT + '/']
+    assert not result.artifacts
