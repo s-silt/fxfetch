@@ -61,7 +61,7 @@ def script_package_candidates(html: str, source: str, maximum: int) -> list[Cand
         if kind == "word" and value in {"window", "location"} and values[index + 1:index + 3] == ["=", ">"]:
             return []  # An unparenthesized arrow parameter shadows the browser global.
         if kind == "word" and value in {"window", "location"} and index and values[index - 1] in {
-            "var", "let", "const", "function", "(", ",",
+            "var", "let", "const", "function", "class", "(", ",",
         }:
             return []  # A local binding/parameter may replace the browser navigation object.
         if kind == "word" and value in {"with", "eval", "Function"} and values[index + 1:index + 2] == ["("]:
@@ -91,7 +91,7 @@ def script_package_candidates(html: str, source: str, maximum: int) -> list[Cand
             ["location", "="],
         ):
             start = index - len(prefix)
-            if start >= 0 and values[start:index] == prefix and (start == 0 or values[start - 1] != "."):
+            if start >= 0 and values[start:index] == prefix and (start == 0 or values[start - 1] not in {".", "#"}):
                 destinations.add(index)
                 break
 

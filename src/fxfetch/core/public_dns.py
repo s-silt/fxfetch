@@ -7,6 +7,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import os
 import socket
 import ssl
 import threading
@@ -413,21 +414,27 @@ class PublicDNSResolver:
 
 
 class DefaultPublicDNSResolver:
-    """User-selected AliDNS first, DNSPod backup only for transport/service failures."""
+    """Configured pinned providers; backup only for transport/service failures."""
 
     def __init__(self, *, proxy: LocalConnectProxy | None = None, transport: Transport | None = None) -> None:
         self.proxy = proxy
         self.transport = transport
+        self.providers = tuple(item.strip() for item in os.environ.get(
+            "FXFETCH_DNS_PROVIDERS", "alidns,dnspod"
+        ).split(","))
+        if (not 1 <= len(self.providers) <= 2 or len(set(self.providers)) != len(self.providers)
+                or any(item not in ENDPOINTS for item in self.providers)):
+            raise FxfetchError("dns_configuration_invalid", "Choose one or two supported DNS providers")
         self.last_records: list[dict[str, object]] = []
 
     def resolve(self, host: str, port: int) -> tuple[str, ...]:
         self.last_records = []
         deadline = time.monotonic() + 20.0
-        for endpoint in ("alidns", "dnspod"):
+        for index, endpoint in enumerate(self.providers):
             resolver = PublicDNSResolver(endpoint, proxy=self.proxy, transport=self.transport)
             # Allocate the first provider at most half the total budget.
             original = resolver._transport
-            provider_deadline = min(deadline, time.monotonic() + (10.0 if endpoint == "alidns" else 20.0))
+            provider_deadline = min(deadline, time.monotonic() + (10.0 if index == 0 and len(self.providers) == 2 else 20.0))
 
             def bounded(
                 hostname: str,
@@ -456,7 +463,7 @@ class DefaultPublicDNSResolver:
                         "reason_code": exc.code,
                     }
                 )
-                if exc.code not in ("dns_failed", "proxy_failed", "proxy_timeout") or endpoint == "dnspod":
+                if exc.code not in ("dns_failed", "proxy_failed", "proxy_timeout") or index == len(self.providers) - 1:
                     exc.__dict__["dns_records"] = list(self.last_records)
                     raise
             else:

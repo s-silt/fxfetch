@@ -5,6 +5,7 @@
   const activeStates = new Set(["queued", "running", "building", "awaiting_human", "awaiting_selection"]);
   const labels = {queued:"排队中",running:"采集中",building:"正在打包",completed:"采集结束",cancelled:"已取消",interrupted:"已中断",awaiting_selection:"等待选择",awaiting_human:"等待本机处理",downloaded:"已取得原包",not_found:"本次范围内未找到包",blocked:"访问受阻",failed:"未完成",built:"APK 已生成",disabled:"暂不可用",partial:"覆盖不完整",complete:"本次范围已完成",not_started:"尚未执行"};
   const messages = {
+    dns_configuration_invalid:"后端 DNS 配置无效，请联系主机管理员检查支持的服务商名称。",
     analysis_unavailable:"后端 fxapk 未配置或不可用，请联系主机管理员。",analysis_source_unavailable:"数据包尚未就绪或不可用，不能启动分析。",
     analysis_active:"本任务已有离线分析正在进行，请等待结束。",analysis_queue_full:"离线分析队列已满，请稍后重试。",analysis_limit:"此任务的分析次数已达上限。",
     analysis_timeout:"离线分析达到时间限制，已停止，未交付完整报告。",analysis_queue_timeout:"分析排队超时，尚未执行。",

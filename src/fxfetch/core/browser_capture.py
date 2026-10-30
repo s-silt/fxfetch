@@ -166,6 +166,7 @@ async def capture_browser(
     context: BrowserContext | None = None
     browser: Browser | None = None
     last_activity = time.monotonic()
+    entry_navigation_pending = False
     clicked: set[tuple[str, str, str]] = set()
     resources: dict[str, Path] = {}
     resource_aliases: dict[str, str] = {}
@@ -989,9 +990,14 @@ async def capture_browser(
             done.set()
 
     async def navigate(session: str) -> None:
-        response = await send(session, "Page.navigate", {"url": entry_url})
-        if response.get("errorText") and not receiving.locked() and not result.artifacts:
-            raise FxfetchError("browser_navigation_failed", "Browser navigation failed")
+        nonlocal entry_navigation_pending, last_activity
+        try:
+            response = await send(session, "Page.navigate", {"url": entry_url})
+            if response.get("errorText") and not receiving.locked() and not result.artifacts:
+                raise FxfetchError("browser_navigation_failed", "Browser navigation failed")
+        finally:
+            entry_navigation_pending = False
+            last_activity = time.monotonic()
 
     async def follow_disclosed_links(pages: list[Page]) -> bool:
         """Follow explicit file hrefs or bounded literal content-page GET URLs.
@@ -1625,6 +1631,9 @@ async def capture_browser(
                 entry_frame = entry_tree.get("frameTree", {}).get("frame", {})
                 if web_observer is not None:
                     web_observer.set_entry_identity(entry_session, entry_frame.get("id"))
+                entry_navigation_pending = True
+                last_activity = time.monotonic()
+                progress.action()
                 schedule(navigate(entry_session))
                 last_scan = time.monotonic()
                 last_snapshot = 0.0
@@ -1648,7 +1657,7 @@ async def capture_browser(
                             if "destroyed" not in str(error) and "detached" not in str(error):
                                 raise
                         last_scan = now
-                    if not receiving.locked() and now - last_activity >= 5:
+                    if not entry_navigation_pending and not receiving.locked() and now - last_activity >= 5:
                         break
                     if not receiving.locked() and progress.stalled(time.monotonic(), MAX_NO_PROGRESS_SECONDS):
                         result.gaps.append("browser_no_progress")
