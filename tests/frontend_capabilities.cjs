@@ -55,6 +55,46 @@ function harness(capability, responder = () => ({})) {
 
 async function main() {
   {
+    for (const background of [false, true]) {
+      const job = {id:"job", state:"completed", outcome:"blocked", data_package:{state:"ready"}, analyses:[]};
+      const other = {id:"other", state:"completed", analyses:[]};
+      let reads = 0;
+      const ui = harness(() => ({}), (url, options) => {
+        if (url === "/api/jobs/job/analyses" && options.method === "POST") return {id:"analysis", state:"queued", report_ready:false};
+        if (url === "/api/jobs") {
+          reads++;
+          if (reads <= 2) throw new Error("synthetic list read failure");
+          return {jobs:[{id:"job", state:"completed", active_analyses:0}, {id:"other", state:"completed", active_analyses:0}]};
+        }
+        if (url === "/api/jobs/job") return {...job, analyses:[{id:"analysis", state:"completed", report_ready:true}]};
+        if (url === "/api/jobs/other") return other;
+        return {};
+      });
+      ui.test.state.authenticated = true;
+      ui.test.state.current = background ? "other" : "job";
+      ui.test.state.job = background ? other : job;
+      ui.test.state.jobs = [{id:"job", state:"completed", active_analyses:0}, {id:"other", state:"completed", active_analyses:0}];
+      await ui.test.submitAnalysis(job, {disabled:false});
+      assert.equal(job.analyses[0].state, "queued", "POST result must survive a failed list refresh");
+      assert.equal(ui.test.state.pendingAnalyses.size, 0, "Successful POST must not be retried");
+      assert.equal(ui.test.hasActive(), true, "Acknowledged analysis must keep polling even in the background");
+      async function tickPoll(milliseconds) {
+        const timer = [...ui.timers.entries()].find(([, item]) => item.milliseconds === milliseconds);
+        assert.ok(timer, "Expected a scheduled analysis progress read");
+        ui.timers.delete(timer[0]);
+        await timer[1].fn(); await ui.settle();
+      }
+      await tickPoll(1500);
+      assert.equal(ui.test.hasActive(), true);
+      await tickPoll(5000);
+      assert.equal(ui.test.hasActive(), false, "Terminal server state must stop polling");
+      if (!background) assert.equal(ui.test.state.job.analyses[0].report_ready, true);
+      assert.equal(ui.calls.filter(([url, method]) => url.endsWith("/analyses") && method === "POST").length, 1);
+      assert.equal(reads, 3, "Read failures should recover using GET requests only");
+      assert.ok(![...ui.timers.values()].some(item => item.milliseconds === 5000));
+    }
+  }
+  {
     const ui = harness(() => ({}));
     const node = (tag, className, text) => {
       const element = ui.document.createElement(tag);
@@ -190,6 +230,6 @@ async function main() {
     assert.equal(ui.test.state.capabilityStatus, "ready");
     assert.equal(ui.timers.size, 0);
   }
-  console.log(JSON.stringify({passed:true, cases:6, browser:false, network:false}));
+  console.log(JSON.stringify({passed:true, cases:7, analysisRecoveryScenarios:2, browser:false, network:false}));
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

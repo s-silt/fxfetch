@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -486,6 +487,26 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
         value = await run_in_threadpool(jobs.store.artifact, current["id"], identifier, artifact_id)
         path = contained_path(jobs.store.root, value["path"])
         return FileResponse(path, media_type="application/octet-stream", filename=value["filename"])
+
+    @app.get("/api/jobs/{identifier}/rejected-files/{file_id}")
+    async def rejected_file(identifier: str, file_id: str, current: Annotated[dict, Depends(session)]):
+        stream, metadata = await run_in_threadpool(jobs.rejected_file, current['id'], identifier, file_id)
+
+        def chunks():
+            try:
+                remaining = metadata['size']
+                while remaining and (block := stream.read(min(65536, remaining))):
+                    remaining -= len(block)
+                    yield block
+            finally:
+                stream.close()
+
+        return StreamingResponse(
+            chunks(), media_type='application/octet-stream', background=BackgroundTask(stream.close),
+            headers={'Cache-Control': 'no-store', 'Content-Length': str(metadata['size']),
+                     'Content-Disposition': f'attachment; filename="{metadata["filename"]}"',
+                     'X-Content-Type-Options': 'nosniff'},
+        )
 
     @app.get("/api/jobs/{identifier}/data-package")
     async def data_package(identifier: str, current: Annotated[dict, Depends(session)]):

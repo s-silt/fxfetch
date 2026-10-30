@@ -356,6 +356,8 @@ def test_cancel_running_and_queued_jobs(running):
     second = submit(client, headers, key="queued-cancel-key")
     assert client.post(f"/api/jobs/{second['id']}/cancel", headers=headers).status_code == 200
     assert wait_job(client, second["id"], "cancelled")["outcome"] is None
+    assert client.get(f"/api/jobs/{second['id']}").json()["data_package"]["state"] == "unavailable"
+    assert client.get(f"/api/jobs/{second['id']}/data-package").status_code == 404
     assert client.post(f"/api/jobs/{first['id']}/cancel", headers=headers).status_code == 200
     completed = wait_job(client, first["id"], "cancelled")
     assert completed["outcome"] == "failed" and completed["artifacts"] == []
@@ -372,6 +374,53 @@ def test_cancel_running_and_queued_jobs(running):
     assert manifest["package_result"]["reason_code"] == "cancelled"
     assert manifest["external_packages"] == []
     assert len(workflow.calls) == 1
+
+
+def test_collection_exception_seals_already_recorded_materials(running, monkeypatch):
+    from fxfetch import service as service_module
+    from fxfetch.core.task_evidence_recorder import TaskEvidenceRecorder
+
+    client, _, workflow, _ = running
+    recorders = []
+
+    def create_recorder(*args, **kwargs):
+        recorder = TaskEvidenceRecorder(*args, **kwargs)
+        recorders.append(recorder)
+        return recorder
+
+    def fail_after_saving(url, output_dir, cancel, on_event=None):
+        raw = b"<p>synthetic saved before exception</p>"
+        material = output_dir / "web" / "response.body"
+        material.parent.mkdir()
+        material.write_bytes(raw)
+        recorder = recorders[-1]
+        recorder.observe_transport({"kind": "request_attempted", "request_ref": "request-1", "url": url})
+        recorder.observe_transport({
+            "kind": "response_body_saved", "request_ref": "request-1", "url": url,
+            "path": material, "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+            "representation": "http_response_body", "complete": True,
+        })
+        raise ValueError("synthetic collector exception")
+
+    monkeypatch.setattr(service_module, "TaskEvidenceRecorder", create_recorder)
+    monkeypatch.setattr(workflow, "run", fail_after_saving)
+    headers = login(client)
+    job = submit(client, headers, key="exception-seal-key")
+    finished = wait_job(client, job["id"])
+    assert finished["reason_code"] == "internal_error" and finished["artifacts"] == []
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        finished = client.get(f"/api/jobs/{job['id']}").json()
+        if finished["data_package"]["state"] not in {"pending", "building"}:
+            break
+        time.sleep(0.01)
+    assert finished["data_package"]["state"] == "ready", finished
+    response = client.get(f"/api/jobs/{job['id']}/data-package")
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["package_result"]["reason_code"] == "internal_error"
+        assert archive.read("web/response.body") == b"<p>synthetic saved before exception</p>"
 
 
 def test_timeout_discards_late_package_and_seals_failure_archive(running, monkeypatch):

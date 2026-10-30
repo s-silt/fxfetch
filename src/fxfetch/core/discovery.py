@@ -456,6 +456,18 @@ def discover_html(
         parser.close()
     except (ValueError, AssertionError) as exc:
         raise FxfetchError("html_parse_failed", "Static HTML parse failed") from exc
+    if "browser_required" in parser.result.gaps:
+        from .script_package import script_package_candidates
+
+        try:
+            for candidate in script_package_candidates(text, source_url, maximum):
+                parser.add(candidate.url, action=candidate.action)
+        except FxfetchError as error:
+            if error.code != "browser_script_limit":
+                raise
+            # Optional literal discovery cannot turn an unprocessed script
+            # into package absence or prevent the existing Chrome handoff.
+            parser.result.gaps.append("script_package_incomplete")
     if any(item.action == "download_attribute" for item in parser.result.candidates):
         parser.result.candidates = [
             item

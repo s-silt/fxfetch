@@ -704,3 +704,47 @@ def test_sealing_failure_does_not_change_original_package_result(
     assert metadata["state"] == "failed"
     assert result["outcome"] == "downloaded"
     assert original.read_bytes() == b"original package"
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_metadata_replace_windows_reader_conflict_is_bounded(tmp_path, monkeypatch, recover):
+    from fxfetch.core.task_evidence import write_package_metadata
+
+    original = Path.replace
+    attempts = []
+
+    def busy_once(path, target):
+        attempts.append(path)
+        if not recover or len(attempts) == 1:
+            error = PermissionError(13, "synthetic sharing conflict")
+            error.winerror = 5
+            raise error
+        return original(path, target)
+
+    monkeypatch.setattr(Path, "replace", busy_once)
+    target = tmp_path / "metadata"
+    if recover:
+        write_package_metadata(target, {"state": "ready"})
+        assert len(attempts) == 2
+        assert json.loads((target / "metadata.json").read_text()) == {"state": "ready"}
+        assert not (target / "metadata.json.pending").exists()
+    else:
+        with pytest.raises(PermissionError):
+            write_package_metadata(target, {"state": "pending"})
+        assert len(attempts) == 3
+        assert not (target / "metadata.json").exists()
+
+
+def test_metadata_replace_unrelated_error_is_not_retried(tmp_path, monkeypatch):
+    from fxfetch.core.task_evidence import write_package_metadata
+
+    attempts = []
+
+    def failed(path, target):
+        attempts.append(path)
+        raise OSError(28, "synthetic disk full")
+
+    monkeypatch.setattr(Path, "replace", failed)
+    with pytest.raises(OSError):
+        write_package_metadata(tmp_path / "metadata", {"state": "pending"})
+    assert len(attempts) == 1

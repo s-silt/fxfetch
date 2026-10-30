@@ -1,6 +1,7 @@
 """Test-only bootstrap for the real task_worker inside its process limits.
 
-The sole transport substitution is a fixed synthetic origin. Production code
+The transport substitution is a fixed synthetic origin; HTTP preflight returns
+an explicit synthetic browser-required result without resolving a target. Production code
 never imports this module. Android control calls execute unchanged and are only
 observed so a failed cold start retains its original control error.
 """
@@ -22,6 +23,7 @@ from android_lease_acceptance import RecordedWorker
 
 from fxfetch.core.browser_gateway import BrowserGateway
 from fxfetch.core.errors import FxfetchError
+from fxfetch.core.workflow import WorkflowResult
 
 
 def main() -> None:
@@ -94,12 +96,19 @@ def main() -> None:
         gates.append(value)
         return value
 
+    def synthetic_preflight(self, url, output_dir, cancel, on_event=None):
+        assert url == "http://capture.test/api-page"
+        state["synthetic_http_preflight_calls"] = state.get("synthetic_http_preflight_calls", 0) + 1
+        save()
+        return WorkflowResult("failed", "browser_required", "partial")
+
     save()
     sys.argv = ["fxfetch.task_worker", str(args.request), str(args.result)]
     try:
         with (
             patch("fxfetch.core.browser_workflow.BrowserGateway", gateway),
             patch("fxfetch.core.browser_workflow.AndroidWorker", ObservedWorker),
+            patch("fxfetch.core.workflow.Workflow.run", synthetic_preflight),
         ):
             try:
                 runpy.run_module("fxfetch.task_worker", run_name="__main__")

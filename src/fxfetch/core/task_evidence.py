@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,16 @@ def write_package_metadata(directory: Path, value: dict[str, Any]) -> None:
         if is_reparse(path):
             raise EvidenceError("data_package_storage_path_invalid")
     pending.write_text(json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False), encoding="utf-8")
-    pending.replace(metadata)
+    for attempt in range(3):
+        try:
+            pending.replace(metadata)
+            break
+        except OSError as error:
+            # Windows readers can briefly deny replacement while polling. Do
+            # not replay writes or retry unrelated failures/permanent denial.
+            if getattr(error, "winerror", None) not in {5, 32, 33} or attempt == 2:
+                raise
+            time.sleep(0.02 * (attempt + 1))
 
 
 def package_metadata(

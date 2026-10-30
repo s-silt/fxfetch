@@ -12,6 +12,7 @@ from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from ..rejected_files import validation_record
 from .classify import classify_input
 from .discovery import Candidate, discover_html, discover_manifest_file
 from .download import classify_package
@@ -21,7 +22,14 @@ from .http_client import MAX_EVIDENCE_HEADER_BYTES, FetchedResponse, Hop, HttpCl
 from .landing_adapter import discover_landing
 from .limits import Limits
 from .offline import MAX_RESOURCE_BYTES, MAX_RESOURCE_TOTAL, MAX_RESOURCES, OfflineBundle, resource_references
-from .page_qr import MAX_DECODE_SECONDS, MAX_IMAGE_TOTAL, MAX_IMAGES, decode_saved_image, discover_images
+from .page_qr import (
+    BROWSER_RECOVERABLE_QR_GAPS,
+    MAX_DECODE_SECONDS,
+    MAX_IMAGE_TOTAL,
+    MAX_IMAGES,
+    decode_saved_image,
+    discover_images,
+)
 
 _DEFAULT_LIMITS = Limits()
 ANDROID_UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
@@ -181,7 +189,16 @@ class Workflow:
                 prefix = stream.read(4)
             if prefix in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
                 emit("file_verifying", chain, fetched.url, size=fetched.size)
-            return classify_package(fetched.path, self.limits)
+            try:
+                return classify_package(fetched.path, self.limits)
+            except FxfetchError as error:
+                validation = validation_record(error.code, fetched.url, fetched.headers.get('content-type', ''))
+                if validation and 200 <= fetched.status < 300:
+                    for body in result.bodies:
+                        if body.get('path') == str(fetched.path) and body.get('complete') is True:
+                            body.update(validation=validation, status_code=fetched.status,
+                                        content_type=fetched.headers.get('content-type', ''))
+                raise
 
         def hop_records(hops: tuple[Hop, ...], chain: str, first_request_id: int) -> list[dict[str, object]]:
             return [
@@ -974,7 +991,19 @@ class Workflow:
                         "html" in content_type
                         or data.lstrip().lower().startswith((b"<!doctype html", b"<html"))
                     ):
-                        choices = scan_page(data, fetched.url, jar, chain, content_type)
+                        try:
+                            choices = scan_page(data, fetched.url, jar, chain, content_type)
+                        except FxfetchError as error:
+                            qr_gaps = result.page_qr.get("gaps", [])
+                            if (
+                                error.code == "page_qr_incomplete"
+                                and "browser_required" in discovery.gaps
+                                and isinstance(qr_gaps, list)
+                                and qr_gaps
+                                and all(gap in BROWSER_RECOVERABLE_QR_GAPS for gap in qr_gaps)
+                            ):
+                                result.page_qr["browser_required"] = True
+                            raise
                         if (
                             len(choices) == 1
                             and choices[0].kind in ("direct_ipa", "itms_manifest")

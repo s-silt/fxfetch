@@ -26,6 +26,7 @@ from fxfetch.core.android_worker import PROBE_ID, AndroidWorker, load_worker_con
 from fxfetch.core.errors import FxfetchError
 from fxfetch.core.limits import Limits
 from fxfetch.core.process_limits import run_limited
+from fxfetch.core.task_evidence_verify import verify_task_archive
 from fxfetch.security import password_hash
 from fxfetch.service import JobService
 from fxfetch.web.api import create_app
@@ -171,6 +172,23 @@ def main() -> None:
                     assert child["gateway_count"] == 1
                     assert any(row["action"] == "begin" and row.get("returncode") == 0 for row in child["control_calls"])
                     assert any(row["action"] == "end" and row.get("returncode") == 0 for row in child["control_calls"])
+                    assert child["synthetic_http_preflight_calls"] == 1
+                    bundle_deadline = time.monotonic() + 30
+                    while job["data_package"]["state"] in {"pending", "building"}:
+                        assert time.monotonic() < bundle_deadline, "Data package seal exceeded deadline"
+                        time.sleep(0.1)
+                        job = client.get(f"/api/jobs/{identifier}").json()
+                    assert job["data_package"]["state"] == "ready", job["data_package"]
+                    response = client.get(f"/api/jobs/{identifier}/data-package")
+                    assert response.status_code == 200
+                    bundle_path = args.output / "task-data.zip"
+                    bundle_path.write_bytes(response.content)
+                    manifest, bundle_sha = verify_task_archive(bundle_path, max_bytes=32 * 1024**2)
+                    assert manifest["package_result"]["outcome"] == "downloaded"
+                    assert manifest["web_materials"]["count"] > 0
+                    assert all(row["sha256"] != expected_hash for row in manifest["files"])
+                    receipt.update(data_package_downloaded=True, data_package_sha256=bundle_sha,
+                                   data_package_material_count=manifest["web_materials"]["count"])
                     counts = dict(server.counts)
                     response = client.delete("/api/jobs", headers=headers)
                     assert response.status_code == 200 and client.get("/api/jobs").json()["jobs"] == []

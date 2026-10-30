@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,10 @@ from .text_decode import decode_html
 MAX_IMAGES = 8
 MAX_IMAGE_TOTAL = 20 * 1024 * 1024
 MAX_DECODE_SECONDS = 20.0
+# These are coverage gaps that a rendered page can recover from. Transport,
+# decoder, parser, request/time and safety failures are deliberately excluded.
+BROWSER_RECOVERABLE_QR_GAPS = frozenset({"page_qr_image_limit", "page_qr_image_source_unavailable"})
+_QR_HINT = re.compile(r"二维码|二維碼|qrcode|qr[-_\s]?code|erweima|(?:^|[^a-z0-9])qr(?:$|[^a-z0-9])", re.I)
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,16 @@ class _Images(BoundedHTMLParser):
         self.result = ImageDiscovery()
         self.has_base = False
         self.count = 0
+        # Metadata is bounded by the HTML byte/node budgets. All retained inline
+        # payloads together decode to at most 3/4 of the 8 MiB HTML byte cap;
+        # this is base64 decoding only, never image/pixel decompression.
+        self.unique: dict[str, tuple[ImageReference, bool]] = {}
+
+    def add_image(self, key: str, image: ImageReference, hinted: bool) -> None:
+        previous = self.unique.get(key)
+        # A later semantic occurrence can promote an already seen image without
+        # consuming another fetch/decode slot or losing its first DOM index.
+        self.unique[key] = (previous[0] if previous else image, hinted or bool(previous and previous[1]))
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.start_budget(tag, attrs)
@@ -65,10 +80,11 @@ class _Images(BoundedHTMLParser):
                 ImageReference(self.count, self.source, skip_reason="tracking_image_skipped")
             )
             return
-        if len([item for item in self.result.images if not item.skip_reason]) >= MAX_IMAGES:
-            self.result.gaps.append("page_qr_image_limit")
-            return
         raw = values.get("src") or ""
+        hints = " ".join(values.get(key) or "" for key in ("alt", "title", "id", "class"))
+        if not raw.startswith("data:"):
+            hints += " " + raw
+        hinted = bool(_QR_HINT.search(hints))
         if not raw:
             self.result.gaps.append("page_qr_image_source_unavailable")
             return
@@ -84,15 +100,15 @@ class _Images(BoundedHTMLParser):
             except binascii.Error:
                 self.result.gaps.append("page_qr_data_invalid")
                 return
-            self.result.images.append(ImageReference(self.count, self.source, data=decoded))
+            self.add_image("data:" + hashlib.sha256(decoded).hexdigest(),
+                           ImageReference(self.count, self.source, data=decoded), hinted)
             return
         try:
             url = validate_url(urljoin(self.source, raw))
         except FxfetchError:
             self.result.gaps.append("page_qr_image_url_invalid")
             return
-        if not any(item.url == url for item in self.result.images):
-            self.result.images.append(ImageReference(self.count, self.source, url=url))
+        self.add_image(url, ImageReference(self.count, self.source, url=url), hinted)
 
     def handle_endtag(self, tag: str) -> None:
         self.end_budget(tag)
@@ -112,11 +128,13 @@ def discover_images(
         parser.close()
     except (ValueError, UnicodeError, AssertionError) as error:
         raise FxfetchError("page_qr_html_invalid", "Page image discovery failed") from error
-    if parser.has_base and parser.result.images:
+    images = sorted(parser.unique.values(), key=lambda item: not item[1])
+    if parser.has_base and images:
         parser.result.gaps.append("page_qr_base_unsupported")
-        parser.result.images = [
-            item for item in parser.result.images if item.data is not None or item.skip_reason
-        ]
+        images = [item for item in images if item[0].data is not None]
+    if len(images) > MAX_IMAGES:
+        parser.result.gaps.append("page_qr_image_limit")
+    parser.result.images.extend(item[0] for item in images[:MAX_IMAGES])
     parser.result.gaps = list(dict.fromkeys(parser.result.gaps))
     return parser.result
 

@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import urldefrag, urlsplit
 
 from filelock import FileLock
@@ -36,6 +36,7 @@ from .core.task_evidence import (
 from .core.task_evidence_recorder import TaskEvidenceRecorder
 from .core.web_apk import WebApkBuilder, derive_names
 from .core.workflow import Workflow
+from .rejected_files import open_rejected_file, rejected_files
 from .security import contained_path
 from .store import TERMINAL, Store, json_text
 
@@ -246,6 +247,8 @@ class JobService:
 
     def get_job(self, owner: str, identifier: str) -> dict:
         job = self.store.get_job(owner, identifier)
+        job['rejected_files'] = [item.metadata for item in rejected_files(
+            job, self.store.root / 'jobs' / identifier, self.settings.limits.max_package_bytes)]
         job.pop("owner", None)
         if job["state"] == "queued":
             job["progress"] = self._queued_progress(job, self.settings.limits.chain_timeout)
@@ -316,6 +319,11 @@ class JobService:
             )
         job["analyses"] = self.analysis.list(owner, identifier)
         return job
+
+    def rejected_file(self, owner: str, identifier: str, file_id: str) -> tuple[BinaryIO, dict]:
+        job = self.store.get_job(owner, identifier)
+        return open_rejected_file(job, self.store.root / 'jobs' / identifier, file_id,
+                                  self.settings.limits.max_package_bytes)
 
     def data_package_file(self, owner: str, identifier: str) -> tuple[Path, str]:
         job = self.store.get_job(owner, identifier)
@@ -484,7 +492,18 @@ class JobService:
 
     def cancel_job(self, owner: str, identifier: str) -> dict:
         with self._mutex:
+            was_queued = self.store.get_job(owner, identifier)["state"] == "queued"
             self.store.cancel_queued_job(owner, identifier)
+            if was_queued:
+                # No acquisition ran and no archive is promised for this path.
+                # Do not leave pending metadata looking like an interrupted seal.
+                try:
+                    write_package_metadata(
+                        package_directory(self.store.root / "jobs" / identifier), {"state": "unavailable"},
+                    )
+                except (OSError, ValueError) as error:
+                    log.error("data_package_cancel_state_failed id=%s exception_type=%s",
+                              identifier, type(error).__name__)
             if identifier in self._cancels:
                 self._cancels[identifier].set()
         return self.get_job(owner, identifier)
@@ -747,6 +766,13 @@ class JobService:
             self._data_package_active.add(job["id"])
         try:
             self._collect_claimed(job, cancel)
+        except Exception as error:
+            log.error("worker_error kind=collect id=%s exception_type=%s", job["id"], type(error).__name__)
+            failure = {"outcome": "failed", "reason_code": "internal_error", "coverage": "incomplete"}
+            self.store.finish_job(job["id"], "completed", failure)
+            # Keep archive ownership until the terminal failure and any already
+            # recorded materials have gone through the normal bounded finalizer.
+            self._seal_data_package(job, failure)
         finally:
             with self._mutex:
                 self._data_package_active.discard(job["id"])

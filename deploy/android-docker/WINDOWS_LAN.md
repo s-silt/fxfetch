@@ -43,3 +43,7 @@ Compose 使用 `--no-build --pull never --no-recreate --wait --wait-timeout 300`
 核对实际 PortBindings、Windows 监听、镜像 ID、API Origin、匿名请求拒绝和错误 Host 拒绝，再从第二台 LAN 设备完成登录及下载字节校验。
 
 启动器输出 `android_download_verified=false`：启动成功不等于 Chrome 下载验收。Docker NAT 可能将所有客户端变成网关 peer，API 不信任转发头，来源限制依靠转发前的宿主防火墙。保持无路由器公网映射；上游 NAT 若改写为允许的 LAN 来源，应用无法恢复原始来源。
+
+## 下载显示 100% 但未完成
+
+先查看 Chrome 下载详情。如果显示“由于网站未使用安全连接”而阻止下载，这是浏览器对 HTTP 下载的安全判定；服务器已经传完、长度和哈希正确，也不代表浏览器已保存最终文件。不要据此重复采集或调整服务器读取上限。受信任 HTTPS 入口需要另行配置并验证证书、Host/Origin、局域网防火墙及附件下载；当前启动器不会自动启用 HTTPS，也不会更改 Chrome 安全设置。
