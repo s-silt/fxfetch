@@ -121,7 +121,10 @@ class BrowserWorkflow:
             preflight = self.static.run(url, output_dir / "http", cancel, http_event)
             dynamic = preflight.reason_code in {
                 "browser_required", "challenge_detected", "device_verification_required",
-            }
+            } or (
+                preflight.reason_code == "page_qr_incomplete"
+                and preflight.page_qr.get("browser_required") is True
+            )
             browser_recoverable_response = preflight.reason_code in {"http_status", "http_access_control"} and any(
                 hop.get("status") in {403, 429, 502, 503} for hop in preflight.hops
             )
@@ -208,6 +211,7 @@ class BrowserWorkflow:
             result.landing["http_resolution"] = {
                 "outcome": preflight.outcome, "reason_code": preflight.reason_code,
                 "coverage": preflight.coverage, "new_browser_session": True, "cookies_inherited": False,
+                "page_qr": preflight.page_qr,
             }
             if not result.offline.get("available") and preflight.offline.get("available"):
                 result.offline = preflight.offline

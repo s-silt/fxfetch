@@ -1,0 +1,12 @@
+# Apply after the base/API builder compose files. Build the base image first.
+services:
+  api:
+    image: fxfetch-android-api-analysis:local
+    build:
+      context: ../..
+      dockerfile: deploy/android-docker/Dockerfile.analysis
+      target: analysis
+      args:
+        BASE_IMAGE: ${FXFETCH_ANALYSIS_BASE_IMAGE:-fxfetch-android-api-builder:local}
+    environment:
+      FXFETCH_FXAPK: /opt/fxapk-venv/bin/fxapk

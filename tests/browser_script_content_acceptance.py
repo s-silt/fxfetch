@@ -5,8 +5,17 @@ import threading
 from urllib.parse import urlsplit
 
 import pytest
-from browser_capture_acceptance import APK, PNG, Handler, SyntheticProxy
+from browser_capture_acceptance import (
+    APK,
+    PNG,
+    Handler,
+    SyntheticProxy,
+    assert_package_journal,
+    synthetic_sdk_payload,
+)
 from browser_capture_acceptance import run_capture as capture_fixture
+
+from fxfetch.core.web_journal import EvidenceJournal
 
 run_capture = capture_fixture
 
@@ -43,7 +52,7 @@ class ContentHandler(Handler):
         elif path == "/content-package.apk":
             self.server.counts[path] += 1
             allowed = "fx_gate=1" in self.headers.get("Cookie", "") and self.server.counts[path] == 1
-            self.respond(200 if allowed else 403, APK if allowed else b"Ticket invalid", "application/vnd.android.package-archive")
+            self.respond(200 if allowed else 403, self.server.payload if allowed else b"Ticket invalid", "application/vnd.android.package-archive")
         elif path == "/denied.html":
             self.server.counts[path] += 1
             self.respond(403, b"Verification required")
@@ -69,9 +78,17 @@ def proxy():
         thread.join(2)
 
 
-def test_disclosed_content_chain_preserves_cookie_and_single_use_package(run_capture, proxy):
-    result, events = run_capture("/script-gate")
-    assert result.outcome == "downloaded" and result.artifacts[0].path.read_bytes() == APK, result
+@pytest.mark.parametrize("with_journal", [False, True], ids=["plain", "package-journal-sdk"])
+def test_disclosed_content_chain_preserves_cookie_and_single_use_package(run_capture, proxy, tmp_path, with_journal):
+    payload = synthetic_sdk_payload() if with_journal else APK
+    proxy.payload = payload
+    journal = EvidenceJournal(tmp_path / "package-observations.jsonl", "browser", "package-content-sdk") if with_journal else None
+    try:
+        result, events = run_capture("/script-gate", purpose="package", journal=journal)
+    finally:
+        if journal is not None:
+            journal.close()
+    assert result.outcome == "downloaded" and result.artifacts[0].path.read_bytes() == payload, result
     assert proxy.counts["/content.html"] == proxy.counts["/content-package.apk"] == 1
     assert proxy.counts["/function-called"] == 0
     assert "page_challenge_observed" in result.gaps
@@ -79,6 +96,9 @@ def test_disclosed_content_chain_preserves_cookie_and_single_use_package(run_cap
     assert any(row.get("continuation") == "explicit_script_content_link" and row.get("verification_passed") is False
                for row in events)
     assert any(row.get("mechanism") == "script_content_link" and row.get("same_browser_session") for row in events)
+    if journal is not None:
+        assert_package_journal(journal, ("/script-gate", "/content.html", "/content-package.apk"),
+                               allow_inline_url_omission=True)
 
 
 @pytest.mark.parametrize("path,reason", [

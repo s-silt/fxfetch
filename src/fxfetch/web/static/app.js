@@ -40,6 +40,10 @@
     flutter_source_limit:"Flutter 页面资源超过本次读取上限，尚未确认原包地址。",
     flutter_main_reference_unknown:"Flutter 启动配置没有可确认的主脚本地址，尚未确认原包地址。",
     package_verified:"已取得完整应用包，文件完整性检查通过。",
+    archive_invalid:"文件已接收，但应用包结构或完整性校验失败，未计为成功取得原包。",
+    archive_unsupported:"文件已接收，但其归档格式无法完成校验，未计为成功取得原包。",
+    archive_limit:"文件已接收，但包校验超过检查限额，未计为成功取得原包。",
+    archive_ambiguous:"文件已接收，但应用包结构存在歧义，未计为成功取得原包。",
     landing_candidate_discovered:"已从页面下载配置找到真实地址，继续验证应用包。",
     tls_handshake_failed:"下载节点的 TLS 连接中断，本次节点未取得文件。",tls_verification_failed:"目标证书校验失败，已停止访问。",
     challenge_detected:"观察到实际验证页面或访问控制，尚未取得原包；此状态不能判断网站性质。",
@@ -367,71 +371,27 @@
     }
     container.append(panel);
   }
-  function renderJob() {
-    const job = state.job, content = $("job-content");
-    content.replaceChildren();
-    content.hidden = !job;
-    $("job-empty").hidden = !!job;
-    if (!job) return;
-    const heading = node("div", "job-heading");
-    heading.append(badge(labels[job.state] || "任务", activeStates.has(job.state) ? "busy" : ""));
-    if (activeStates.has(job.state)) {
-      const cancel = node("button", "text-button", "取消采集");
-      cancel.type = "button";
-      cancel.onclick = () => cancelJob(job.id, cancel);
-      heading.append(cancel);
+  function renderRejectedFiles(job, content) {
+    const files = (job.rejected_files || []).filter((file) => file.validation_status === "failed");
+    if (!files.length) return;
+    const panel = node("section", "details download-files rejected-files");
+    panel.append(node("h3", "", "原文件 · 校验失败"));
+    panel.append(node("p", "result-note", "文件已完整接收，但未通过包校验。可下载原始字节；任务仍保留校验失败，不代表有效 APK/IPA。"));
+    for (const file of files) {
+      const row = node("div", "file-card");
+      const info = node("div", "file-info");
+      info.append(node("strong", "", file.filename || "原文件"));
+      info.append(node("small", "", `校验失败 · ${bytes(file.size)}`));
+      const link = node("a", "file-link", "下载原文件（校验失败）");
+      link.href = `/api/jobs/${encodeURIComponent(job.id)}/rejected-files/${encodeURIComponent(file.id)}`;
+      link.setAttribute("download", "");
+      row.append(info, link);
+      panel.append(row);
+      panel.append(node("p", "muted", friendly(file.reason_code)));
     }
-    content.append(heading, node("p", "job-url", job.input?.entry_url || ""));
-    content.append(node("p", "", `原包结果：${labels[job.outcome] || "尚未取得结论"}`));
-    const artifacts = job.artifacts || [];
-    if (artifacts.length) {
-      const files = node("section", "details download-files");
-      files.append(node("h3", "", "应用文件（单独下载）"));
-      for (const artifact of artifacts) files.append(downloadFile(job, artifact));
-      content.append(files);
-    }
-    renderProgress(job, content);
-    FxfetchDataPackage.render(job, content, {node, bytes, friendly});
-    FxfetchAnalysis.render(job, content, {
-      node, friendly, capability:state.capabilities?.web_analysis,
-      submitting:!!state.pendingAnalyses.get(job.id)?.busy,
-      onStart:(button) => submitAnalysis(job, button),
-      onCancel:(id, button) => cancelAnalysis(job.id, id, button)
-    });
-    const result = job.result || {};
-    if ((result.network_attempts || []).length) {
-      const network = node("section", "details network-attempts");
-      network.append(node("h3", "", "网络尝试记录"));
-      for (const attempt of result.network_attempts) {
-        const detail = attempt.result || {};
-        network.append(node("p", "", `${attempt.network_mode === "proxy" ? "本机代理" : "直连"} · ${labels[detail.outcome] || "未完成"}${result.network_attempts.length > 1 ? " · " + friendly(detail.reason_code) : ""}`));
-      }
-      if (result.network_attempts.length > 1) network.append(node("p", "muted", "代理尝试使用独立访问，直连结果保留，不继承页面登录状态。"));
-      content.append(network);
-    }
-    const reason = result.reason_code || job.reason_code;
-    const collectorLabel = {http:"静态 HTTP 采集",android_chrome:"Android Chrome 采集",android_chrome_unavailable:"Android Chrome 未能启动"}[result.collector_mode];
-    if (collectorLabel) content.append(node("p", "muted", collectorLabel));
-    if (reason) content.append(node("p", "result-note", job.download_selection_unavailable ? "这条旧记录没有保存可继续的候选，请重新提交入口。" : friendly(reason)));
-    if (result.coverage) content.append(node("p", "muted", `覆盖范围：${labels[result.coverage] || "存在未完成范围"}`));
-    if (job.outcome !== "downloaded") {
-      if (result.offline?.available) content.append(node("p", "offline-status", "已有离线页面内容。离线可用范围取决于已保存的内容，不代表网站业务可离线运行。"));
-      else if (!activeStates.has(job.state)) content.append(node("p", "offline-status", "未取得网站离线内容。联网入口与原采集结果保留。"));
-    }
-    if ((result.attempts || []).length) {
-      const attempts = node("section", "details");
-      attempts.append(node("h3", "", "链路记录"));
-      for (const attempt of result.attempts) {
-        const line = node("div", "attempt");
-        line.append(node("strong", "", attempt.chain === "android" ? "Android" : "iPhone"));
-        const discoveryEvent = !attempt.outcome && ["candidate_discovered","landing_candidate_discovered"].includes(attempt.reason_code);
-        line.append(node("span", "", `${discoveryEvent ? "已发现下载地址" : labels[attempt.outcome] || "继续处理中"} · ${labels[attempt.coverage] || "范围待确认"}`));
-        if (attempt.reason_code && attempt.reason_code !== "candidate_discovered") line.append(node("p", "muted", friendly(attempt.reason_code)));
-        attempts.append(line);
-      }
-      content.append(attempts);
-    }
-    renderContinuation(job, content);
+    content.append(panel);
+  }
+  function renderBuildPanel(job, content, artifacts) {
     const candidates = job.web_candidates || [];
     if (candidates.length && job.outcome !== "downloaded") {
       const panel = node("section", "build-panel");
@@ -480,6 +440,74 @@
       }
       content.append(panel);
     }
+  }
+  function renderJob() {
+    const job = state.job, content = $("job-content");
+    content.replaceChildren();
+    content.hidden = !job;
+    $("job-empty").hidden = !!job;
+    if (!job) return;
+    const heading = node("div", "job-heading");
+    heading.append(badge(labels[job.state] || "任务", activeStates.has(job.state) ? "busy" : ""));
+    if (activeStates.has(job.state)) {
+      const cancel = node("button", "text-button", "取消采集");
+      cancel.type = "button";
+      cancel.onclick = () => cancelJob(job.id, cancel);
+      heading.append(cancel);
+    }
+    content.append(heading, node("p", "job-url", job.input?.entry_url || ""));
+    content.append(node("p", "", `原包结果：${labels[job.outcome] || "尚未取得结论"}`));
+    const artifacts = job.artifacts || [];
+    if (artifacts.length) {
+      const files = node("section", "details download-files");
+      files.append(node("h3", "", "应用文件（单独下载）"));
+      for (const artifact of artifacts) files.append(downloadFile(job, artifact));
+      content.append(files);
+    }
+    renderRejectedFiles(job, content);
+    renderBuildPanel(job, content, artifacts);
+    renderProgress(job, content);
+    FxfetchDataPackage.render(job, content, {node, bytes, friendly});
+    FxfetchAnalysis.render(job, content, {
+      node, friendly, capability:state.capabilities?.web_analysis,
+      submitting:!!state.pendingAnalyses.get(job.id)?.busy,
+      onStart:(button) => submitAnalysis(job, button),
+      onCancel:(id, button) => cancelAnalysis(job.id, id, button)
+    });
+    const result = job.result || {};
+    if ((result.network_attempts || []).length) {
+      const network = node("section", "details network-attempts");
+      network.append(node("h3", "", "网络尝试记录"));
+      for (const attempt of result.network_attempts) {
+        const detail = attempt.result || {};
+        network.append(node("p", "", `${attempt.network_mode === "proxy" ? "本机代理" : "直连"} · ${labels[detail.outcome] || "未完成"}${result.network_attempts.length > 1 ? " · " + friendly(detail.reason_code) : ""}`));
+      }
+      if (result.network_attempts.length > 1) network.append(node("p", "muted", "代理尝试使用独立访问，直连结果保留，不继承页面登录状态。"));
+      content.append(network);
+    }
+    const reason = result.reason_code || job.reason_code;
+    const collectorLabel = {http:"静态 HTTP 采集",android_chrome:"Android Chrome 采集",android_chrome_unavailable:"Android Chrome 未能启动"}[result.collector_mode];
+    if (collectorLabel) content.append(node("p", "muted", collectorLabel));
+    if (reason) content.append(node("p", "result-note", job.download_selection_unavailable ? "这条旧记录没有保存可继续的候选，请重新提交入口。" : friendly(reason)));
+    if (result.coverage) content.append(node("p", "muted", `覆盖范围：${labels[result.coverage] || "存在未完成范围"}`));
+    if (job.outcome !== "downloaded") {
+      if (result.offline?.available) content.append(node("p", "offline-status", "已有离线页面内容。离线可用范围取决于已保存的内容，不代表网站业务可离线运行。"));
+      else if (!activeStates.has(job.state)) content.append(node("p", "offline-status", "未取得网站离线内容。联网入口与原采集结果保留。"));
+    }
+    if ((result.attempts || []).length) {
+      const attempts = node("section", "details");
+      attempts.append(node("h3", "", "链路记录"));
+      for (const attempt of result.attempts) {
+        const line = node("div", "attempt");
+        line.append(node("strong", "", attempt.chain === "android" ? "Android" : "iPhone"));
+        const discoveryEvent = !attempt.outcome && ["candidate_discovered","landing_candidate_discovered"].includes(attempt.reason_code);
+        line.append(node("span", "", `${discoveryEvent ? "已发现下载地址" : labels[attempt.outcome] || "继续处理中"} · ${labels[attempt.coverage] || "范围待确认"}`));
+        if (attempt.reason_code && attempt.reason_code !== "candidate_discovered") line.append(node("p", "muted", friendly(attempt.reason_code)));
+        attempts.append(line);
+      }
+      content.append(attempts);
+    }
+    renderContinuation(job, content);
     if (busy(job)) content.append(node("p", "refresh-note", "正在自动更新 · 离开当前页面后暂停轮询"));
     else content.append(node("p", "refresh-note", "任务已停止更新，刷新会清空当前会话记录。"));
   }
@@ -716,15 +744,24 @@
     if (!pending) { pending = {key:idempotencyKey(),busy:false}; state.pendingAnalyses.set(job.id,pending); }
     if (pending.busy) return;
     pending.busy = true; button.disabled = true;
+    let submitted = false;
     try {
-      await api(`/api/jobs/${encodeURIComponent(job.id)}/analyses`, {method:"POST",body:{},headers:{"Idempotency-Key":pending.key}});
+      const analysis = await api(`/api/jobs/${encodeURIComponent(job.id)}/analyses`, {method:"POST",body:{},headers:{"Idempotency-Key":pending.key}});
       if (epoch !== state.epoch || !state.authenticated) return;
+      // A successful POST is already authoritative. Keep its active state even
+      // when the following list/detail read fails, so the normal bounded polling
+      // cadence can recover without submitting another analysis.
+      job.analyses = [...(job.analyses || []).filter(item => item.id !== analysis.id), analysis];
+      if (state.job?.id === job.id) state.job.analyses = job.analyses;
+      const summary = state.jobs.find(item => item.id === job.id);
+      if (summary) summary.active_analyses = job.analyses.filter(item => activeStates.has(item.state)).length;
+      submitted = true;
       state.pendingAnalyses.delete(job.id); state.pollDelay = 1500;
       await loadJobs(); notice("离线分析已提交，原采集结果不变。刷新清空会取消本会话未完成的分析。");
     } catch (error) {
       if (epoch !== state.epoch || !state.authenticated) return;
       if (error.status && error.status < 500) state.pendingAnalyses.delete(job.id);
-      notice(error.message + (state.pendingAnalyses.has(job.id) ? " 再次点击将重试同一次提交，不会重复创建分析。" : ""),true);
+      notice((submitted ? "离线分析已提交，暂时未能获取进度，将自动重试读取。 " : "") + error.message + (state.pendingAnalyses.has(job.id) ? " 再次点击将重试同一次提交，不会重复创建分析。" : ""),true);
     } finally { pending.busy = false; if (state.job?.id === job.id) renderJob(); schedule(); }
   }
   async function cancelAnalysis(job, id, button) {

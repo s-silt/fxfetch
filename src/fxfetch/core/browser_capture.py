@@ -17,6 +17,7 @@ from urllib.parse import urljoin, urlsplit
 from playwright.async_api import Browser, BrowserContext, ElementHandle, Frame, Page, Route, async_playwright
 from playwright.async_api import Error as PlaywrightError
 
+from ..rejected_files import validation_record
 from .browser_click_state import write_click_state
 from .browser_dom_links import OBSERVE_PACKAGE_LINKS, observed_package_candidates
 from .browser_progress import BrowserProgress
@@ -304,6 +305,7 @@ async def capture_browser(
             size = 0
             digest = hashlib.sha256()
             last_progress = 0.0
+            transfer_complete = False
             emit("download_started", url, received_bytes=0, total_bytes=expected, package_unverified=True)
             try:
                 with partial.open("xb") as output:
@@ -353,6 +355,7 @@ async def capture_browser(
                         raise FxfetchError("length_mismatch", "Browser candidate transfer length mismatch")
                 check()
                 emit("file_verifying", url, size=size)
+                transfer_complete = True
                 kind = classify_package(partial, limits)
                 if kind is None or kind != ("apk" if chain == "android" else "ipa"):
                     raise FxfetchError(
@@ -387,14 +390,21 @@ async def capture_browser(
                 # Taken streams cannot be resumed: terminate the original request.
                 await send(session, "Fetch.failRequest", {"requestId": request_id, "errorReason": "Aborted"})
                 done.set()
-            except (FxfetchError, OSError, ValueError, asyncio.CancelledError):
+            except (FxfetchError, OSError, ValueError, asyncio.CancelledError) as error:
                 if partial.is_file():
+                    validation = validation_record(
+                        error.code, url, headers.get('content-type', '')
+                    ) if isinstance(error, FxfetchError) and transfer_complete else None
                     result.partials.append(
                         {
                             "path": str(partial),
                             "size": size,
                             "sha256": digest.hexdigest(),
-                            "hash_scope": "saved_prefix",
+                            "hash_scope": "decoded_browser_response" if validation else "saved_prefix",
+                            "complete": bool(validation),
+                            **({"validation": validation, "url": url, "chain": chain,
+                                "status_code": event.get('responseStatusCode'),
+                                "content_type": headers.get('content-type', '')} if validation else {}),
                         }
                     )
                 emit(

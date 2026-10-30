@@ -1,0 +1,12 @@
+# Optional layer for an already built API/browser or API/builder image.
+ARG BASE_IMAGE=fxfetch-android-api-builder:local
+FROM ${BASE_IMAGE} AS analysis
+USER root
+COPY deploy/android-docker/requirements-analysis.lock /opt/fxfetch/requirements-analysis.lock
+# Separate interpreter keeps fxapk dependencies out of the acquisition service.
+RUN python -m venv /opt/fxapk-venv \
+    && /opt/fxapk-venv/bin/python -m pip install --no-deps --no-cache-dir --only-binary=:all: \
+       --retries 0 --timeout 30 -r /opt/fxfetch/requirements-analysis.lock \
+    && /opt/fxapk-venv/bin/python -m pip check
+ENV FXFETCH_FXAPK=/opt/fxapk-venv/bin/fxapk
+USER 10001:10001

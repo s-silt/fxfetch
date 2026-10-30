@@ -10,6 +10,7 @@ from .errors import FxfetchError
 from .guard import validate_url
 from .http_client import HttpClient
 from .limits import Limits
+from .web_evidence_io import create_private_evidence_directory
 from .web_http import collect_http
 from .web_journal import EvidenceJournal
 from .web_materials import WebCaptureResult, now_utc, save_summary
@@ -37,7 +38,7 @@ def capture_web(
         raise FxfetchError("capture_output_exists", "Capture output directory already exists")
     if not output.parent.is_dir():
         raise FxfetchError("capture_parent_missing", "Capture output parent directory is unavailable")
-    output.mkdir()
+    create_private_evidence_directory(output)
     result = WebCaptureResult(
         capture_id=uuid.uuid4().hex,
         entry_url=approved_url,

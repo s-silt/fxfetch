@@ -13,6 +13,7 @@ from .limits import Limits
 from .web_evidence_io import (
     check_ancestors,
     contained,
+    create_private_evidence_directory,
     digest,
     directory_inventory,
     is_reparse,
@@ -177,7 +178,7 @@ def export_web(capture_dir: Path, output_dir: Path, limits: Limits) -> tuple[dic
     created_files: list[Path] = []
     created_dirs: list[Path] = []
     try:
-        destination.mkdir()
+        create_private_evidence_directory(destination)
         created_dirs.append(destination)
         for record in records:
             _copy_record(source, destination, record, limits, created_files, created_dirs)

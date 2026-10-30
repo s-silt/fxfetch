@@ -8,12 +8,19 @@ import time
 from urllib.parse import urlsplit
 
 import pytest
-from browser_capture_acceptance import APK, Handler, SyntheticProxy
+from browser_capture_acceptance import (
+    APK,
+    Handler,
+    SyntheticProxy,
+    assert_package_journal,
+    synthetic_sdk_payload,
+)
 from browser_capture_acceptance import run_capture as capture_fixture
 
 from fxfetch.core import browser_capture
 from fxfetch.core.cdp_transport import CDPCommandError, CDPMux
 from fxfetch.core.limits import Limits
+from fxfetch.core.web_journal import EvidenceJournal
 
 run_capture = capture_fixture
 
@@ -239,7 +246,8 @@ def test_repeated_heartbeat_stops_without_waiting_for_task_timeout(run_capture, 
     assert proxy.counts["/heartbeat"] >= 3
 
 
-def test_navigation_discards_old_image_without_failing_new_download(run_capture, proxy, monkeypatch):
+@pytest.mark.parametrize("with_journal", [False, True], ids=["plain", "package-journal-sdk"])
+def test_navigation_discards_old_image_without_failing_new_download(run_capture, proxy, monkeypatch, tmp_path, with_journal):
     original = CDPMux.send
     discarded = []
 
@@ -260,12 +268,21 @@ def test_navigation_discards_old_image_without_failing_new_download(run_capture,
             raise
 
     monkeypatch.setattr(CDPMux, "send", delayed)
-    result, _events = run_capture("/stale-image-page")
+    payload = synthetic_sdk_payload() if with_journal else APK
+    proxy.payload = payload
+    journal = EvidenceJournal(tmp_path / "package-observations.jsonl", "browser", "package-resource-sdk") if with_journal else None
+    try:
+        result, _events = run_capture("/stale-image-page", purpose="package", journal=journal)
+    finally:
+        if journal is not None:
+            journal.close()
     assert discarded == ["interception_gone"]
-    assert result.outcome == "downloaded" and result.artifacts[0].path.read_bytes() == APK, result
+    assert result.outcome == "downloaded" and result.artifacts[0].path.read_bytes() == payload, result
     assert proxy.counts["/stale-image.png"] == proxy.counts["/app.apk"] == 1
     assert "browser_resource_interception_expired" in result.gaps
     assert any(row.get("delivered_to_browser") is False for row in result.bodies)
+    if journal is not None:
+        assert_package_journal(journal, ("/stale-image-page", "/stale-image.png", "/stale-image-next", "/app.apk"))
 
 
 @pytest.mark.parametrize("path,outcome", [("/expired-dispatch", "downloaded"), ("/expired-package-dispatch", "failed")])

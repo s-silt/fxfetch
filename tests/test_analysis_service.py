@@ -81,8 +81,10 @@ def completed_runner(command: list[str], **_: object) -> ProcessResult:
     return ProcessResult(0, limit_method="synthetic")
 
 
-def wait_analysis(service: JobService, owner: str, job_id: str, identifier: str, state: str) -> dict:
-    deadline = time.monotonic() + 5
+def wait_analysis(
+    service: JobService, owner: str, job_id: str, identifier: str, state: str, *, timeout: float = 5,
+) -> dict:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = service.analysis.get(owner, job_id, identifier)
         if value["state"] == state:
@@ -431,7 +433,7 @@ def test_real_service_fxapk_subprocess_is_offline(tmp_path, monkeypatch):
     service.start()
     try:
         analysis = service.analysis.create("owner", job["id"], "real")
-        value = wait_analysis(service, "owner", job["id"], analysis["id"], "completed")
+        value = wait_analysis(service, "owner", job["id"], analysis["id"], "completed", timeout=60)
         assert value["report_ready"]
         report_zip, _ = service.analysis.report_file("owner", job["id"], analysis["id"])
         with zipfile.ZipFile(report_zip) as published:

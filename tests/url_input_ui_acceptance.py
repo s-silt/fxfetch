@@ -14,6 +14,7 @@ from browser_capture_acceptance import APK
 from playwright.sync_api import sync_playwright
 
 from fxfetch.config import Settings
+from fxfetch.core.task_evidence_verify import verify_task_archive
 from fxfetch.core.workflow import Workflow, WorkflowResult
 from fxfetch.security import password_hash
 from fxfetch.service import JobService
@@ -109,6 +110,22 @@ def main() -> None:
                 while len(workflow.entries) <= index and time.monotonic() < deadline:
                     time.sleep(0.01)
                 assert workflow.entries[index] == expected
+            bundle_link = page.get_by_role("link", name="下载数据包", exact=True)
+            bundle_link.wait_for(state="visible", timeout=15000)
+            bundle_url = bundle_link.get_attribute("href")
+            assert bundle_url and bundle_url.endswith("/data-package")
+            with page.expect_download() as bundle_download:
+                bundle_link.click()
+            bundle_path = output / "task-data.zip"
+            bundle_download.value.save_as(bundle_path)
+            manifest, _ = verify_task_archive(bundle_path, max_bytes=16 * 1024 * 1024)
+            assert manifest["package_result"]["outcome"] == "failed"
+            assert len(workflow.entries) == len(cases)
+            stranger = browser.new_context()
+            try:
+                assert stranger.request.get(origin + bundle_url).status == 401
+            finally:
+                stranger.close()
             page.locator("#url").fill("javascript:alert(1)")
             with page.expect_response(lambda response: response.url.endswith("/api/preview")) as rejected:
                 page.locator("#download-button").click()
@@ -123,7 +140,7 @@ def main() -> None:
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             page.screenshot(path=str(output / "mobile.png"), full_page=True)
             browser.close()
-        receipt = {"passed": True, "normalized_cases": len(cases), "rejected_foreign_scheme": True, "target_requests": 0, "frontend_direct_download_verified": True, "synthetic_download_requests": 1, "collection": "injected_synthetic_workflow", "output": str(output)}
+        receipt = {"passed": True, "normalized_cases": len(cases), "rejected_foreign_scheme": True, "target_requests": 0, "frontend_direct_download_verified": True, "data_package_download_verified": True, "data_package_unauthenticated_rejected": True, "synthetic_download_requests": 1, "collection": "injected_synthetic_workflow", "output": str(output)}
         (output / "result.json").write_text(json.dumps(receipt, indent=2) + "\n")
         print(json.dumps(receipt))
     finally:

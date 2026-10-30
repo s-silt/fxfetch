@@ -279,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, self.server.payload, "application/octet-stream")
         elif path in {"/app.apk", "/a.apk", "/b.apk", "/declared.apk"}:
             self.server.package_started.set()
-            self.respond(200, APK, "application/octet-stream")
+            self.respond(200, self.server.payload, "application/octet-stream")
         elif path == "/truncated.apk":
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
@@ -396,6 +396,31 @@ def test_web_capture_is_passive_and_journals_browser_context(run_capture, proxy,
     assert any(row["kind"] == "network_request_observed" for row in rows)
     bodies = [row for row in rows if row["kind"] == "response_body_saved"]
     assert bodies and all(row["fields"]["request_ref"].startswith("browser:") for row in bodies)
+
+
+def test_complete_invalid_package_records_rejected_download_proof(run_capture, proxy, tmp_path):
+    from test_rejected_files import bad_apk
+
+    from fxfetch.core.browser_workflow import project_capture
+    from fxfetch.rejected_files import open_rejected_file, rejected_files
+
+    proxy.payload = bad_apk()
+    result, _ = run_capture('/app.apk')
+    assert result.outcome == 'failed' and result.reason_code == 'archive_invalid', result
+    assert not result.artifacts and proxy.counts['/app.apk'] == 1
+    record = result.partials[0]
+    assert record['complete'] is True and record['hash_scope'] == 'decoded_browser_response'
+    assert record['validation'] == {'status': 'failed', 'kind': 'apk', 'reason_code': 'archive_invalid'}
+    from dataclasses import asdict
+
+    job = {'id': 'synthetic-chrome', 'state': 'completed', 'outcome': 'failed', 'reason_code': 'archive_invalid',
+           'result': asdict(project_capture(result, 'http://capture.test/app.apk'))}
+    folder = tmp_path / 'capture'
+    item = rejected_files(job, folder, 1024 * 1024)[0]
+    stream, metadata = open_rejected_file(job, folder, item.metadata['id'], 1024 * 1024)
+    with stream:
+        assert stream.read() == proxy.payload
+    assert metadata['validation_status'] == 'failed'
 
 
 def test_web_capture_retains_challenge_body(run_capture, proxy):
@@ -731,7 +756,7 @@ def test_popup_capture_is_ready_before_autonavigation(run_capture, proxy, run_nu
     assert result.artifacts[0].path.read_bytes() == APK
 
 
-def test_real_sdk_generated_synthetic_apk_uses_the_original_request(run_capture, proxy):
+def synthetic_sdk_payload():
     value = os.environ.get("FXFETCH_SYNTHETIC_SDK_APK")
     if not value:
         pytest.skip("Optional independently built synthetic SDK package is not configured")
@@ -744,12 +769,48 @@ def test_real_sdk_generated_synthetic_apk_uses_the_original_request(run_capture,
             for name in archive.namelist()
             if name.startswith("assets/") and not name.endswith("/")
         )
+    return payload
+
+
+def assert_package_journal(journal, expected_requests, *, allow_inline_url_omission=False):
+    assert not journal.failed and not journal.saturated
+    assert journal.gaps == (["journal_optional_field_omitted"] if allow_inline_url_omission else [])
+    rows = [json.loads(line) for line in journal.path.read_text().splitlines()]
+    omissions = [row for row in rows if row["fields"].get("omitted_fields")]
+    if allow_inline_url_omission:
+        assert len(omissions) == 1
+        assert omissions[0]["kind"] == "network_request_observed"
+        assert omissions[0]["fields"]["omitted_fields"] == ["url"]
+        assert omissions[0]["fields"]["resource_type"] == "Image"
+    else:
+        assert not omissions
+    requests = [row["fields"] for row in rows if row["kind"] == "request_attempted"]
+    refs = {row["request_ref"] for row in requests}
+    for path in expected_requests:
+        matching = [row for row in requests if urlsplit(row["url"]).path == path]
+        assert len(matching) == 1, (path, matching)
+    bodies = [row["fields"] for row in rows if row["kind"] == "response_body_saved"]
+    assert bodies
+    assert all(row["request_ref"] in refs for row in bodies)
+    assert all((journal.path.parent / row["path"]).is_file() for row in bodies)
+
+
+@pytest.mark.parametrize("with_journal", [False, True], ids=["plain", "package-journal-sdk"])
+def test_real_sdk_generated_synthetic_apk_uses_the_original_request(run_capture, proxy, tmp_path, with_journal):
+    payload = synthetic_sdk_payload()
     proxy.payload = payload
-    result, events = run_capture("/api-page")
+    journal = EvidenceJournal(tmp_path / "package-observations.jsonl", "browser", "package-sdk") if with_journal else None
+    try:
+        result, events = run_capture("/api-page", purpose="package", journal=journal)
+    finally:
+        if journal is not None:
+            journal.close()
     assert result.outcome == "downloaded", (result, events)
     assert result.artifacts[0].path.read_bytes() == payload
     assert result.artifacts[0].sha256 == hashlib.sha256(payload).hexdigest()
     assert proxy.counts["/api-page"] == proxy.counts["/api"] == proxy.counts["/single"] == 1
+    if journal is not None:
+        assert_package_journal(journal, ("/api-page", "/api", "/single"))
 
 
 def test_gzip_html_and_script_are_fulfilled_as_decoded_bytes(run_capture, proxy):

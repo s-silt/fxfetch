@@ -36,6 +36,7 @@ Host 由启动参数明确允许。上传鉴权在 multipart 解析前完成，�
 | `GET /api/jobs/{id}/web-apk-builds/{build_id}` | 构建状态/结果/已登记产物 ID |
 | `POST /api/jobs/{id}/web-apk-builds/{build_id}/cancel` | 取消构建进程树 |
 | `GET /api/jobs/{id}/artifacts/{artifact_id}` | 已登记附件，文件名来自受控配置；无路径参数 |
+| `GET /api/jobs/{id}/rejected-files/{file_id}` | 已完整保存但包校验失败的原文件；只读附件下载，不改变任务结果 |
 
 二维码候选保留原始文本、严格解码结果与坐标；`url=null` 表示不可直接提交。多码必须选择。`truncated=true` 时须裁剪重新识别。提交的 `url` 是对所选二维码的编辑值，来源仍保留。原始 itms-services 文本作为 manifest 入口处理，不安装描述文件。
 
@@ -50,6 +51,10 @@ Host 由启动参数明确允许。上传鉴权在 multipart 解析前完成，�
 `result.offline` 返回 `{available,bytes,coverage,reasons}`，仅说明可加入 APK 的局部静态内容。已保存响应的正文、头、宿主文件路径和其他私有材料不通过任务 JSON 公开。
 
 构建状态为 `queued → running → built/failed/disabled/cancelled`，重启为 `interrupted`。构建成功不修改原采集 outcome。`origin=downloaded_original` 为下载原包，`origin=generated_webview` 为生成包。
+
+任务详情另有 `rejected_files`，成员为 `{id,filename,kind,size,sha256,validation_status:"failed",reason_code}`。仅展示完整接收、可关联到明确 APK/IPA 包校验失败的文件，不加入 `artifacts`，不将任务改为 `downloaded`，不影响已有网页打包候选。旧 HTTP 记录仅在完整正文、响应和最终错误能严格对应时兼容；旧 Chrome 记录缺少完整性证明则不展示。
+
+原文件下载沿用会话归属与归档可见性规则，校验当前任务目录内的普通文件、大小和 SHA-256 后，返回 `application/octet-stream`、附件文件名、`Content-Length`、`Cache-Control: no-store` 和 `nosniff`。传输的仍是原始字节；不重抓目标、不修复压缩条目、不重新签名。截断、超时、取消、普通网页、越界路径、链接文件或摘要不符均不提供该入口。刷新清空记录后该下载也不可见。
 
 只有任务结束、没有下载原包、且存在合法网页候选时可构建。客户端提交候选 ID，不提交任意网页、路径、包名、脚本或签名选项。打包交付仅一个 APK；离线资源只在 APK 内，不附带证据清单。
 

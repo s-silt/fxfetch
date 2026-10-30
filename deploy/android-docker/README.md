@@ -53,3 +53,11 @@ worker 仅获得 `/dev/kvm`：无 privileged、Docker socket、宿主网络或�
 维护前确认无活动 lease，让 guest 有序关机再停止 Compose。TERM 通过 QMP 请求 ACPI 关机并最多等待 5 秒确认；`guest_acpi_shutdown_acknowledged` 只表示请求被接受，仍须检查实际退出。
 
 参考：[KVM API](https://www.kernel.org/doc/html/latest/virt/kvm/api.html)、[QEMU 网络](https://www.qemu.org/docs/master/system/devices/net.html)。
+## 可选的网页离线分析
+
+先按上述部署说明构建当前源码的 API/browser 或 API/builder 镜像，再叠加 `compose.analysis.yaml`。默认基础镜像为 `fxfetch-android-api-builder:local`，可用 `FXFETCH_ANALYSIS_BASE_IMAGE` 指定已构建的浏览器版镜像。
+
+分析镜像使用 `Dockerfile.analysis` 和 `requirements-analysis.lock`，将 fxapk 1.21.0 安装在独立的 `/opt/fxapk-venv`，不改变采集服务的 Python 依赖。安装只发生在显式构建镜像时，服务启动和分析任务不会安装工具。将 `-f deploy/android-docker/compose.analysis.yaml` 加在原 Compose 文件列表末尾，再构建并启动 `api`；沿用原有 LAN 配置、状态卷和 Android worker。
+
+`FXFETCH_FXAPK=/opt/fxapk-venv/bin/fxapk` 由容器管理员配置。数据包就绪后可点击“离线分析数据包”，报告 ZIP 单独下载；没有配置或程序不可用时按钮禁用。离线分析使用 fxapk 的 `--offline` 契约及受限进程，生产 API 容器仍需要网络进行授权采集，不把该参数称为整个容器断网。
+

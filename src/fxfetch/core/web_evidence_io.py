@@ -28,6 +28,25 @@ def check_ancestors(path: Path) -> None:
             raise EvidenceError("evidence_link_rejected")
 
 
+def create_private_evidence_directory(path: Path) -> None:
+    """Create a new evidence root, then secure it before writing any material."""
+    from ..build_setup import _private_directory
+
+    check_ancestors(path)
+    path.mkdir(mode=0o700, exist_ok=False)
+    try:
+        check_ancestors(path)
+        if not _private_directory(path):
+            raise EvidenceError("private_permissions_unavailable")
+    except (OSError, ValueError):
+        # It is still empty: never recursively remove material on setup failure.
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+        raise
+
+
 def contained(root: Path, candidate: Path) -> bool:
     try:
         candidate.relative_to(root)
