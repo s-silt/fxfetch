@@ -24,6 +24,7 @@ class Settings:
     # Optional fallback only: every new task starts with a direct transport.
     proxy_host: str | None = None
     proxy_port: int = 7890
+    fxapk_executable: str | None = None
 
     def __post_init__(self) -> None:
         validate_bind(self.host)
@@ -34,3 +35,10 @@ class Settings:
             raise ValueError("invalid_proxy_port")
         if self.proxy_host is not None:
             LocalConnectProxy(self.proxy_host, self.proxy_port)
+        if self.fxapk_executable is not None:
+            if (
+                not isinstance(self.fxapk_executable, str)
+                or not self.fxapk_executable
+                or "\0" in self.fxapk_executable
+            ):
+                raise ValueError("invalid_fxapk_executable")

@@ -78,6 +78,7 @@ def _server_config(root: Path, options: argparse.Namespace | None = None) -> dic
         "allowed_networks": ["127.0.0.0/8"],
         "proxy_host": None,
         "proxy_port": 7890,
+        "fxapk_executable": None,
     }
     path = root / "server.json"
     if path.exists():
@@ -109,6 +110,11 @@ def _server_config(root: Path, options: argparse.Namespace | None = None) -> dic
         if not isinstance(config["proxy_host"], str):
             raise ValueError("invalid_server_configuration")
         LocalConnectProxy(config["proxy_host"], config["proxy_port"])
+    executable = config["fxapk_executable"]
+    if executable is not None and (
+        not isinstance(executable, str) or not executable or "\0" in executable
+    ):
+        raise ValueError("invalid_server_configuration")
     return config
 
 
@@ -139,6 +145,7 @@ def _parser(command: str | None = None) -> argparse.ArgumentParser:
         parser.add_argument("--port", type=int)
         parser.add_argument("--allowed-network", dest="allowed_networks", action="append")
         parser.add_argument("--allowed-host", action="append", default=[], metavar="HOST:PORT")
+        parser.add_argument("--fxapk", dest="fxapk_executable")
         parser.add_argument(
             "--secure-cookie", action="store_true", help="Use only behind local HTTPS termination"
         )

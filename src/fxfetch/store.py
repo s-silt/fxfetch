@@ -63,6 +63,13 @@ class Store:
                     id TEXT PRIMARY KEY, job_id TEXT NOT NULL, owner TEXT NOT NULL, build_id TEXT,
                     path TEXT NOT NULL, filename TEXT NOT NULL, kind TEXT NOT NULL, sha256 TEXT NOT NULL,
                     size INTEGER NOT NULL, origin TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS analyses (
+                    id TEXT PRIMARY KEY, job_id TEXT NOT NULL, owner TEXT NOT NULL, idem TEXT NOT NULL,
+                    state TEXT NOT NULL, reason_code TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+                    started REAL, deadline REAL, queue_deadline REAL, output_path TEXT NOT NULL,
+                    executable_path TEXT NOT NULL, source_path TEXT NOT NULL, source_size INTEGER NOT NULL,
+                    source_sha256 TEXT NOT NULL, report_path TEXT, report_size INTEGER, report_sha256 TEXT,
+                    UNIQUE(owner,job_id,idem));
             """)
             if sum(bool(row[5]) for row in db.execute("PRAGMA table_info(continuations)")) == 1:
                 db.execute("ALTER TABLE continuations RENAME TO continuations_old")
@@ -102,6 +109,11 @@ class Store:
             )
             db.execute(
                 "UPDATE builds SET state='interrupted',updated=? WHERE state IN ('queued','running')",
+                (time.time(),),
+            )
+            db.execute(
+                "UPDATE analyses SET state='interrupted',reason_code='service_restarted',updated=? "
+                "WHERE state IN ('queued','running')",
                 (time.time(),),
             )
 
@@ -296,6 +308,8 @@ class Store:
                 for row in db.execute(
                     "SELECT jobs.*, (SELECT count(*) FROM builds WHERE builds.job_id=jobs.id "
                     "AND builds.state IN ('queued','running')) AS active_builds "
+                    ",(SELECT count(*) FROM analyses WHERE analyses.job_id=jobs.id "
+                    "AND analyses.state IN ('queued','running')) AS active_analyses "
                     "FROM jobs WHERE owner=? AND archived=0 ORDER BY created DESC LIMIT 50",
                     (owner,),
                 )

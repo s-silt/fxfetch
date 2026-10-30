@@ -19,6 +19,7 @@ from urllib.parse import urldefrag, urlsplit
 from filelock import FileLock
 
 from . import __version__
+from .analysis_service import AnalysisService
 from .config import Settings
 from .core.classify import classify_input, normalize_entry_url
 from .core.errors import FxfetchError
@@ -72,19 +73,22 @@ class JobService:
         self._chrome_probe_running = False
         self._chrome_probe_thread: threading.Thread | None = None
         self._chrome_capability: dict = {"enabled": False, "reason_code": "browser_guard_unavailable"}
+        self.analysis = AnalysisService(self)
 
     def start(self) -> None:
         self._instance_lock.acquire(timeout=0)
         self.store.restart_interrupt()
+        self.analysis.start()
         for kind in ("collect", "build", "maintenance"):
             worker = threading.Thread(target=self._loop, args=(kind,), daemon=True, name=f"fxfetch-{kind}")
             self._threads.append(worker)
             worker.start()
 
     def close(self) -> None:
-        self._stop.set()
-        self._wake.set()
         with self._mutex:
+            self._stop.set()
+            self.analysis.stop_locked()
+            self._wake.set()
             for event in self._cancels.values():
                 event.set()
         for thread in self._threads:
@@ -147,6 +151,7 @@ class JobService:
                 "reasons": list(build.reasons),
                 "scratch_limit_method": getattr(build, "scratch_limit_method", "unavailable"),
             },
+            "web_analysis": self.analysis.capability(),
             "version": __version__,
             "dns": ["223.5.5.5", "119.29.29.29"],
             "network_policy": {
@@ -309,6 +314,7 @@ class JobService:
                 job["state"],
                 active=identifier in self._data_package_active,
             )
+        job["analyses"] = self.analysis.list(owner, identifier)
         return job
 
     def data_package_file(self, owner: str, identifier: str) -> tuple[Path, str]:
@@ -323,6 +329,29 @@ class JobService:
         except Exception as error:
             raise FxfetchError("not_found", "Data package is unavailable") from error
         return path, metadata["filename"]
+
+    def analysis_source_descriptor(self, owner: str, identifier: str) -> dict:
+        job = self.store.get_job(owner, identifier)
+        if job["state"] not in TERMINAL:
+            raise FxfetchError("not_found", "Data package is unavailable")
+        folder = self.store.root / "jobs" / identifier
+        with self._mutex:
+            metadata = package_metadata(
+                folder, job["state"], active=identifier in self._data_package_active
+            )
+        try:
+            if metadata.get("state") != "ready":
+                raise ValueError("data package is not ready")
+            relative = (
+                Path("jobs") / identifier / "data-package" / metadata["filename"]
+            ).as_posix()
+            path = contained_path(self.store.root, relative)
+            size = path.stat().st_size
+            if size != metadata["size"] or size > self.settings.limits.max_task_bytes:
+                raise ValueError("data package size mismatch")
+        except (FxfetchError, OSError, TypeError, ValueError) as error:
+            raise FxfetchError("not_found", "Data package is unavailable") from error
+        return {"path": relative, "size": size, "sha256": metadata["sha256"]}
 
     @staticmethod
     def download_candidates(job: dict) -> list[dict]:
@@ -433,6 +462,7 @@ class JobService:
 
     def clear_jobs(self, owner: str) -> dict:
         with self._mutex:
+            self.analysis.cancel_owner(owner)
             count, active = self.store.clear_jobs(owner)
             for identifier in active:
                 event = self._cancels.get(identifier)
@@ -502,6 +532,7 @@ class JobService:
             while not self._stop.wait(1):
                 try:
                     self._expire_queued()
+                    self.analysis.expire_queued()
                 except (sqlite3.Error, OSError) as error:
                     log.error("queue_expiry_failed exception_type=%s", type(error).__name__)
             return

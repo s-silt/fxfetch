@@ -183,6 +183,10 @@ class BuildInput(StrictModel):
     candidate_id: str = Field(min_length=1, max_length=80)
 
 
+class EmptyInput(StrictModel):
+    pass
+
+
 def create_app(settings: Settings, *, service: JobService | None = None) -> FastAPI:
     jobs = service or JobService(settings)
     decode_lock = asyncio.Lock()
@@ -219,9 +223,13 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
                 "continuation_active",
                 "continuation_limit",
                 "continuation_cycle",
+                "analysis_active",
+                "analysis_source_unavailable",
+                "analysis_queue_full",
+                "analysis_limit",
             }
             else 503
-            if exc.code == "build_unavailable"
+            if exc.code in {"build_unavailable", "analysis_unavailable"}
             else 400
         )
         return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=status)
@@ -394,6 +402,7 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
                     "created": item["created"],
                     "url": item["input"]["entry_url"],
                     "active_builds": item["active_builds"],
+                    "active_analyses": item["active_analyses"],
                 }
                 for item in values
             ]
@@ -402,6 +411,41 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
     @app.get("/api/jobs/{identifier}")
     async def get_job(identifier: str, current: Annotated[dict, Depends(session)]):
         return await run_in_threadpool(jobs.get_job, current["id"], identifier)
+
+    @app.post("/api/jobs/{identifier}/analyses", status_code=202)
+    async def create_analysis(
+        identifier: str,
+        current: Annotated[dict, Depends(session)],
+        value: EmptyInput | None = None,
+        idempotency_key: Annotated[str | None, Header()] = None,
+    ):
+        return await run_in_threadpool(
+            jobs.analysis.create, current["id"], identifier, idem(idempotency_key)
+        )
+
+    @app.get("/api/jobs/{identifier}/analyses/{analysis_id}")
+    async def get_analysis(
+        identifier: str, analysis_id: str, current: Annotated[dict, Depends(session)]
+    ):
+        return await run_in_threadpool(jobs.analysis.get, current["id"], identifier, analysis_id)
+
+    @app.post("/api/jobs/{identifier}/analyses/{analysis_id}/cancel")
+    async def cancel_analysis(
+        identifier: str, analysis_id: str, current: Annotated[dict, Depends(session)]
+    ):
+        return await run_in_threadpool(jobs.analysis.cancel, current["id"], identifier, analysis_id)
+
+    @app.get("/api/jobs/{identifier}/analyses/{analysis_id}/report.zip")
+    async def analysis_report(
+        identifier: str, analysis_id: str, current: Annotated[dict, Depends(session)]
+    ):
+        path, filename = await run_in_threadpool(
+            jobs.analysis.report_file, current["id"], identifier, analysis_id
+        )
+        return FileResponse(
+            path, media_type="application/zip", filename=filename,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/api/jobs/{identifier}/continue", status_code=202)
     async def continue_job(
