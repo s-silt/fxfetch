@@ -5,7 +5,8 @@
 - TLS 汇总区分 `required` 策略标记与 `verified` / `not_applicable` 实际结果；明确忽略校验仍为 `ignored`，未知或冲突结果仍为 `unknown`，不靠策略声明补造验证结论。
 - 通过 CLI 的 `--evidence-handoff` 传递版本化 `fxapk.web-evidence-handoff.v1` 清单；清单置于 input 目录外，绑定原材料和 HAR 哈希、观察序号、来源映射、TLS/截断/关联状态及未分析附件。fxapk 回传清单哈希后才接受报告，不把哈希绑定称为真实性或 App 归属验证。
 - 新运行配套 fxapk 1.22.0 的此项参数；不兼容时失败，不静默丢掉交接参数重试。旧报告发布保持兼容。native-report 原始副本与公开过滤投影继续分开，新 provenance/locator/occurrence、准入及覆盖字段不被过滤器剥离。
-- Linux/Python 3.12、完整锁定依赖的合成回归：1465 passed、15 skipped（PowerShell 防火墙夹具）、0 failed，含真实本地 fxapk 子进程与 API 下载。无真实目标、设备或在线富化验收；这不是 BLA/Android 验收。
+- ZIP 中的 APK/IPA 和证书附件保留，但不进入网页分析链路；哈希吻合不证明真实性或 App 归属。
+- Linux/Python 3.12、完整锁定依赖的合成回归：1472 passed、15 skipped（PowerShell 防火墙夹具）、0 failed，含真实本地 fxapk 子进程、API 下载和 TLS 汇总回归。无真实目标、设备或在线富化验收；这不是 BLA/Android 验收。
 
 ## dnspython 安全升级（2026-10-30）
 
