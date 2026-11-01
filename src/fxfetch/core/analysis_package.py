@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..build_setup import _private_directory
+from .analysis_handoff import write_handoff
 from .analysis_har import json_bytes, project_har
 from .analysis_materials import MaterialSources, analysis_suffix
 from .task_evidence_provenance import parse_observations
@@ -134,6 +135,7 @@ def prepare_analysis(
             },
             "target_app_attribution_verified": False,
         }
+        receipt["evidence_handoff"] = write_handoff(output, receipt, rows)
         write_receipt(output, receipt)
         return receipt
     except (OSError, ValueError, zipfile.BadZipFile) as error:

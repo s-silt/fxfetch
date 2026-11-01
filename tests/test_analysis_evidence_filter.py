@@ -75,6 +75,24 @@ def report(*items):
     }
 
 
+def test_filter_preserves_occurrences_admission_and_coverage(tmp_path):
+    output, receipt = prepared(tmp_path)
+    original = report()
+    original["endpoints"] = [{
+        "value": "https://api.example.test/", "evidence_admission": {"state": "review"},
+        "evidences": [{"source": "web", "location": LOCATION, "occurrence_id": "occ-v1-synthetic",
+                       "provenance": {"source_sha256": "a" * 64}, "locator": {"char_offset": 12},
+                       "suspicions": [{"kind": "capture_truncated"}]}],
+    }]
+    original["meta"]["web_capture_visibility"] = {"status": "partial", "truncated_files": 1}
+    original["meta"]["visibility"] = {"sources": {"resource": {"status": "partial"}}}
+    before = copy.deepcopy(original)
+    published, _ = filter_report(original, output, receipt)
+    assert published == before and original == before
+    published["endpoints"][0]["evidences"][0]["provenance"]["source_sha256"] = "changed"
+    assert original == before
+
+
 @pytest.mark.parametrize(
     "snippet,location",
     [
@@ -201,6 +219,15 @@ def test_runner_preserves_original_private_json_and_filters_before_hash(tmp_path
     monkeypatch.setattr(analysis_runner.shutil, "which", lambda _: "C:/synthetic/fxapk.exe")
 
     def run(command, **kwargs):
+        nonlocal original
+        source = json.loads(original)
+        handoff_path = Path(command[command.index("--evidence-handoff") + 1])
+        source["meta"]["web_evidence"]["handoff"] = {
+            "sha256": hashlib.sha256(handoff_path.read_bytes()).hexdigest(),
+            "schema_version": "fxapk.web-evidence-handoff.v1", "authenticity_verified": False,
+            "target_app_attribution_verified": False,
+        }
+        original = json.dumps(source).encode()
         directory = Path(command[-1])
         directory.mkdir()
         (directory / "input.json").write_bytes(original)

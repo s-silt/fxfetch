@@ -10,11 +10,25 @@ import pytest
 from analysis_fixtures import analysis_archive
 
 from fxfetch.cli import main
-from fxfetch.core import analysis_package, analysis_runner
+from fxfetch.core import analysis_handoff, analysis_package, analysis_runner
 from fxfetch.core.process_limits import ProcessResult
 from fxfetch.core.web_evidence_schema import EvidenceError
 
 LIMIT = 16 * 1024 * 1024
+
+
+@pytest.mark.parametrize("states,expected", [
+    (["required", "verified"], "verified"),
+    (["not_applicable", "required"], "not_applicable"),
+    (["required"], "required"),
+    (["required", "verified", "unknown"], "unknown"),
+    (["required", "verified", "ignored"], "ignored"),
+    (["verified", "not_applicable"], "unknown"),
+    ([], "unknown"),
+])
+def test_handoff_tls_separates_policy_from_observation(states, expected):
+    rows = [{"fields": {"tls_verification": state}} for state in states]
+    assert analysis_handoff._tls(rows) == expected
 
 
 @pytest.fixture(autouse=True)
@@ -115,8 +129,13 @@ def test_runner_uses_offline_argv_and_requires_report(tmp_path, monkeypatch):
         report_dir = Path(command[-1])
         assert report_dir != Path(command[2])
         report_dir.mkdir()
+        handoff_path = Path(command[command.index("--evidence-handoff") + 1])
+        handoff = {"sha256": hashlib.sha256(handoff_path.read_bytes()).hexdigest(),
+                   "schema_version": "fxapk.web-evidence-handoff.v1", "authenticity_verified": False,
+                   "target_app_attribution_verified": False}
         (report_dir / "input.json").write_text(json.dumps({"meta": {
-            "online": False, "web_evidence": {"file_count": 2, "load_errors": ["synthetic gap"]}}}))
+            "online": False, "web_evidence": {"file_count": 2, "load_errors": ["synthetic gap"],
+                                              "handoff": handoff}}}))
         return ProcessResult(0)
 
     monkeypatch.setattr(analysis_runner, "run_limited", run)

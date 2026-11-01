@@ -20,6 +20,13 @@
 
 仅在授权范围内采集；输入和扫码不访问目标，提交后才开始。材料可能含敏感信息，分享前需审查。Android Chrome、打包和离线分析需要另行配置；手机运行、第二台设备 LAN 和 Mac 部署尚未验收。
 
+## fxapk 离线分析
+
+网页材料的离线分析配套 [fxapk 1.22.0](https://github.com/s-silt/fxapk/releases/tag/v1.22.0)，
+通过子进程传递 `fxapk.web-evidence-handoff.v1` 清单；旧版不支持 `--evidence-handoff` 时明确失败，
+不会丢掉来源约束重试。原始文件/HAR 的哈希、逐次定位、TLS/截断及关联缺口随报告保留。
+ZIP 中的 APK/IPA 和证书附件被保留不等于已进入网页分析链路；哈希吻合也不证明真实性或 App 归属。
+
 ## 文档
 
 [部署](deploy/docker/README.md) · [Android Chrome](deploy/android-docker/README.md) · [局域网](deploy/android-docker/WINDOWS_LAN.md) · [API](API.md) · [实测范围](IMPLEMENTATION.md) · [开发约定](AGENTS.md)
