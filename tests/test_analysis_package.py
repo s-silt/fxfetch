@@ -10,11 +10,25 @@ import pytest
 from analysis_fixtures import analysis_archive
 
 from fxfetch.cli import main
-from fxfetch.core import analysis_package, analysis_runner
+from fxfetch.core import analysis_handoff, analysis_package, analysis_runner
 from fxfetch.core.process_limits import ProcessResult
 from fxfetch.core.web_evidence_schema import EvidenceError
 
 LIMIT = 16 * 1024 * 1024
+
+
+@pytest.mark.parametrize("states,expected", [
+    (["required", "verified"], "verified"),
+    (["not_applicable", "required"], "not_applicable"),
+    (["required"], "required"),
+    (["required", "verified", "unknown"], "unknown"),
+    (["required", "verified", "ignored"], "ignored"),
+    (["verified", "not_applicable"], "unknown"),
+    ([], "unknown"),
+])
+def test_handoff_tls_separates_policy_from_observation(states, expected):
+    rows = [{"fields": {"tls_verification": state}} for state in states]
+    assert analysis_handoff._tls(rows) == expected
 
 
 @pytest.fixture(autouse=True)

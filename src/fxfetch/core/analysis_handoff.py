@@ -17,6 +17,8 @@ def _tls(rows: list[dict]) -> str:
     values = {row["fields"]["tls_verification"] for row in rows if "tls_verification" in row["fields"]}
     if "ignored" in values:
         return "ignored"
+    if len(values) > 1:
+        values.discard("required")
     if len(values) == 1 and next(iter(values)) in {"verified", "required", "not_applicable"}:
         return next(iter(values))
     return "unknown"
