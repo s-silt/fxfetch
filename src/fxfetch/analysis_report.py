@@ -58,7 +58,12 @@ def build_analysis_report(output: Path, pending: Path) -> dict[str, Any]:
 
     try:
         declared = analysis.get("report")
-        verified = _report_receipt(output)
+        handoff = receipt.get("evidence_handoff")
+        if handoff is not None and (
+            not isinstance(handoff, dict) or not isinstance(handoff.get("sha256"), str)
+        ):
+            raise EvidenceError("analysis_report_invalid")
+        verified = _report_receipt(output, handoff["sha256"] if handoff else None)
         if (
             analysis.get("state") != "completed"
             or not isinstance(declared, dict)

@@ -17,7 +17,7 @@ from .web_evidence_schema import EvidenceError
 MAX_REPORT_BYTES = 32 * 1024 * 1024
 
 
-def _report_receipt(output: Path) -> dict[str, Any]:
+def _report_receipt(output: Path, handoff_sha256: str | None = None) -> dict[str, Any]:
     path = output / "report" / "input.json"
     check_ancestors(path)
     if not path.is_file() or is_reparse(path):
@@ -32,6 +32,12 @@ def _report_receipt(output: Path) -> dict[str, Any]:
         raise EvidenceError("fxapk_report_contract_invalid")
     if type(web.get("file_count")) is not int or web["file_count"] <= 0:
         raise EvidenceError("fxapk_report_empty")
+    handoff = web.get("handoff")
+    if handoff_sha256 is not None and (not isinstance(handoff, dict) or handoff.get("sha256") != handoff_sha256
+            or handoff.get("schema_version") != "fxapk.web-evidence-handoff.v1"
+            or handoff.get("authenticity_verified") is not False
+            or handoff.get("target_app_attribution_verified") is not False):
+        raise EvidenceError("fxapk_handoff_contract_invalid")
     return {
         "path": "report/input.json",
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -81,6 +87,8 @@ def analyze_archive(
         "--offline",
         "--fmt",
         "json",
+        "--evidence-handoff",
+        str((output / receipt["evidence_handoff"]["path"]).resolve()),
         "--out",
         str((output / "report").resolve()),
     ]
@@ -106,7 +114,7 @@ def analyze_archive(
         analysis.update(state="failed", reason_code=reason)
     else:
         try:
-            native = _report_receipt(output)
+            native = _report_receipt(output, receipt["evidence_handoff"]["sha256"])
             report_path = output / "report" / "input.json"
             report = read_json_object(report_path, MAX_REPORT_BYTES)
             published, filter_stats = filter_report(report, output, receipt)
@@ -133,7 +141,7 @@ def analyze_archive(
                 "publication_included": False,
             }
             analysis["evidence_filter"] = filter_stats
-            analysis["report"] = _report_receipt(output)
+            analysis["report"] = _report_receipt(output, receipt["evidence_handoff"]["sha256"])
             analysis["state"] = "completed"
         except (OSError, ValueError) as error:
             analysis.update(

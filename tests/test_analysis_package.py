@@ -115,8 +115,13 @@ def test_runner_uses_offline_argv_and_requires_report(tmp_path, monkeypatch):
         report_dir = Path(command[-1])
         assert report_dir != Path(command[2])
         report_dir.mkdir()
+        handoff_path = Path(command[command.index("--evidence-handoff") + 1])
+        handoff = {"sha256": hashlib.sha256(handoff_path.read_bytes()).hexdigest(),
+                   "schema_version": "fxapk.web-evidence-handoff.v1", "authenticity_verified": False,
+                   "target_app_attribution_verified": False}
         (report_dir / "input.json").write_text(json.dumps({"meta": {
-            "online": False, "web_evidence": {"file_count": 2, "load_errors": ["synthetic gap"]}}}))
+            "online": False, "web_evidence": {"file_count": 2, "load_errors": ["synthetic gap"],
+                                              "handoff": handoff}}}))
         return ProcessResult(0)
 
     monkeypatch.setattr(analysis_runner, "run_limited", run)

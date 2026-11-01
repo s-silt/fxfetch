@@ -158,6 +158,22 @@ def test_mixed_browser_materials_keep_evidence_semantics(tmp_path, network_audit
     assert receipt["source_manifest"]["package_result"]["outcome"] == {
         "ordinary": "not_found", "blocked": "blocked", "package": "downloaded"}[scenario]
     assert receipt["coverage"] == "partial" and not report["meta"]["web_evidence"]["load_errors"]
+    handoff = report["meta"]["web_evidence"]["handoff"]
+    assert handoff["sha256"] == receipt["evidence_handoff"]["sha256"]
+    assert handoff["authenticity_verified"] is False
+    assert report["meta"]["web_capture_visibility"]["truncated_files"] == 1
+    partial_refs = [ref for endpoint in report["endpoints"]
+                    if endpoint["value"] == "partial-api.example.test" for ref in endpoint["evidences"]]
+    assert partial_refs
+    for ref in partial_refs:
+        assert ref["occurrence_id"]
+        assert ref["provenance"]["capture_handoff"]["source"]["material"]["path"] == "partial.body"
+        assert {"kind": "capture_truncated"} in ref["suspicions"]
+    observed_refs = [ref for endpoint in report["endpoints"]
+                     for ref in endpoint["evidences"] if ref["location"].endswith("/request/url")]
+    assert observed_refs and all(ref["occurrence_id"] for ref in observed_refs)
+    assert all(ref["provenance"]["capture_handoff"]["entry"]["source"]["observation_sequences"]
+               for ref in observed_refs)
     assert all(not row["target_app_attribution_verified"] for row in records.values())
     with zipfile.ZipFile(output / "source.zip") as bundle:
         rows = {row["seq"]: row for row in map(json.loads, bundle.read("observations.jsonl").splitlines())}
