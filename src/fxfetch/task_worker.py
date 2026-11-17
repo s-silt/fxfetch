@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -29,6 +31,7 @@ _PATHS = {
 
 
 def main() -> int:
+    started = time.monotonic()
     request_path, result_path = map(Path, sys.argv[1:3])
     request = json.loads(request_path.read_text(encoding="utf-8"))
     store = Store(Path(request["root"]))
@@ -56,6 +59,11 @@ def main() -> int:
         tls_policy = web_tls_policy({key: request[key] for key in ('tls_policy', 'ignore_tls_errors') if key in request}
                                     or {'tls_policy': 'strict'})
         limits = Limits(**request["limits"])
+        deadline = request.get('deadline_monotonic')
+        if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and math.isfinite(deadline):
+            deadline = min(deadline, started + limits.chain_timeout)
+        else:
+            deadline = None
         output_dir = Path(request["output_dir"])
         recorder = TaskEvidenceRecorder(
             output_dir,
@@ -75,6 +83,16 @@ def main() -> int:
         )
         try:
             result = workflow.run(request["url"], output_dir, threading.Event(), progress)
+            if request.get('gemini_select') and result.reason_code == 'candidate_selection_required':
+                from .candidate_advisor import advise_bounded
+
+                progress({'event': 'candidate_advising'})
+                result.candidate_advice = advise_bounded(result, Path(request['root']), output_dir,
+                                                         deadline=deadline)
+                recorder.append('candidate_advice', result.candidate_advice)
+                progress({'event': 'candidate_advised', 'label':
+                          '已给出 Android 候选建议' if result.candidate_advice.get('state') == 'selected'
+                          else '未能确定候选，请手动选择'})
         finally:
             recorder.close()
     pending = result_path.with_suffix(".pending")

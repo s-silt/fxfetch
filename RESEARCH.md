@@ -65,3 +65,8 @@ Python 以 [`SSLCertVerificationError`](https://docs.python.org/3/library/ssl.ht
 Chrome 采用 [Security 协议](https://raw.githubusercontent.com/ChromeDevTools/devtools-protocol/master/pdl/domains/Security.pdl) 的 `setOverrideCertificateErrors`、`certificateError` 与 `handleCertificateError` 逐事件处理，不全局 `setIgnoreCertificateErrors(true)`。这些错误事件接口已标 deprecated，是否可用需在已安装 Chrome 版本上实测；内部允许的错误不保证发出事件，不能把缺少事件推断为每张观察证书均验证成功。只继续已通过请求守卫的匹配请求，保留错误、继续记录与证书原件的真实关联范围，未知/缺失记为缺口。当前实现与实测版本以 IMPLEMENTATION 最新章节为准。
 
 跨任务隔离不只依赖恢复 CDP 设置。[Chromium SecurityHandler](https://raw.githubusercontent.com/chromium/chromium/main/content/browser/devtools/protocol/security_handler.cc) 在关闭 override 时取消挂起的证书错误，但接口存在 target 类型限制；[SSLManager](https://raw.githubusercontent.com/chromium/chromium/main/content/browser/ssl/ssl_manager.cc) 的 DevTools 继续路径也不能证明所有连接缓存均被清除。生产 Android lease 每次从受验只读基线复制独立数据分区，启动新的容器与 Chrome 进程，结束后清理该 lease。实际接口版本、页面/iframe 行为和跨任务拒绝均须以合成测试验收。
+
+
+## 图标搜索补充（2026-11-03）
+
+采用 [SerpApi Google Lens](https://serpapi.com/google-lens-api) 的图片上传 ID 与 [Google Search API](https://serpapi.com/search-api) 的名称网页搜索组合，避免第二次仅重复视觉近似结果。模型负责可见名称与图标框，排序只依据标题同名、Android/APK 字样和搜索服务匹配标签；没有自动认定同一应用的能力。供应商 JSON、标题和图像文字均是不可信输入，不能替代实际下载和包验证。

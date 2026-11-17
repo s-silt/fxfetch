@@ -19,7 +19,7 @@ from urllib.parse import urldefrag, urlsplit
 
 from filelock import FileLock
 
-from . import __version__
+from . import __version__, retention
 from .analysis_service import AnalysisService
 from .config import Settings
 from .core.classify import classify_input, normalize_entry_url
@@ -68,9 +68,11 @@ class JobService:
         self._mutex = threading.RLock()
         self._cancels: dict[str, threading.Event] = {}
         self._data_package_active: set[str] = set()
+        self._file_readers: dict[str, int] = {}
         self._threads: list[threading.Thread] = []
         self._instance_lock = FileLock(self.store.root / "service.lock", thread_local=False)
         self._next_cleanup = 0.0
+        self._next_retention_cleanup = 0.0
         self._chrome_probe_at: float | None = None
         self._chrome_probe_lock = threading.Lock()
         self._chrome_probe_running = False
@@ -156,6 +158,7 @@ class JobService:
             },
             "web_analysis": self.analysis.capability(),
             "version": __version__,
+            "retention": {"days": 7, "scope": "task_and_related_files", "active_tasks_protected": True},
             "dns": ["223.5.5.5", "119.29.29.29"],
             "network_policy": {
                 "default_mode": "direct",
@@ -181,7 +184,8 @@ class JobService:
             },
         }
 
-    def create_job(self, owner: str, idem: str, value: dict) -> dict:
+    def create_job(self, owner: str, idem: str, value: dict, *,
+                   icon_evidence: tuple[dict, bytes, bytes] | None = None) -> dict:
         try:
             tls_policy = web_tls_policy(value)
         except ValueError as error:
@@ -192,6 +196,8 @@ class JobService:
         if existing:
             return self.get_job(owner, existing["id"])
         source: dict = {"kind": "manual_url", "entry_url": value.get("url")}
+        if icon_evidence:
+            source.update(kind='icon_search', icon_search=icon_evidence[0])
         image = None
         if value.get("image_id"):
             image = self.store.image(owner, value["image_id"])
@@ -220,6 +226,9 @@ class JobService:
             source["entry_url"] = normalized_entry
         classified = classify_input(source["entry_url"])
         source['tls_policy'] = tls_policy
+        if type(value.get('gemini_select', False)) is not bool:
+            raise FxfetchError('invalid_input', 'gemini_select must be boolean')
+        source['gemini_select'] = value.get('gemini_select', False)
         if classified.kind in ("unsupported", "store") or classified.request_url is None:
             raise FxfetchError("unsupported_input", "Unsupported URL type")
         # Preserve the typed source separately when a scheme was completed;
@@ -244,6 +253,10 @@ class JobService:
                             contained_path(self.store.root, image["path"]), directory / "image.original"
                         )
                         atomic_json(directory / "qr.json", image["result"])
+                    if icon_evidence:
+                        (directory / 'image.original').write_bytes(icon_evidence[1])
+                        (directory / 'icon.jpg').write_bytes(icon_evidence[2])
+                        atomic_json(directory / 'icon-search.json', icon_evidence[0])
                     atomic_json(directory / "input.json", source)
                     if image:
                         self.store.mark_image_used(owner, value["image_id"])
@@ -256,6 +269,8 @@ class JobService:
 
     def get_job(self, owner: str, identifier: str) -> dict:
         job = self.store.get_job(owner, identifier)
+        with self.store.connect() as db:
+            job["retention"] = retention.status(db, identifier)
         job['tls_policy'] = job['input'].get('tls_policy') or (
             'legacy_ignore' if job['input'].get('ignore_tls_errors') is True else 'strict')
         job['rejected_files'] = [item.metadata for item in rejected_files(
@@ -279,6 +294,7 @@ class JobService:
                 "selection_candidates",
                 "network_mode",
                 "collector_mode",
+                "candidate_advice",
             )
             if key in result
         }
@@ -411,7 +427,8 @@ class JobService:
         return choices
 
     def continue_job(self, owner: str, parent_id: str, idem: str, candidate_id: str,
-                     ignore_tls_errors: bool | None = None, *, tls_policy: str | None = None) -> dict:
+                     ignore_tls_errors: bool | None = None, *, tls_policy: str | None = None,
+                     selection_method: str = 'manual') -> dict:
         choices = {**({'ignore_tls_errors': ignore_tls_errors} if ignore_tls_errors is not None else {}),
                    **({'tls_policy': tls_policy} if tls_policy is not None else {})}
         try:
@@ -454,6 +471,7 @@ class JobService:
                 "session_continuity": "independent_request_session",
                 "cookies_inherited": False,
                 "continuation_depth": depth,
+                "selection_method": selection_method,
                 'tls_policy': tls_policy,
             }
             job, created = self.store.create_continuation(
@@ -575,7 +593,10 @@ class JobService:
                 try:
                     self._expire_queued()
                     self.analysis.expire_queued()
-                except (sqlite3.Error, OSError) as error:
+                    if time.monotonic() >= self._next_retention_cleanup:
+                        self.cleanup_retention()
+                        self._next_retention_cleanup = time.monotonic() + 60
+                except (sqlite3.Error, OSError, FxfetchError) as error:
                     log.error("queue_expiry_failed exception_type=%s", type(error).__name__)
             return
         while not self._stop.is_set():
@@ -657,6 +678,8 @@ class JobService:
         # precisely its remote lease after the local process tree has stopped.
         request = dict(request)
         request.pop("android_lease_id", None)
+        if request["operation"] == "collect":
+            request['deadline_monotonic'] = deadline
         android_worker = None
         android_lease_id = None
         if request["operation"] == "collect" and classify_input(request["url"]).kind == "http":
@@ -830,6 +853,7 @@ class JobService:
                     "proxy_host": self.settings.proxy_host,
                     "proxy_port": self.settings.proxy_port,
                     'tls_policy': tls_policy,
+                    'gemini_select': job['input'].get('gemini_select', False),
                 },
                 folder / "worker",
                 deadline,
@@ -898,7 +922,8 @@ class JobService:
             "schema_version": 1,
             "run": {
                 "version": __version__,
-                "authorized_by": "candidate_selection"
+                "authorized_by": ("ai_candidate_selection" if job['input'].get('selection_method') == 'ai'
+                                  else "candidate_selection")
                 if job["input"].get("kind") == "download_candidate"
                 else "download_action",
                 "started": started,
@@ -920,7 +945,34 @@ class JobService:
         except OSError as error:
             # The committed SQLite result stays authoritative if the final evidence write fails.
             log.error("final_evidence_write_failed id=%s exception_type=%s", job["id"], type(error).__name__)
+        self._auto_continue(job, terminal, cancel)
         self._seal_data_package(job, terminal["result"])
+
+    def _auto_continue(self, job: dict, terminal: dict, cancel: threading.Event) -> None:
+        """Only a newly finished, opted-in task may enqueue one observed candidate."""
+        result = terminal.get('result') or {}
+        advice = result.get('candidate_advice') or {}
+        if (not job['input'].get('gemini_select') or cancel.is_set()
+                or terminal.get('state') != 'completed'
+                or result.get('reason_code') != 'candidate_selection_required'
+                or advice.get('state') != 'selected'):
+            return
+        index = advice.get('candidate_index')
+        candidates = result.get('selection_candidates', [])
+        if type(index) is not int or not 0 <= index < len(candidates):
+            return
+        try:
+            with self._mutex:
+                if cancel.is_set():
+                    return
+                current = self.get_job(job['owner'], job['id'])
+                choice = next((c for c in current['download_candidates']
+                               if c['url'] == candidates[index].get('url')), None)
+                if choice is not None:
+                    self.continue_job(job['owner'], job['id'], 'gemini-' + job['id'], choice['id'],
+                                      tls_policy=job['input'].get('tls_policy', 'auto'), selection_method='ai')
+        except FxfetchError as error:
+            log.info('candidate_auto_continue_stopped code=%s', error.code)
 
     def _build(self, build: dict, cancel: threading.Event) -> None:
         if self._expired_claim(build, build=True):
@@ -1004,6 +1056,24 @@ class JobService:
         self.store.finish_with_artifacts(
             build["id"], value.get("state", "failed"), value, artifacts, deadline, cancel, build=True
         )
+
+    def cleanup_retention(self, *, now: float | None = None) -> int:
+        with self._mutex:
+            protected = set(self._cancels) | set(self.analysis._cancels) | self._data_package_active | set(self._file_readers)
+            return retention.cleanup(self.store, protected, now=now)
+
+    def retain_download(self, owner: str, identifier: str) -> None:
+        with self._mutex:
+            self.store.get_job(owner, identifier)
+            self._file_readers[identifier] = self._file_readers.get(identifier, 0) + 1
+
+    def release_download(self, identifier: str) -> None:
+        with self._mutex:
+            remaining = self._file_readers.get(identifier, 0) - 1
+            if remaining > 0:
+                self._file_readers[identifier] = remaining
+            else:
+                self._file_readers.pop(identifier, None)
 
     def cleanup_images(self) -> None:
         with self.store.connect() as db:

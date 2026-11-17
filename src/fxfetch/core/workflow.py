@@ -80,6 +80,7 @@ class WorkflowResult:
     offline: dict[str, object] = field(default_factory=lambda: {"available": False})
     landing: dict[str, object] = field(default_factory=lambda: {"evidence": [], "gaps": []})
     collector_mode: str = "http"
+    candidate_advice: dict = field(default_factory=dict)
 
 
 class Workflow:

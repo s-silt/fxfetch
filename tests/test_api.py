@@ -347,6 +347,35 @@ def test_downloaded_original_never_offers_web_build(running):
     assert not builder.calls
 
 
+def test_expiry_waits_for_file_response_then_returns_404(running, monkeypatch):
+    from fastapi.responses import FileResponse
+
+    client, service, workflow, _ = running
+    workflow.downloaded = True
+    job = wait_job(client, submit(client, login(client))["id"])
+    identifier = job["id"]
+    endpoint = f"/api/jobs/{identifier}/artifacts/{job['artifacts'][0]['id']}"
+    deadline = time.monotonic() + 5
+    while service._cancels or service._data_package_active:
+        assert time.monotonic() < deadline, "synthetic worker did not exit"
+        time.sleep(0.01)
+    original = FileResponse.__call__
+    future = time.time() + 8 * 86400
+
+    async def during_response(response, scope, receive, send):
+        assert service._file_readers.get(identifier) == 1
+        assert service.cleanup_retention(now=future) == 0
+        await original(response, scope, receive, send)
+
+    monkeypatch.setattr(FileResponse, "__call__", during_response)
+    response = client.get(endpoint)
+    assert response.status_code == 200
+    assert response.content == b"synthetic-original-artifact"
+    assert not service._file_readers
+    assert service.cleanup_retention(now=future) == 1
+    assert client.get(endpoint).status_code == 404
+
+
 def test_cancel_running_and_queued_jobs(running):
     client, _, workflow, _ = running
     workflow.release.clear()

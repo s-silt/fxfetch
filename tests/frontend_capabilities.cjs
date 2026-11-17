@@ -6,7 +6,7 @@ const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../src/fxfetch/web/static/app.js"), "utf8")
   .replace(/^\s*api\("\/api\/session"\).*$/m, "")
-  .replace(/\}\)\(\);\s*$/, "globalThis.test = {state, authenticated, pollCapabilities, signedOut, busy, hasActive, submitAnalysis, cancelAnalysis, submitJob, submitContinuation, clearRecords, renderJob, eventText};})();");
+  .replace(/\}\)\(\);\s*$/, "globalThis.test = {state, authenticated, pollCapabilities, signedOut, busy, hasActive, submitAnalysis, cancelAnalysis, submitJob, submitContinuation, clearRecords, renderJob, eventText, resultLabel};})();");
 
 function harness(capability, responder = () => ({})) {
   const elements = new Map(), events = new Map(), timers = new Map(), calls = [];
@@ -54,6 +54,39 @@ function harness(capability, responder = () => ({})) {
 }
 
 async function main() {
+  {
+    const ui = harness(() => ({}));
+    const base = {id:"synthetic-result", state:"completed", outcome:"failed", input:{entry_url:"https://synthetic.test/"}};
+    const cases = [
+      [{...base, reason_code:"candidate_selection_required", download_candidates:[{id:"a"},{id:"b"}]}, "发现多个下载候选"],
+      [{...base, result:{reason_code:"candidate_selection_required"}, download_candidates:[{id:"a"}]}, "发现下载候选"],
+      [{...base, reason_code:"candidate_selection_required", rejected_files:[{validation_status:"failed"}]}, "原文件校验失败，可下载原文件"],
+      [{...base, reason_code:"archive_invalid"}, "原文件校验失败"],
+      [{...base, reason_code:"network_timeout"}, "目标连接或读取超时"],
+      [{...base, outcome:"blocked", reason_code:"device_verification_required"}, "设备验证受阻，尚未取得原包"],
+      [{...base, outcome:"blocked"}, "访问受阻，尚未取得原包"],
+      [{...base, reason_code:"unknown_future_failure"}, "采集失败，尚未取得原包"],
+      [{...base, outcome:"not_found"}, "本次范围内未找到原包"],
+      [{...base, outcome:"downloaded"}, "已取得原包"],
+      [{...base, state:"cancelled", reason_code:"candidate_selection_required"}, "采集已取消"],
+      [{...base, state:"queued", outcome:"downloaded"}, "排队中"],
+      [{...base, state:"running", outcome:"downloaded", progress:{event:"file_verifying"}}, "正在核验文件"],
+      [{...base, builds:[{state:"built", outcome:"built"}]}, "采集失败，尚未取得原包"],
+    ];
+    for (const [item, expected] of cases) {
+      const original = JSON.stringify(item);
+      assert.equal(ui.test.resultLabel(item), expected);
+      assert.equal(JSON.stringify(item), original, "Display labels never rewrite recorded outcomes");
+    }
+    ui.test.state.job = {...base, reason_code:"candidate_selection_required"};
+    ui.test.renderJob();
+    const children = ui.document.getElementById("job-content").children;
+    const summaryIndex = children.findIndex(node => node.className?.includes("package-result"));
+    assert.ok(summaryIndex >= 0);
+    assert.equal(children[summaryIndex].textContent, "原包结果：发现多个下载候选");
+    assert.ok(summaryIndex < children.findIndex(node => node.className === "job-url"), "Result precedes even a long URL");
+    assert.equal(ui.calls.length, 0, "Result rendering must never contact a candidate");
+  }
   {
     const ui = harness(() => ({}));
     const text = ui.test.eventText({event:"dns_resolution_observed", provider:"dnspod", query_type:"AAAA", reason_code:"dns_unsafe_answer", dns_record:{answers:["private diagnostic"]}});
@@ -346,6 +379,6 @@ async function main() {
     assert.equal(ui.test.state.capabilityStatus, "ready");
     assert.equal(ui.timers.size, 0);
   }
-  console.log(JSON.stringify({passed:true, cases:7, analysisRecoveryScenarios:2, browser:false, network:false}));
+  console.log(JSON.stringify({passed:true, cases:8, resultLabelScenarios:14, analysisRecoveryScenarios:2, browser:false, network:false}));
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

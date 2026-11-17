@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 import qrcode
 import uvicorn
+from desktop_ui_assertions import DESKTOP_SIZES, assert_desktop_workspace, assert_same_page
 from playwright.sync_api import sync_playwright
 
 from fxfetch.config import Settings
@@ -82,7 +83,7 @@ def main() -> None:
         faulthandler.dump_traceback()
         server.should_exit = True
         raise AssertionError("Synthetic localhost service did not start within 10 seconds")
-    sizes = {"desktop": {"width": 1280, "height": 900}, "mobile-375": {"width": 375, "height": 812}, "mobile-390": {"width": 390, "height": 844}}
+    sizes = DESKTOP_SIZES
     screenshots = []
     errors = []
     qr = output / "synthetic-qr.png"
@@ -90,15 +91,15 @@ def main() -> None:
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome", headless=True, args=["--disable-background-networking"])
-            context = browser.new_context(viewport=sizes["desktop"], accept_downloads=True)
+            context = browser.new_context(viewport=sizes["desktop-1280"], accept_downloads=True)
             context.route("**/*", lambda route: route.continue_() if route.request.url.startswith(origin + "/") else route.abort())
             page = context.new_page()
             page.on("pageerror", lambda error: errors.append(str(error)))
 
             def screenshot(state, viewport):
                 page.set_viewport_size(sizes[viewport])
-                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-                for selector in ("#url", "#dropzone", "#download-button", "#job-picker"):
+                assert_desktop_workspace(page)
+                for selector in ("#url", "#mode-qr", "#download-button", "#job-picker"):
                     bounds = page.locator(selector).bounding_box()
                     assert bounds and 0 <= bounds["x"] and bounds["x"] + bounds["width"] <= sizes[viewport]["width"]
                 button = page.locator("#download-button").bounding_box()
@@ -111,20 +112,38 @@ def main() -> None:
             page.locator("#password").fill(password)
             page.locator("#login-form button[type=submit]").click()
             page.locator("#workspace").wait_for(state="visible")
-            screenshot("empty", "desktop")
-            screenshot("empty", "mobile-375")
+            original_url = page.url
+            for viewport in sizes:
+                screenshot("empty", viewport)
             page.locator("#image-file").set_input_files(qr)
-            page.wait_for_function("document.querySelector('#qr-status').textContent.startsWith('识别到')")
+            page.wait_for_function("() => document.querySelector('#qr-status').textContent.startsWith('识别到')")
             assert workflow.entries == []
-            screenshot("qr", "mobile-390")
+            for viewport in sizes:
+                screenshot("qr", viewport)
             page.locator("#clear-image").click()
-            entered = "layout.synthetic.invalid/download/path?source=mobile&token=" + "synthetic-" * 24
+            entered = "layout.synthetic.invalid/download/path?source=desktop&token=" + "synthetic-" * 24
             page.locator("#url").fill(entered)
             assert workflow.entries == []
             page.locator("#download-button").click()
             page.locator(".collection-progress.is-active progress").wait_for()
             assert page.locator("#url").input_value() == "https://" + entered
             assert workflow.entries == ["https://" + entered]
+            timeline = page.locator('.collection-progress > .progress-timeline')
+            scroll_top = timeline.evaluate('''element => {
+                element.scrollTop = Math.min(90, element.scrollHeight - element.clientHeight);
+                element.dataset.beforePoll = 'true';
+                return element.scrollTop;
+            }''')
+            assert scroll_top > 0
+            page.wait_for_function("() => !document.querySelector('.collection-progress > .progress-timeline').dataset.beforePoll")
+            assert timeline.evaluate('(element) => element.scrollTop') == scroll_top
+            job_id = page.locator('#job-picker').input_value()
+            page.locator('#view-search').click()
+            assert_desktop_workspace(page, 'search')
+            page.locator('#view-collect').click()
+            assert page.locator('#job-picker').input_value() == job_id
+            assert page.locator('#url').input_value() == 'https://' + entered
+            assert_same_page(page, original_url)
             for viewport in sizes:
                 screenshot("progress", viewport)
             workflow.release.set()
@@ -144,8 +163,8 @@ def main() -> None:
         receipt = {
             "status": "passed", "target_requests": 0, "vm_access": False,
             "scope": "installed_chrome_local_synthetic_workflow",
-            "screenshots": screenshots, "widths": [1280, 375, 390],
-            "checks": ["qr_does_not_submit", "bare_url_normalized", "long_url_no_overflow", "active_and_completed_progress", "file_precedes_history", "download_exact_bytes", "refresh_clears_without_revisit", "no_console_errors"],
+            "screenshots": screenshots, "widths": [1280, 1440, 1920],
+            "checks": ["desktop_two_columns", "single_page_state_preservation", "poll_preserves_timeline_scroll", "qr_does_not_submit", "bare_url_normalized", "long_url_no_overflow", "active_and_completed_progress", "file_precedes_history", "download_exact_bytes", "refresh_clears_without_revisit", "no_console_errors"],
         }
         (output / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
         print(json.dumps({**receipt, "output": str(output)}))

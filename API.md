@@ -1,5 +1,35 @@
 # HTTP API v1
 
+## 模型设置
+
+以下接口须登录，两个 POST 另须同源 Origin 和 CSRF；不接受客户端提供供应商地址或密钥。
+
+| 接口 | 输入与结果 | 供应商请求 |
+| --- | --- | --- |
+| `GET /api/model-settings` | 返回 `{current_model}` | 无 |
+| `POST /api/model-settings/refresh` | `{}`；返回 `{current_model, models: [模型 ID], list_token}` | 一次已配置 HTTPS 模型接口的 `/models` GET |
+| `POST /api/model-settings` | `{model, list_token}`；返回 `{current_model}` | 无 |
+
+列表仅显式点击获取，不自动请求、重试或保存。每服务同时一次、调用间隔至少十秒，严格 TLS、默认直连且拒绝重定向；独立受限进程整体执行最多三十秒、内存 256 MiB，响应最多 1 MiB、1000 个模型，每个 ID 为 1–200 个 ASCII 可见字符。列表令牌仅存内存，绑定当前会话及配置摘要，十分钟过期；服务重启、配置变化或列表被替换后须重新获取。只可保存该列表中的 ID，保存保留密钥、接口、其他字段和文件权限。设置由服务共用，用于之后的图标识别和 AI 辅助选择；列表中存在不代表模型支持图片或推理可用。
+
+保存的响应丢失或超时时，前端显示「保存结果未确认」，只调用 `GET /api/model-settings` 核对实际当前值；核对失败提供手动再次核对入口，不重发保存、列表或推理请求。核对及迟到响应受登录/清空状态代次保护。
+
+模型服务默认直连。后端私有配置可选 `vision_proxy`，仅接受显式端口的本机 HTTP 代理（回环或 Docker 的 `host.docker.internal`），只应用于配置模型接口及其 `/models`；不改变 SerpApi、采集请求或系统代理。严格 TLS、拒绝重定向和无自动直连回退保持生效；网页不能修改代理。
+
+错误代码包括 `model_list_busy`、`model_list_cooldown`、`model_list_invalid`、`model_list_limit`、`model_list_expired`、`model_not_available`、`model_settings_changed`、`model_settings_unavailable` 及既有供应商错误。失败不改变当前模型，也不透传供应商响应正文。
+
+## AI 辅助选择
+
+`POST /api/jobs` 新增严格布尔字段 `gemini_select`，默认 `false`。网页默认勾选后随明确的开始采集动作提交 `true`；离线预览、上传和读取均不调用模型。
+
+任务发现多个候选后，在原任务隔离 worker 与执行期限内最多进行一次模型判断。只提交候选名称、域名及截断路径，不提交查询参数或页面正文。`result.candidate_advice` 记录 `state`、`reason`、`candidate_index` 及请求/返回模型名称；`selected` 仅代表建议，不代表下载成功。
+
+生产模型判断另用独立受限子进程：上限三十秒、256 MiB、16 KiB 输出，并按父任务剩余预算扣除至少五秒结果保存余量。预算不足返回 `manual/ai_budget_insufficient`，硬超时返回 `manual/ai_timeout`，进程异常返回 `manual/ai_worker_failed`。原采集 outcome、reason 和候选不被这些建议失败覆盖，取消仍受整个任务进程树约束，无模型重试。
+
+建议可附 `elapsed_seconds`、`timeout_seconds`、安全的 `request_timing` 与 `error_detail`；后者仅含固定错误码和有效 HTTP 状态，不附供应商正文、密钥或端点。
+
+有效建议在 supervisor 提交原结果后，按原继续下载合同创建独立子任务，沿用该任务 TLS 策略，标记 `input.selection_method=ai`。子任务不继承自动选择，实际下载结果在子任务中查询；原结果不改写。关闭、取消、清空、重启、模型失败或不确定时不自动创建新下载。
+
 本页是网页服务的接口约定；项目与部署入口见 [README](README.md)，实际验收范围见 [IMPLEMENTATION.md](IMPLEMENTATION.md)。后端执行采集、构建和分析，前端使用同源 JSON API；图片上传使用 multipart 的 `file` 字段，所有响应默认禁止缓存。计划接口不视为已提供。
 
 | 查找内容 | 章节 |
@@ -166,4 +196,28 @@ HTTP 优先；需要动态处理或收到 403/429/502/503 时最多尝试一次�
 
 ## 刷新与清空
 
+### 后台保存期限
+
+任务及其关联采集、打包、解析全部结束后保留 7 天，后台每分钟分批检查到期任务，删除任务原文件（含校验失败文件）、生成 APK、网页材料、数据包、解析报告及相关数据库记录。排队、执行中、尚未退出的工作进程和正在传输的下载受到保护，不会中途删除。运行期间新建关联操作会重新计算全部操作的结束时间；刷新、读取、下载和归档不会重置期限。服务停机期间不执行清理，启动后继续检查。
+
+任务详情 `retention` 提供 `days=7`、`protected_active`、`finished_at` 和 `expires_at`（Unix 秒；仍有活动操作时后两者为 null）。旧任务没有独立结束时间时，首次升级以原记录最后更新时间回填。到期文件不可再次下载，用户已下载到自己电脑的副本不受影响。刷新隐藏的任务及会话过期的任务也按此规则清理。服务口令、签名密钥、环境配置不属于清理范围。
+
 刷新按钮和整页刷新调用 `DELETE /api/jobs`，重置输入并取消当前会话未完成任务。记录在任务、构建、附件接口不可见，迟到写回不恢复显示；其他会话不受影响，后端原文件保留。演示文件接口已移除。
+
+
+## 图标截图搜索（可选）
+
+所有接口沿用登录、CSRF、Host/Origin 与会话所有权检查。文件选择、预览和结果展示不访问第三方或候选站点；只有点击搜索的 POST 才授权本次第三方识图和搜索。扫码仍完全离线。
+
+- `POST /api/icon-searches`：multipart `file`，必需 `Idempotency-Key`，返回 202 和任务 ID。仅接收单张有效图片，10 MiB / 2500 万像素；支持 PNG/JPEG/WebP/HEIF/AVIF/BMP/GIF/TIFF，拒绝动画、多页与 SVG。原图经方向校正、去元数据、缩放后交给模型；仅裁出的图标交给搜图服务。没有有效裁剪框或裁剪结果仍为整图时，停止搜索，不向搜图服务上传图片。
+- `GET /api/icon-searches/{id}`：状态 `running/completed/partial/failed/cancelled`、阶段、识别名称、置信度、请求/返回模型名、候选、错误与到期时间。`completed` 只表示搜索过程完成；候选始终 `verified=false`、`downloadable=null`。
+
+  新记录的 `timing` 含 `started_at,stage_started_at,stage_elapsed_seconds,total_seconds`、已结束的 `stages[{stage,elapsed_seconds}]` 与 `requests[{stage,route,response_wait_seconds,body_read_seconds,total_seconds,http_status,error_code}]`。`route` 仅为 `direct/configured_proxy`，不公开代理地址。等待响应包含网络和供应商处理；旧记录没有该字段时仍可读取。`error_detail` 保留失败阶段、固定 code 及可得的 HTTP 状态。父进程终止搜索时补结算当前阶段，保留已发现候选；网页的本地计时不自行判定任务结束。
+- `GET /api/icon-searches/{id}/image/{preview|icon}`：当前会话的干净 JPEG 预览。
+- `POST /api/icon-searches/{id}/cancel`：取消本次工作进程。
+- `POST /api/icon-searches/{id}/collect`：`candidate_id`、`tls_policy`，必需 `Idempotency-Key`。明确选择才进入既有有界 HTTP / Chrome 采集；复制截图、图标、哈希与搜索来源到任务 source。搜索本身不创建下载成功记录。
+
+供应商错误区分 `icon_provider_auth`（401）、`icon_provider_forbidden`（403）、`icon_provider_quota`（429）、`icon_provider_http`（其他 HTTP）、`icon_provider_timeout`、`icon_provider_tls`、`icon_provider_proxy`、`icon_provider_connection`、`icon_provider_response_invalid`、`icon_provider_incomplete`。错误响应可附安全整数 `error.http_status`；不透传供应商正文或异常文本，不自动重试。
+- `DELETE /api/jobs` 同时取消并隐藏本会话搜索，不影响其他会话。重启只标记中断，不重试搜索。
+
+全服务一个搜索槽位、每 24 小时最多 20 次提交、单次 180 秒/768 MiB 工作进程预算。先检查 SerpApi 免费方案且至少余 2 次；每次最多 1 次 Google Lens 搜图和 1 次名称 Android/APK 网页搜索，不自动分页/重试/购买额度。低置信度无名称时只搜图一次。各任务结果及图片结束后保留 7 天；运行中不删，刷新不延长。选择下载时独立复制来源，后续按下载任务保留期限处理。
