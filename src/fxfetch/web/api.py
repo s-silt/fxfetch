@@ -25,7 +25,7 @@ from ..core.errors import FxfetchError
 from ..core.lan import client_allowed
 from ..core.qr import decode_image
 from ..core.tls_policy import web_tls_policy
-from ..icon_search.service import IconSearchService
+from ..icon_search.service import IconSearchService, saved_candidates
 from ..model_settings import ModelSettingsService
 from ..security import contained_path, password_matches, token_hash
 from ..service import JobService
@@ -416,13 +416,14 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
         def collect():
             with icons.lock:
                 result = icons.get(current['id'], identifier)
-                if result['state'] not in ('completed', 'partial'):
+                if result['finished_at'] is None or result['state'] not in ('completed', 'partial', 'cancelled'):
                     raise FxfetchError('invalid_selection', 'Search is not finished')
-                selected = next((item for item in result.get('candidates', [])
-                                 if item['id'] == value.candidate_id), None)
+                if result['expires_at'] is None or result['expires_at'] <= time.time():
+                    raise FxfetchError('not_found', 'Search has expired')
+                selected = next((item for item in saved_candidates(result) if item['id'] == value.candidate_id), None)
                 if selected is None:
                     raise FxfetchError('invalid_selection', 'Unknown candidate')
-                directory = icons.directory / identifier
+                original, icon = icons.evidence_files(identifier, result)
                 evidence = {'search_id': identifier, 'candidate': selected,
                             'recognition': result.get('recognition'),
                             'input_sha256': result.get('input_sha256'),
@@ -431,8 +432,7 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
                 return jobs.create_job(current['id'], key, {
                     'url': selected['url'], 'tls_policy': value.tls_policy,
                     'icon_search_id': identifier, 'icon_candidate_id': value.candidate_id,
-                }, icon_evidence=(evidence, (directory / 'input.image').read_bytes(),
-                                  (directory / 'icon.jpg').read_bytes()))
+                }, icon_evidence=(evidence, original, icon))
         return await run_in_threadpool(collect)
 
     @app.post("/api/preview")

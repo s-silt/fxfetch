@@ -14,13 +14,43 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ..core.errors import FxfetchError
 from ..core.process_limits import run_limited
 from ..retention import SECONDS, _safe_tree
-from .providers import fail, load_config
+from ..security import contained_path
+from .providers import candidate_url, fail, load_config
 
 log = logging.getLogger(__name__)
+SEARCH_STAGES = ('validating', 'quota', 'recognizing', 'uploading', 'searching')
+
+
+def saved_candidates(result: dict) -> list[dict]:
+    rows = result.get('candidates')
+    if not isinstance(rows, list) or len(rows) > 20:
+        return []
+    valid = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        identifier, evidence = row.get('id'), row.get('evidence')
+        url = candidate_url(row.get('url'))
+        if (isinstance(identifier, str) and re.fullmatch(r'(?:[1-9]|1[0-9]|20)', identifier)
+                and url is not None
+                and isinstance(row.get('title'), str) and len(row['title']) <= 300
+                and row.get('source') == urlsplit(url).hostname
+                and isinstance(evidence, list) and len(evidence) <= 4
+                and all(item in ('name_in_title', 'android_text', 'provider_exact_match', 'name_web_search')
+                        for item in evidence)
+                and row.get('verified') is False and row.get('downloadable') is None):
+            if identifier in seen:
+                return []
+            seen.add(identifier)
+            valid.append({key: row.get(key) for key in
+                          ('id', 'url', 'title', 'source', 'evidence', 'verified', 'downloadable')})
+    return valid
 
 
 class IconSearchService:
@@ -57,10 +87,13 @@ class IconSearchService:
             return {'enabled': False, 'reason_code': 'icon_search_unconfigured'}
 
     def start(self) -> None:
-        with self.db() as db:
-            db.execute("UPDATE searches SET state='failed',finished=?,result=? WHERE state='running'",
-                       (time.time(), json.dumps({'state': 'failed', 'error': 'icon_interrupted',
-                                                'candidates': []})))
+        with self.lock, self.db() as db:
+            rows = db.execute("SELECT id, digest FROM searches WHERE state='running'").fetchall()
+            finished = time.time()
+            for row in rows:
+                result = self.interrupted_result(row['id'], row['digest'])
+                db.execute("UPDATE searches SET state=?,finished=?,result=? WHERE id=?",
+                           (result['state'], finished, json.dumps(result, ensure_ascii=False), row['id']))
         thread = threading.Thread(target=self.maintenance, daemon=True, name='icon-maintenance')
         self.threads.append(thread)
         thread.start()
@@ -142,14 +175,78 @@ class IconSearchService:
                            (result['state'], time.time(), json.dumps(result, ensure_ascii=False), identifier))
                 self.active.pop(identifier, None)
 
+    def read_evidence_file(self, identifier: str, name: str, limit: int) -> bytes:
+        path = contained_path(self.root, f'icon-searches/{identifier}/{name}')
+        with path.open('rb') as stream:
+            data = stream.read(limit + 1)
+        if not data or len(data) > limit:
+            raise ValueError('invalid_icon_evidence_size')
+        return data
+
     def progress(self, identifier: str) -> dict | None:
-        try:
-            path = self.directory / identifier / 'progress.json'
-            if path.stat().st_size > 512 * 1024:
-                return None
-            return json.loads(path.read_text(encoding='utf-8'))
-        except (OSError, ValueError):
+        if not re.fullmatch(r'[0-9a-f]{32}', identifier):
             return None
+        try:
+            value = json.loads(self.read_evidence_file(identifier, 'progress.json', 512 * 1024))
+            if not isinstance(value, dict):
+                return None
+            # Worker snapshots are JSON objects. Reject non-finite numbers before persisting or serving them.
+            json.dumps(value, ensure_ascii=False, allow_nan=False).encode('utf-8')
+            return value
+        except (FxfetchError, OSError, ValueError, RecursionError):
+            return None
+
+    def evidence_files(self, identifier: str, result: dict) -> tuple[bytes, bytes]:
+        try:
+            original = self.read_evidence_file(identifier, 'input.image', 10 * 1024 * 1024)
+            icon = self.read_evidence_file(identifier, 'icon.jpg', 500_000)
+        except (FxfetchError, OSError, ValueError):
+            raise fail('invalid_selection') from None
+        if (result.get('crop_applied') is not True
+                or hashlib.sha256(original).hexdigest() != result.get('input_sha256')
+                or hashlib.sha256(icon).hexdigest() != result.get('icon_sha256')):
+            raise fail('invalid_selection')
+        return original, icon
+
+    def interrupted_result(self, identifier: str, digest: str) -> dict:
+        snapshot = self.progress(identifier) or {}
+        result = {key: snapshot[key] for key in
+                  ('input_sha256', 'icon_sha256', 'crop_applied', 'quota_before', 'search_attempts',
+                   'candidate_requests', 'recognition', 'timing') if key in snapshot}
+        recognition = result.get('recognition')
+        if (not isinstance(recognition, dict) or not isinstance(recognition.get('name'), str)
+                or type(recognition.get('ambiguous')) is not bool
+                or recognition.get('confidence') not in ('high', 'medium', 'low')):
+            result.pop('recognition', None)
+        recovered = saved_candidates(snapshot)
+        if recovered:
+            if result.get('input_sha256') != digest:
+                recovered = []
+            else:
+                try:
+                    self.evidence_files(identifier, result)
+                except FxfetchError:
+                    recovered = []
+        stage = snapshot.get('stage')
+        if stage not in SEARCH_STAGES:
+            detail = snapshot.get('error_detail')
+            stage = detail.get('stage') if isinstance(detail, dict) else None
+        if stage not in SEARCH_STAGES:
+            stage = 'searching' if recovered else 'validating'
+        timing = result.get('timing')
+        if (not isinstance(timing, dict)
+                or not all(type(timing.get(key)) in (float, int) and timing[key] >= 0 for key in
+                           ('started_at', 'stage_started_at', 'total_seconds', 'stage_elapsed_seconds'))
+                or not all(isinstance(timing.get(key), list) and all(isinstance(row, dict) for row in timing[key])
+                           for key in ('stages', 'requests'))):
+            result.pop('timing', None)
+        elif snapshot.get('stage') == stage:
+            # The last durable elapsed time is known. Downtime is not search time.
+            timing['stages'].append({'stage': stage, 'elapsed_seconds': timing['stage_elapsed_seconds']})
+            timing.update(stage_elapsed_seconds=0.0, stage_started_at=time.time())
+        return {**result, 'state': 'partial' if recovered else 'failed', 'stage': 'finished',
+                'error': 'icon_interrupted', 'error_detail': {'stage': stage, 'code': 'icon_interrupted'},
+                'candidates': recovered}
 
     def get(self, owner: str, identifier: str) -> dict:
         if not re.fullmatch(r'[0-9a-f]{32}', identifier):
@@ -160,7 +257,7 @@ class IconSearchService:
             if row is None:
                 raise fail('not_found')
             value = (self.progress(identifier) if row['state'] == 'running' else None) or json.loads(row['result'])
-            return {**value, 'id': identifier, 'created_at': row['created'],
+            return {**value, 'id': identifier, 'state': row['state'], 'created_at': row['created'],
                     'finished_at': row['finished'],
                     'expires_at': row['finished'] + SECONDS if row['finished'] else None}
 

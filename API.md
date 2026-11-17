@@ -28,7 +28,7 @@
 
 建议可附 `elapsed_seconds`、`timeout_seconds`、安全的 `request_timing` 与 `error_detail`；后者仅含固定错误码和有效 HTTP 状态，不附供应商正文、密钥或端点。
 
-有效建议在 supervisor 提交原结果后，按原继续下载合同创建独立子任务，沿用该任务 TLS 策略，标记 `input.selection_method=ai`。子任务不继承自动选择，实际下载结果在子任务中查询；原结果不改写。关闭、取消、清空、重启、模型失败或不确定时不自动创建新下载。
+有效建议在 supervisor 提交原结果后，按原继续下载合同创建独立子任务，沿用该任务 TLS 策略，标记 `input.selection_method=ai`。子任务不继承自动选择，实际下载结果在子任务中查询；原结果不改写。自动创建或保存子任务输入失败时，父任务的数据包仍使用已提交的原结果；不自动重放。关闭、取消、清空、重启、模型失败或不确定时不自动创建新下载。
 
 本页是网页服务的接口约定；项目与部署入口见 [README](README.md)，实际验收范围见 [IMPLEMENTATION.md](IMPLEMENTATION.md)。后端执行采集、构建和分析，前端使用同源 JSON API；图片上传使用 multipart 的 `file` 字段，所有响应默认禁止缓存。计划接口不视为已提供。
 
@@ -215,9 +215,9 @@ HTTP 优先；需要动态处理或收到 403/429/502/503 时最多尝试一次�
   新记录的 `timing` 含 `started_at,stage_started_at,stage_elapsed_seconds,total_seconds`、已结束的 `stages[{stage,elapsed_seconds}]` 与 `requests[{stage,route,response_wait_seconds,body_read_seconds,total_seconds,http_status,error_code}]`。`route` 仅为 `direct/configured_proxy`，不公开代理地址。等待响应包含网络和供应商处理；旧记录没有该字段时仍可读取。`error_detail` 保留失败阶段、固定 code 及可得的 HTTP 状态。父进程终止搜索时补结算当前阶段，保留已发现候选；网页的本地计时不自行判定任务结束。
 - `GET /api/icon-searches/{id}/image/{preview|icon}`：当前会话的干净 JPEG 预览。
 - `POST /api/icon-searches/{id}/cancel`：取消本次工作进程。
-- `POST /api/icon-searches/{id}/collect`：`candidate_id`、`tls_policy`，必需 `Idempotency-Key`。明确选择才进入既有有界 HTTP / Chrome 采集；复制截图、图标、哈希与搜索来源到任务 source。搜索本身不创建下载成功记录。
+- `POST /api/icon-searches/{id}/collect`：`candidate_id`、`tls_policy`，必需 `Idempotency-Key`。明确选择才进入既有有界 HTTP / Chrome 采集；复制截图、图标、哈希与搜索来源到任务 source。已取消搜索中保留且证据可验证的候选仍可手动选择，不重启原搜索。搜索本身不创建下载成功记录。
 
 供应商错误区分 `icon_provider_auth`（401）、`icon_provider_forbidden`（403）、`icon_provider_quota`（429）、`icon_provider_http`（其他 HTTP）、`icon_provider_timeout`、`icon_provider_tls`、`icon_provider_proxy`、`icon_provider_connection`、`icon_provider_response_invalid`、`icon_provider_incomplete`。错误响应可附安全整数 `error.http_status`；不透传供应商正文或异常文本，不自动重试。
-- `DELETE /api/jobs` 同时取消并隐藏本会话搜索，不影响其他会话。重启只标记中断，不重试搜索。
+- `DELETE /api/jobs` 同时取消并隐藏本会话搜索，不影响其他会话。重启标记中断；已有候选和截图、图标证据可验证时保留为 `partial`，否则记 `failed`。不重试搜索。
 
 全服务一个搜索槽位、每 24 小时最多 20 次提交、单次 180 秒/768 MiB 工作进程预算。先检查 SerpApi 免费方案且至少余 2 次；每次最多 1 次 Google Lens 搜图和 1 次名称 Android/APK 网页搜索，不自动分页/重试/购买额度。低置信度无名称时只搜图一次。各任务结果及图片结束后保留 7 天；运行中不删，刷新不延长。选择下载时独立复制来源，后续按下载任务保留期限处理。
