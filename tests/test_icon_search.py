@@ -1,6 +1,7 @@
 """Synthetic icon-search acceptance; no provider or candidate network requests."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import threading
@@ -233,28 +234,77 @@ def test_multiframe_image_is_rejected(tmp_path):
         normalize(path)
 
 
-def test_restart_marks_interrupted_without_provider_call(tmp_path):
-    configure(tmp_path)
+@pytest.mark.parametrize('snapshot', [
+    None, b'broken JSON', b'{"timing":{"total_seconds":1e999}}',
+    b'{"recognition":{"name":"\\ud800"}}', b'{"x":' + b'[' * 1100 + b'0' + b']' * 1100 + b'}',
+])
+def test_restart_marks_interrupted_without_provider_call(tmp_path, monkeypatch, snapshot):
+    monkeypatch.setattr(module, 'run_limited', lambda *a, **k: pytest.fail('restart launched a worker'))
     service = IconSearchService(tmp_path)
+    if snapshot is not None:
+        directory = service.directory / ('a' * 32)
+        directory.mkdir()
+        (directory / 'progress.json').write_bytes(snapshot)
     with service.db() as db:
         db.execute('INSERT INTO searches(id,owner,idem,digest,created,state,result) VALUES(?,?,?,?,?,?,?)',
                    ('a' * 32, 'owner', 'key', 'digest', time.time(), 'running', '{}'))
     service.start()
     try:
-        assert service.get('owner', 'a' * 32)['error'] == 'icon_interrupted'
+        result = service.get('owner', 'a' * 32)
+        assert result['state'] == 'failed' and result['error'] == 'icon_interrupted'
         assert not service.active
     finally:
         service.close()
 
 
-def test_api_authenticated_upload_and_explicit_collect(running, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize('valid_evidence', [True, False])
+def test_restart_recovers_saved_search_evidence(tmp_path, monkeypatch, valid_evidence):
+    service = IconSearchService(tmp_path)
+    identifier = 'b' * 32
+    directory = service.directory / identifier
+    directory.mkdir()
+    image = picture()
+    (directory / 'input.image').write_bytes(image)
+    snapshot = execute(tmp_path, directory, FakeProvider())
+    assert snapshot['candidates']
+    snapshot.update(state='running', stage='searching')
+    publish(directory / 'progress.json', snapshot)
+    if not valid_evidence:
+        (directory / 'icon.jpg').write_bytes(b'changed icon bytes')
+    with service.db() as db:
+        db.execute('INSERT INTO searches(id,owner,idem,digest,created,state,result) VALUES(?,?,?,?,?,?,?)',
+                   (identifier, 'owner', 'key', hashlib.sha256(image).hexdigest(), time.time(), 'running', '{}'))
+    monkeypatch.setattr(module, 'run_limited', lambda *a, **k: pytest.fail('restart launched a worker'))
+    service.start()
+    try:
+        result = service.get('owner', identifier)
+        assert result['state'] == ('partial' if valid_evidence else 'failed')
+        assert result['candidates'] == (snapshot['candidates'] if valid_evidence else [])
+        assert result['recognition'] == snapshot['recognition']
+        assert result['error_detail'] == {'stage': 'searching', 'code': 'icon_interrupted'}
+        assert result['expires_at'] == result['finished_at'] + 7 * 86400
+        assert not service.active
+        with pytest.raises(FxfetchError, match='not_found'):
+            service.get('different-owner', identifier)
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize('cancel_search', [False, True])
+def test_api_authenticated_upload_and_explicit_collect(running, monkeypatch, cancel_search):  # noqa: F811
     from test_api import login
     client, jobs, workflow, _ = running
     configure(jobs.store.root)
+    calls = []
+    saved = threading.Event()
+
     def runner(command, **kwargs):
         directory = Path(command[-1])
-        result = execute(jobs.store.root, directory, FakeProvider())
-        publish(directory / 'progress.json', result)
+        calls.append(directory)
+        execute(jobs.store.root, directory, FakeProvider())
+        saved.set()
+        if cancel_search and kwargs['cancel'].wait(5):
+            return ProcessResult(returncode=None, cancelled=True)
         return ProcessResult(returncode=0)
     monkeypatch.setattr(module, 'run_limited', runner)
     assert client.post('/api/icon-searches', files={'file': ('x.png', picture())},
@@ -266,22 +316,51 @@ def test_api_authenticated_upload_and_explicit_collect(running, monkeypatch):  #
                            headers={**headers, 'Idempotency-Key': 'search-key'})
     assert response.status_code == 202
     identifier = response.json()['id']
+    search_path = f'/api/icon-searches/{identifier}'
+    collect_headers = {**headers, 'Idempotency-Key': 'collect-key'}
+    assert saved.wait(2)
+    if cancel_search:
+        in_progress = client.get(search_path).json()
+        assert in_progress['state'] == 'running' and in_progress['finished_at'] is None
+        assert client.post(search_path + '/collect', json={'candidate_id': '1'},
+                           headers=collect_headers).status_code == 400
+        response = client.post(search_path + '/cancel', headers=headers)
+        assert response.status_code == 200 and response.json()['cancel_requested']
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         result = client.get('/api/icon-searches/' + identifier).json()
         if result['finished_at']:
             break
         time.sleep(0.02)
-    assert result['state'] == 'completed'
+    assert result['state'] == ('cancelled' if cancel_search else 'completed')
+    assert result['candidates']
     assert workflow.calls == []
-    assert client.get(f'/api/icon-searches/{identifier}/image/icon').status_code == 200
-    response = client.post(f'/api/icon-searches/{identifier}/collect',
-                           json={'candidate_id': '1'}, headers={**headers, 'Idempotency-Key': 'collect-key'})
+    assert client.get(search_path + '/image/icon').status_code == 200
+    if cancel_search:
+        assert client.post(search_path + '/collect', json={'candidate_id': '1'},
+                           headers={'Origin': 'http://testserver', 'Idempotency-Key': 'collect-key'}).status_code == 403
+        assert client.post(search_path + '/collect', json={'candidate_id': '999'},
+                           headers=collect_headers).status_code == 400
+        icon = calls[0] / 'icon.jpg'
+        saved_icon = icon.read_bytes()
+        icon.write_bytes(b'changed icon bytes')
+        assert client.post(search_path + '/collect', json={'candidate_id': '1'},
+                           headers=collect_headers).status_code == 400
+        icon.write_bytes(saved_icon)
+        assert workflow.calls == []
+    response = client.post(search_path + '/collect', json={'candidate_id': '1'}, headers=collect_headers)
     assert response.status_code == 202, response.text
     job = response.json()
     source = jobs.store.root / 'jobs' / job['id'] / 'source'
     assert (source / 'image.original').read_bytes() == picture()
     assert json.loads((source / 'input.json').read_text())['kind'] == 'icon_search'
+    assert len(calls) == 1
+    if cancel_search:
+        icons = client.app.state.icon_search
+        with icons.db() as db:
+            db.execute('UPDATE searches SET finished=? WHERE id=?', (time.time() - 7 * 86400 - 1, identifier))
+        assert client.post(search_path + '/collect', json={'candidate_id': '1'},
+                           headers=collect_headers).status_code == 404
     assert client.delete('/api/jobs', headers=headers).status_code == 200
     assert client.get('/api/icon-searches/' + identifier).status_code == 404
 

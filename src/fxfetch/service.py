@@ -945,7 +945,11 @@ class JobService:
         except OSError as error:
             # The committed SQLite result stays authoritative if the final evidence write fails.
             log.error("final_evidence_write_failed id=%s exception_type=%s", job["id"], type(error).__name__)
-        self._auto_continue(job, terminal, cancel)
+        try:
+            self._auto_continue(job, terminal, cancel)
+        except Exception as error:
+            # Follow-up scheduling cannot change the already committed collection result.
+            log.error("candidate_auto_continue_failed id=%s exception_type=%s", job["id"], type(error).__name__)
         self._seal_data_package(job, terminal["result"])
 
     def _auto_continue(self, job: dict, terminal: dict, cancel: threading.Event) -> None:

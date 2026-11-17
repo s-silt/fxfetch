@@ -3,6 +3,7 @@ import hashlib
 import json
 import threading
 import time
+import zipfile
 from dataclasses import asdict
 from pathlib import Path
 
@@ -145,6 +146,58 @@ def test_collection_lifecycle_auto_child_keeps_original_result_and_bytes(tmp_pat
     assert evidence['run']['authorized_by'] == 'ai_candidate_selection'
     assert service.get_job('owner', parent['id'])['outcome'] == 'failed'
     assert service.store.claim_job() is None
+
+
+def test_failed_auto_child_write_preserves_committed_parent_and_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    from fxfetch import service as service_module
+
+    entry = 'https://entry.synthetic.test/'
+    selection = result()
+    selection.candidate_advice = {'state': 'selected', 'candidate_index': 0}
+
+    class SyntheticWorkflow(Workflow):
+        def run(self, url, output_dir, cancel, on_event=None):
+            assert url == entry
+            return selection
+
+    service = JobService(Settings(tmp_path, password_hash('synthetic')), workflow=SyntheticWorkflow())
+    parent = service.create_job('owner', 'task', {'url': entry, 'gemini_select': True})
+    atomic_json = service_module.atomic_json
+    child_writes: list[Path] = []
+
+    def fail_child_write(path: Path, value: dict) -> None:
+        if path.name == 'input.json' and value.get('selection_method') == 'ai':
+            child_writes.append(path)
+            raise OSError('synthetic-private-path')
+        atomic_json(path, value)
+
+    monkeypatch.setattr(service_module, 'atomic_json', fail_child_write)
+    service._collect(service.store.claim_job(), threading.Event())
+
+    identifier = parent['id']
+    committed = service.store.get_job('owner', identifier)
+    assert committed['state'] == 'completed'
+    assert committed['result'] == asdict(selection)
+    evidence = json.loads((tmp_path / 'jobs' / identifier / 'evidence.json').read_text(encoding='utf-8'))
+    assert evidence['terminal_status'] == 'committed'
+    assert evidence['summary'] == committed['result']
+    archive, _ = service.data_package_file('owner', identifier)
+    with zipfile.ZipFile(archive) as bundle:
+        manifest = json.loads(bundle.read('manifest.json'))
+    assert manifest['package_result'] == {
+        key: committed['result'][key] for key in ('outcome', 'reason_code', 'coverage')
+    }
+
+    children = service.store.continuation_children('owner', identifier)
+    assert len(children) == len(child_writes) == 1
+    child = service.store.get_job('owner', children[0]['child_id'])
+    assert child['state'] == 'interrupted'
+    assert child['reason_code'] == 'input_persistence_failed'
+    assert service.store.claim_job() is None
+    assert 'candidate_auto_continue_failed' in caplog.text
+    assert 'synthetic-private-path' not in caplog.text
 
 
 def test_private_worker_invokes_model_once_and_preserves_selection(tmp_path, monkeypatch):
