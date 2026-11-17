@@ -3,7 +3,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const activeStates = new Set(["queued", "running", "building", "awaiting_human", "awaiting_selection"]);
-  const labels = {queued:"排队中",running:"采集中",building:"正在打包",completed:"采集结束",cancelled:"已取消",interrupted:"已中断",awaiting_selection:"等待选择",awaiting_human:"等待本机处理",downloaded:"已取得原包",not_found:"本次范围内未找到包",blocked:"访问受阻",failed:"未完成",built:"APK 已生成",disabled:"暂不可用",partial:"覆盖不完整",complete:"本次范围已完成",not_started:"尚未执行"};
+  const labels = {queued:"排队中",running:"采集中",building:"正在打包",completed:"采集结束",cancelled:"已取消",interrupted:"已中断",awaiting_selection:"等待选择",awaiting_human:"等待本机处理",downloaded:"已取得原包",not_found:"本次范围内未找到包",blocked:"访问受阻",failed:"失败",built:"APK 已生成",disabled:"暂不可用",partial:"覆盖不完整",complete:"本次范围已完成",not_started:"尚未执行"};
   const messages = {
     dns_configuration_invalid:"后端 DNS 配置无效，请联系主机管理员检查支持的服务商名称。",
     analysis_unavailable:"后端 fxapk 未配置或不可用，请联系主机管理员。",analysis_source_unavailable:"数据包尚未就绪或不可用，不能启动分析。",
@@ -84,6 +84,23 @@
     epoch:0, clearing:false, mutations:new Set(), pollTimer:null, pollController:null, polling:false, pollDelay:1500, loading:false, activeBuildJobs:new Set(),
     capabilityTimer:null, capabilityController:null, capabilityGeneration:0, capabilityAttempts:0, capabilityDeadline:0, capabilityStatus:"idle"};
 
+  const workspace = globalThis.FxfetchWorkspace?.create({api,
+    canEdit:() => state.authenticated && !state.clearing && !state.submitting && !state.pendingJob && !state.uploading,
+    onMode:mode => { if (mode !== "qr" && state.image) { clearImage(); notice(""); } },
+    onScan:url => { clearImage(); $("url").value = url; updateHost(); }
+  });
+  const iconSearch = globalThis.FxfetchIconSearch?.create({api, key:idempotencyKey,
+    enabled:() => state.authenticated && !state.clearing,
+    collected:async job => {
+      state.current = job.id; rememberJob(job.id); state.pollDelay = 1500;
+      workspace?.showView("collect");
+      await loadJobs(); schedule(); $("job-picker").focus({preventScroll:true});
+    }});
+  const modelSettings = globalThis.FxfetchModelSettings?.create({api,
+    enabled:() => state.authenticated && !state.clearing,
+    changed:model => { if (state.capabilities?.icon_search) state.capabilities.icon_search.model = model; }
+  });
+
   function node(tag, className, text) {
     const element = document.createElement(tag);
     if (className) element.className = className;
@@ -91,6 +108,62 @@
     return element;
   }
   function friendly(code) { return messages[code] || (code?.startsWith("landing_") ? "落地页下载配置超出当前静态解析范围，尚未确定包地址。" : "处理未完成，请稍后重试或查看本机状态。"); }
+  const resultReasons = {
+    task_timeout:"采集超时，已停止", chain_timeout:"下载链路超时，已停止", queue_timeout:"排队超时，尚未执行",
+    network_timeout:"目标连接或读取超时", read_timeout:"读取目标超时", dns_timeout:"DNS 解析超时",
+    timed_out:"处理超时，已停止", browser_worker_start_timeout:"Android Chrome 启动超时",
+    network_failed:"目标连接失败", browser_network_error:"Chrome 页面请求失败",
+    browser_transport_failed:"浏览器连接或传输失败", browser_navigation_failed:"Chrome 跳转失败",
+    dns_failed:"DNS 解析失败", dns_nxdomain:"DNS 返回域名不存在", dns_no_addresses:"DNS 未返回地址",
+    dns_invalid_response:"DNS 响应校验失败", dns_tls_verification_failed:"DNS 服务证书校验失败",
+    dns_unsafe_answer:"DNS 返回非公网地址，已停止", target_not_public:"地址未通过公网检查，已停止",
+    dns_configuration_invalid:"DNS 配置无效", tls_verification_failed:"目标证书校验失败，已停止",
+    tls_handshake_failed:"TLS 连接失败", device_verification_required:"设备验证受阻，尚未取得原包",
+    challenge_detected:"验证或访问控制受阻", http_access_control:"目标限制访问",
+    page_qr_access_control:"二维码图片访问受阻", page_qr_incomplete:"二维码检查存在缺口",
+    browser_required:"需要 Chrome 动态采集", browser_worker_unavailable:"Android Chrome 未能连接",
+    browser_worker_configuration:"Android Chrome 配置无效", browser_guard_unavailable:"Chrome 采集暂不可用",
+    browser_dynamic_incomplete:"动态页面采集存在缺口", browser_worker_scope_unsupported:"页面后台脚本暂不支持",
+    browser_download_not_intercepted:"下载未能安全接管，已停止", browser_content_loop:"跳转循环，已停止",
+    discovery_cycle:"跳转循环，已停止", continuation_cycle:"候选地址循环，已停止",
+    redirect_limit:"跳转次数已达上限", candidate_limit:"候选数量已达上限", workflow_limit:"采集预算已用尽",
+    body_limit:"响应读取已达上限", web_budget:"页面资源已达读取上限", browser_script_limit:"脚本读取已达上限",
+    transfer_failed:"文件传输中断", length_mismatch:"文件不完整：长度不符",
+    http_status:"目标返回 HTTP 错误", browser_http_error:"页面或资源返回 HTTP 错误",
+    candidate_not_package:"候选响应不是应用包", landing_mirrors_failed:"已尝试的下载镜像均未取得有效包",
+    landing_pattern_ambiguous:"下载配置存在歧义，需选择", landing_static_decode_failed:"下载配置解析失败",
+    flutter_runtime_required:"Flutter 页面仍需动态采集", flutter_source_download_limit:"Flutter 脚本读取已达上限",
+    flutter_source_limit:"Flutter 资源读取已达上限", flutter_main_reference_unknown:"未确认 Flutter 主脚本地址",
+    storage_failed:"本机文件保存失败", input_persistence_failed:"入口保存失败，已停止",
+    text_charset_conflict:"页面编码冲突", text_charset_unsupported:"页面编码暂不支持", text_decode_failed:"页面文字解码失败",
+    internal_error:"采集处理异常", service_restarted:"服务重启，采集已中断",
+    archive_invalid:"原文件校验失败", archive_unsupported:"原文件格式无法校验",
+    archive_limit:"原文件校验超过限额", archive_ambiguous:"原文件结构校验存在歧义"
+  };
+  function resultLabel(item) {
+    const result = item.result || item;
+    const reason = result.reason_code || item.reason_code;
+    const outcome = item.outcome || result.outcome;
+    // Live state wins over stale outcomes; building a WebView never changes the original-package result.
+    if (activeStates.has(item.state)) {
+      if (item.state === "running") {
+        const events = item.progress?.events || [];
+        const latest = events.at(-1) || (item.progress?.event ? item.progress : null);
+        return latest ? eventText(latest) : labels.running;
+      }
+      return labels[item.state];
+    }
+    if (item.state === "cancelled" || reason === "cancelled") return "采集已取消";
+    if (item.state === "interrupted") return resultReasons[reason] || "采集已中断";
+    if (outcome === "downloaded") return "已取得原包";
+    if ((item.rejected_files || []).some(file => file.validation_status === "failed")) return "原文件校验失败，可下载原文件";
+    if (reason === "candidate_selection_required") return (item.download_candidates || []).length === 1 ? "发现下载候选" : "发现多个下载候选";
+    if (resultReasons[reason]) return resultReasons[reason];
+    if (outcome === "blocked") return "访问受阻，尚未取得原包";
+    if (outcome === "failed") return "采集失败，尚未取得原包";
+    if (outcome === "not_found") return "本次范围内未找到原包";
+    return labels[item.state] || "尚未取得采集结论";
+  }
   function notice(text, error = false) {
     $("notice").textContent = text;
     $("notice").classList.toggle("error", error);
@@ -108,6 +181,9 @@
     $("tls-policy-summary").textContent = $("tls-policy").value === "strict" ? "证书：严格验证" : "证书：自动处理";
   }
   function signedOut(expired = false) {
+    iconSearch?.reset();
+    modelSettings?.reset();
+    workspace?.reset();
     clearDirectLink();
     $("tls-policy").value = "auto";
     $("advanced-settings").open = false;
@@ -144,7 +220,7 @@
     const abort = () => controller.abort();
     if (external) external.addEventListener("abort", abort, {once:true});
     if (external && external.aborted) controller.abort();
-    const timeout = setTimeout(abort, options.upload ? 30000 : 15000);
+    const timeout = setTimeout(abort, options.upload ? 30000 : options.timeoutMs === 35000 ? 35000 : 15000);
     const headers = new Headers(options.headers || {});
     const method = options.method || "GET";
     if (method !== "GET" && state.csrf) headers.set("X-CSRF-Token", state.csrf);
@@ -159,6 +235,7 @@
         const error = new Error(friendly(code));
         error.code = code;
         error.status = response.status;
+        if (Number.isInteger(payload.error?.http_status) && payload.error.http_status >= 100 && payload.error.http_status <= 599) error.httpStatus = payload.error.http_status;
         throw error;
       }
       return payload;
@@ -222,6 +299,7 @@
       const capabilities = await api("/api/capabilities", {signal:controller.signal});
       if (generation !== state.capabilityGeneration || !state.authenticated || document.hidden) return;
       state.capabilities = capabilities;
+      iconSearch?.update();
       state.capabilityStatus = capabilities.chrome?.checking ? "checking" : "ready";
       renderCapabilities();
       if (!state.clearing) renderJob();
@@ -268,7 +346,7 @@
     if (!state.jobs.length) picker.append(new Option("还没有任务", ""));
     for (const job of state.jobs) {
       const date = new Date(job.created * 1000).toLocaleString("zh-CN", {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"});
-      picker.append(new Option(`${date} · ${labels[job.state] || "任务"}`, job.id));
+      picker.append(new Option(`${date} · ${resultLabel(job)}`, job.id));
     }
     picker.value = state.current || "";
     rememberJob(state.current);
@@ -303,7 +381,7 @@
     card.append(info, link);
     return card;
   }
-  const eventLabels = {tls_certificate_error:"证书校验失败，已记录错误",tls_fallback_continued:"按本任务策略继续，服务器身份未经验证",download_action:"点击下载控件",browser_preparing:"准备 Android Chrome",browser_started:"浏览器已启动",browser_connection:"正在连接目标",browser_connection_blocked:"目标连接被拒绝",interaction_started:"操作下载控件",build_preparing:"准备模板",build_resources:"整理离线资源与字体",build_compiling:"编译 APK",build_signing:"签名",build_verifying:"校验签名与应用包",build_saving:"保存文件",task_started:"开始采集",request:"正在请求",response_received:"收到响应",response_progress:"正在接收响应",queue_timeout:"排队超时，未执行",redirect:"发生跳转",page_received:"已取得页面",download_candidate:"发现下载候选，尚未验证",download_started:"开始传输候选文件，尚未验证",download_progress:"正在传输",response_complete:"响应传输结束",file_verifying:"正在核验文件",file_verified:"文件核验通过",challenge_detected:"观察到验证或访问控制",browser_required:"静态采集仍有脚本覆盖缺口",task_completed:"本次采集结束",task_timeout:"采集超时，已停止",cancelled:"已取消",building:"开始打包",built:"APK 已生成",build_timeout:"打包超时，已停止",failed:"处理未完成"};
+  const eventLabels = {candidate_advising:"AI 正在选择下载候选",candidate_advised:"AI 候选判断结束",tls_certificate_error:"证书校验失败，已记录错误",tls_fallback_continued:"按本任务策略继续，服务器身份未经验证",download_action:"点击下载控件",browser_preparing:"准备 Android Chrome",browser_started:"浏览器已启动",browser_connection:"正在连接目标",browser_connection_blocked:"目标连接被拒绝",interaction_started:"操作下载控件",build_preparing:"准备模板",build_resources:"整理离线资源与字体",build_compiling:"编译 APK",build_signing:"签名",build_verifying:"校验签名与应用包",build_saving:"保存文件",task_started:"开始采集",request:"正在请求",response_received:"收到响应",response_progress:"正在接收响应",queue_timeout:"排队超时，未执行",redirect:"发生跳转",page_received:"已取得页面",download_candidate:"发现下载候选，尚未验证",download_started:"开始传输候选文件，尚未验证",download_progress:"正在传输",response_complete:"响应传输结束",file_verifying:"正在核验文件",file_verified:"文件核验通过",challenge_detected:"观察到验证或访问控制",browser_required:"静态采集仍有脚本覆盖缺口",task_completed:"本次采集结束",task_timeout:"采集超时，已停止",cancelled:"已取消",building:"开始打包",built:"APK 已生成",build_timeout:"打包超时，已停止",failed:"处理未完成"};
   function eventText(event) {
     if (["dns_resolution_observed", "dns_resolution_failed", "dns_resolution_success"].includes(event?.event)) {
       const provider = {alidns:"阿里 DNS", dnspod:"DNSPod", cloudflare:"Cloudflare DNS", google:"Google DNS"}[event.provider] || "DNS";
@@ -335,7 +413,7 @@
     const panel = node("section", `live-progress ${isBuild ? "build-progress" : "collection-progress"} ${active ? "is-active" : "is-finished"}`);
     panel.append(node("h3", "", isBuild ? "打包进度" : "采集进度"));
     const finalReason = item.result?.reason_code || item.reason_code;
-    const currentText = !active ? eventLabels[finalReason] || labels[item.outcome] || labels[item.state] || "本次处理结束" : latest ? eventText(latest) : item.state === "queued" ? "等待执行" : "正在处理";
+    const currentText = !active ? isBuild ? eventLabels[finalReason] || labels[item.outcome] || labels[item.state] || "本次处理结束" : resultLabel(item) : latest ? eventText(latest) : item.state === "queued" ? "等待执行" : "正在处理";
     const summary = node("p", "progress-current", currentText);
     summary.setAttribute("role", "status"); panel.append(summary);
     const mode = latest?.network_mode || [...events].reverse().find((event) => event.network_mode)?.network_mode || item.result?.network_mode;
@@ -470,8 +548,13 @@
       content.append(panel);
     }
   }
+  let displayedJobId = null;
   function renderJob() {
     const job = state.job, content = $("job-content");
+    const sameJob = !!job && displayedJobId === job.id;
+    const scrollTop = sameJob ? content.scrollTop || 0 : 0;
+    const timelineScroll = sameJob ? Array.from(content.querySelectorAll?.(".progress-timeline") || [], list => list.scrollTop) : [];
+    displayedJobId = job?.id || null;
     content.replaceChildren();
     content.hidden = !job;
     $("job-empty").hidden = !!job;
@@ -484,7 +567,48 @@
       cancel.onclick = () => cancelJob(job.id, cancel);
       heading.append(cancel);
     }
-    content.append(heading, node("p", "job-url", job.input?.entry_url || ""));
+    content.append(heading);
+    const summaryResult = job.result || {};
+    const reason = summaryResult.reason_code || job.reason_code;
+    const resultTone = ["failed", "blocked"].includes(job.outcome) ? " warn" : "";
+    const packageResult = node("h3", `package-result${resultTone}`, `原包结果：${resultLabel(job)}`);
+    packageResult.setAttribute("role", "status");
+    content.append(packageResult, node("p", "job-url", job.input?.entry_url || ""));
+    const advice = summaryResult.candidate_advice;
+    if (advice && advice.state !== "not_needed") {
+      const adviceReasons = {
+        ai_timeout:"AI 选择达到限时，已保留候选，请手动选择。",
+        ai_budget_insufficient:"剩余时间不足，已跳过 AI 选择，请手动选择。",
+        ai_worker_failed:"AI 判断未能完成，已保留候选，请手动选择。",
+        invalid_model_response:"AI 返回内容格式无效，已保留候选，请手动选择。",
+        icon_search_unconfigured:"AI 模型服务尚未配置，请从已保留的候选中手动选择。",
+        icon_provider_auth:"模型服务认证失败，请从已保留的候选中手动选择。",
+        icon_provider_forbidden:"模型服务拒绝访问，请检查节点或模型权限，并手动选择候选。",
+        icon_provider_quota:"模型服务额度不足或限流，请从已保留的候选中手动选择。",
+        icon_provider_timeout:"等待模型服务响应超时，已保留候选，请手动选择。",
+        icon_provider_tls:"模型服务 HTTPS 证书或 TLS 连接校验失败，请手动选择候选。",
+        icon_provider_proxy:"模型代理连接失败，请从已保留的候选中手动选择。",
+        icon_provider_connection:"无法连接模型服务，请从已保留的候选中手动选择。",
+        icon_provider_response_invalid:"模型服务返回的内容格式无效，请手动选择候选。",
+        icon_provider_incomplete:"模型服务响应未完整接收，请手动选择候选。",
+        icon_provider_http:"模型服务返回异常 HTTP 状态，请手动选择候选。",
+        icon_provider_response_limit:"模型服务响应超过读取上限，请手动选择候选。",
+        icon_provider_failed:"模型服务请求失败，请从已保留的候选中手动选择。"
+      };
+      const http = advice.error_detail?.http_status;
+      const httpDetail = Number.isInteger(http) && http >= 100 && http <= 599 ? `（上游 HTTP ${http}）` : "";
+      content.append(node("p", "result-note candidate-advice", advice.state === "selected"
+        ? "AI 已建议 Android 候选；下方可查看继续下载的任务。建议不代表文件有效。"
+        : (adviceReasons[advice.reason] || "AI 未能确定下载地址，请从候选中选择。") + httpDetail));
+      if (Number.isFinite(advice.elapsed_seconds) && advice.elapsed_seconds >= 0)
+        content.append(node("p", "muted candidate-advice-timing", `AI 判断耗时 ${advice.elapsed_seconds.toFixed(1)} 秒。`));
+      if (advice.requested_model !== advice.returned_model && advice.returned_model)
+        content.append(node("p", "muted", `模型返回：${advice.returned_model}（与请求不同）`));
+    }
+    const retention = job.retention;
+    if (retention) content.append(node("p", "result-note", retention.expires_at
+      ? `后台文件保留 7 天，预计于 ${new Date(retention.expires_at * 1000).toLocaleString()} 到期后自动删除，请及时下载。后续打包或解析结束后重新计时。`
+      : "任务或关联操作尚未结束，暂不清理；全部结束后保留 7 天。"));
     const tlsPolicy = job.tls_policy || job.input?.tls_policy;
     const tlsFallback = job.tls_fallback || job.data_package?.tls_fallback;
     if (tlsFallback?.observed === true) content.append(node("p", "tls-warning", `本次记录了 ${tlsFallback.count} 次证书校验失败后的继续访问。相关 HTTPS 服务器身份未经验证，页面或 APK 可能被冒充、篡改。文件校验通过不代表来源可信；具体错误、证书原件及获取缺口保留在数据包中。${tlsFallback.state === "unavailable" ? "另有未能确认的证书处理记录，请查看数据包缺口。" : ""}`));
@@ -492,8 +616,33 @@
     else if (tlsFallback?.state === "unavailable") content.append(node("p", "tls-warning", "证书处理记录不完整，暂时不能确认是否发生了放宽校验。请查看数据包中的错误及获取缺口。"));
     else if (tlsPolicy === "auto") content.append(node("p", "muted", "证书策略：先校验，仅证书校验失败时继续；错误和原件随数据包保留。"));
     else if (tlsPolicy === "strict") content.append(node("p", "muted", "证书策略：严格校验，证书错误时停止。"));
-    content.append(node("p", "", `原包结果：${labels[job.outcome] || "尚未取得结论"}`));
+    const collectorLabel = {http:"静态 HTTP 采集",android_chrome:"Android Chrome 采集",android_chrome_unavailable:"Android Chrome 未能启动"}[summaryResult.collector_mode];
+    if (collectorLabel) content.append(node("p", "muted", collectorLabel));
+    if (reason) content.append(node("p", "result-note", job.download_selection_unavailable ? "这条旧记录没有保存可继续的候选，请重新提交入口。" : friendly(reason)));
+    if (summaryResult.coverage) content.append(node("p", "muted", `覆盖范围：${labels[summaryResult.coverage] || "存在未完成范围"}`));
+    if (job.outcome !== "downloaded") {
+      if (summaryResult.offline?.available) content.append(node("p", "offline-status", "已有离线页面内容。离线可用范围取决于已保存的内容，不代表网站业务可离线运行。"));
+      else if (!activeStates.has(job.state)) content.append(node("p", "offline-status", "未取得网站离线内容。联网入口与原采集结果保留。"));
+    }
     const artifacts = job.artifacts || [];
+    const actions = node("nav", "task-actions");
+    actions.setAttribute("aria-label", "当前任务功能");
+    for (const [label, selector, available] of [
+      ["网页打包", ".build-panel", (job.web_candidates || []).length && job.outcome !== "downloaded"],
+      ["材料与数据包", ".data-package", !!job.data_package],
+      ["离线分析", ".analysis-panel", true]
+    ]) {
+      if (!available) continue;
+      const button = node("button", "secondary", label);
+      button.type = "button";
+      button.onclick = () => {
+        const panel = content.querySelector(selector);
+        if (panel) { panel.tabIndex = -1; panel.focus({preventScroll:true}); panel.scrollIntoView({behavior:"smooth",block:"start"}); }
+      };
+      actions.append(button);
+    }
+    content.append(actions);
+    renderContinuation(job, content);
     if (artifacts.length) {
       const files = node("section", "details download-files");
       files.append(node("h3", "", "应用文件（单独下载）"));
@@ -501,34 +650,32 @@
       content.append(files);
     }
     renderRejectedFiles(job, content);
-    renderBuildPanel(job, content, artifacts);
     renderProgress(job, content);
-    FxfetchDataPackage.render(job, content, {node, bytes, friendly});
-    FxfetchAnalysis.render(job, content, {
+    const tools = node("div", "result-tools");
+    renderBuildPanel(job, tools, artifacts);
+    FxfetchDataPackage.render(job, tools, {node, bytes, friendly});
+    FxfetchAnalysis.render(job, tools, {
       node, friendly, capability:state.capabilities?.web_analysis,
       submitting:!!state.pendingAnalyses.get(job.id)?.busy,
       onStart:(button) => submitAnalysis(job, button),
       onCancel:(id, button) => cancelAnalysis(job.id, id, button)
     });
+    content.append(tools);
+    const diagnostics = node("details", "task-diagnostics");
+    const detailsKey = `details:${job.id}`;
+    diagnostics.open = state.progressExpanded.has(detailsKey);
+    diagnostics.ontoggle = () => { if (diagnostics.open) state.progressExpanded.add(detailsKey); else state.progressExpanded.delete(detailsKey); };
+    diagnostics.append(node("summary", "", "链路与采集详情"));
     const result = job.result || {};
     if ((result.network_attempts || []).length) {
       const network = node("section", "details network-attempts");
       network.append(node("h3", "", "网络尝试记录"));
       for (const attempt of result.network_attempts) {
         const detail = attempt.result || {};
-        network.append(node("p", "", `${attempt.network_mode === "proxy" ? "本机代理" : "直连"} · ${labels[detail.outcome] || "未完成"}${result.network_attempts.length > 1 ? " · " + friendly(detail.reason_code) : ""}`));
+        network.append(node("p", "", `${attempt.network_mode === "proxy" ? "本机代理" : "直连"} · ${resultLabel(detail)}`));
       }
       if (result.network_attempts.length > 1) network.append(node("p", "muted", "代理尝试使用独立访问，直连结果保留，不继承页面登录状态。"));
-      content.append(network);
-    }
-    const reason = result.reason_code || job.reason_code;
-    const collectorLabel = {http:"静态 HTTP 采集",android_chrome:"Android Chrome 采集",android_chrome_unavailable:"Android Chrome 未能启动"}[result.collector_mode];
-    if (collectorLabel) content.append(node("p", "muted", collectorLabel));
-    if (reason) content.append(node("p", "result-note", job.download_selection_unavailable ? "这条旧记录没有保存可继续的候选，请重新提交入口。" : friendly(reason)));
-    if (result.coverage) content.append(node("p", "muted", `覆盖范围：${labels[result.coverage] || "存在未完成范围"}`));
-    if (job.outcome !== "downloaded") {
-      if (result.offline?.available) content.append(node("p", "offline-status", "已有离线页面内容。离线可用范围取决于已保存的内容，不代表网站业务可离线运行。"));
-      else if (!activeStates.has(job.state)) content.append(node("p", "offline-status", "未取得网站离线内容。联网入口与原采集结果保留。"));
+      diagnostics.append(network);
     }
     if ((result.attempts || []).length) {
       const attempts = node("section", "details");
@@ -537,15 +684,19 @@
         const line = node("div", "attempt");
         line.append(node("strong", "", attempt.chain === "android" ? "Android" : "iPhone"));
         const discoveryEvent = !attempt.outcome && ["candidate_discovered","landing_candidate_discovered"].includes(attempt.reason_code);
-        line.append(node("span", "", `${discoveryEvent ? "已发现下载地址" : labels[attempt.outcome] || "继续处理中"} · ${labels[attempt.coverage] || "范围待确认"}`));
+        line.append(node("span", "", `${discoveryEvent ? "已发现下载地址，尚未验证" : resultLabel(attempt)} · ${labels[attempt.coverage] || "范围待确认"}`));
         if (attempt.reason_code && attempt.reason_code !== "candidate_discovered") line.append(node("p", "muted", friendly(attempt.reason_code)));
         attempts.append(line);
       }
-      content.append(attempts);
+      diagnostics.append(attempts);
     }
-    renderContinuation(job, content);
+    content.append(diagnostics);
     if (busy(job)) content.append(node("p", "refresh-note", "正在自动更新 · 离开当前页面后暂停轮询"));
     else content.append(node("p", "refresh-note", "任务已停止更新，刷新会清空当前会话记录。"));
+    content.scrollTop = scrollTop;
+    Array.from(content.querySelectorAll?.(".progress-timeline") || []).forEach((list, index) => {
+      if (timelineScroll[index] !== undefined) list.scrollTop = timelineScroll[index];
+    });
   }
   async function viewRelatedJob(id) {
     if (state.clearing) return;
@@ -647,9 +798,11 @@
   }
   function updateInput() {
     updateTLSChoice();
+    workspace?.update();
     const locked = state.submitting || !!state.pendingJob || state.clearing;
     $("url").disabled = locked;
     $("tls-policy").disabled = locked;
+    $("ai-select").disabled = locked;
     $("image-file").disabled = locked || state.uploading;
     $("clear-image").disabled = locked || state.uploading;
     $("dropzone").setAttribute("aria-disabled", String(locked || state.uploading));
@@ -678,6 +831,7 @@
     const imageTypes = ["image/png","image/jpeg","image/webp","image/heic","image/heif","image/avif","image/bmp","image/x-ms-bmp","image/gif","image/tiff"];
     if (!file || (!imageTypes.includes(file.type) && !/\.(png|jpe?g|jfif|webp|heic|heif|avif|bmp|gif|tiff?)$/i.test(file.name || ""))) { notice("只允许上传图片：手机截图、PNG、JPEG、HEIC、WebP、AVIF、BMP、静态 GIF 或单页 TIFF。", true); return; }
     if (file.size > 10 * 1024 * 1024) { notice(messages.image_too_large, true); return; }
+    workspace?.select("qr");
     clearImage();
     state.uploading = true;
     $("image-result").hidden = false;
@@ -752,7 +906,7 @@
         if (epoch !== state.epoch) return;
         if (!preview.request_url || ["unsupported", "store"].includes(preview.kind)) throw new Error(messages.unsupported_input);
         $("url").value = preview.url; updateHost();
-        const body = {url:originalInput,tls_policy:$("tls-policy").value};
+        const body = {url:originalInput,tls_policy:$("tls-policy").value,gemini_select:!!$("ai-select").checked};
         if (state.image && state.selectedQR) {
           body.image_id = state.image.id; body.candidate_id = state.selectedQR.id;
           const original = state.selectedQR.kind === "itms_manifest" ? state.selectedQR.text : state.selectedQR.url;
@@ -875,6 +1029,9 @@
   async function clearRecords(showNotice = true) {
     if (state.clearing || !state.authenticated) return;
     state.clearing = true;
+    iconSearch?.reset();
+    modelSettings?.reset();
+    workspace?.reset();
     state.epoch += 1;
     stopPolling();
     $("refresh").disabled = true;
@@ -890,9 +1047,9 @@
       // records; late responses are ignored by the epoch checks above.
       await Promise.allSettled([...state.mutations]);
       await api("/api/jobs", {method:"DELETE"});
-      if (showNotice) notice("当前会话记录已清空。原始文件保留在后端主机。");
+      if (showNotice) notice("当前会话记录已清空。后台文件仍按任务结束后 7 天的期限自动清理。");
     } catch (error) { if (state.authenticated) notice(error.message,true); }
-    finally { state.clearing = false; $("refresh").disabled = false; updateInput(); }
+    finally { state.clearing = false; $("refresh").disabled = false; updateInput(); iconSearch?.update(); modelSettings?.update(); }
   }
   $("refresh").onclick = () => clearRecords();
   $("tls-policy").value = "auto";

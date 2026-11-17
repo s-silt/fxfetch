@@ -17,6 +17,7 @@ import zipfile
 from pathlib import Path
 
 import uvicorn
+from desktop_ui_assertions import DESKTOP_SIZES, assert_desktop_workspace, assert_same_page
 from playwright.sync_api import sync_playwright
 
 from fxfetch.config import Settings
@@ -115,8 +116,8 @@ def main() -> None:
                 "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
             ])
             try:
-                context = browser.new_context(viewport={"width": 1280, "height": 1000}, accept_downloads=True)
-                external, builds = [], []
+                context = browser.new_context(viewport=DESKTOP_SIZES['desktop-1280'], accept_downloads=True)
+                external, builds, errors = [], [], []
 
                 def route_request(route):
                     if route.request.url.startswith(origin + "/"):
@@ -128,11 +129,13 @@ def main() -> None:
                 context.on("request", lambda request: builds.append(request.url)
                            if request.method == "POST" and request.url.endswith("/web-apk-builds") else None)
                 page = context.new_page()
+                page.on('pageerror', lambda error: errors.append(str(error)))
                 page.set_default_timeout(15000)
                 page.goto(origin)
                 page.locator("#password").fill(password)
                 page.locator("#login-form button[type=submit]").click()
                 page.locator("#workspace").wait_for(state="visible")
+                original_url = page.url
                 page.locator("#url").fill(ENTRY)
                 with page.expect_response(lambda response: response.url == origin + "/api/jobs"
                                           and response.request.method == "POST") as submitted:
@@ -150,13 +153,20 @@ def main() -> None:
                 assert "已取得原包" not in page.locator("#job-content").inner_text()
                 panel = page.locator(".build-panel")
                 panel.wait_for(state="visible")
-                assert panel.evaluate("p => !!(p.compareDocumentPosition(document.querySelector('.collection-progress')) & Node.DOCUMENT_POSITION_FOLLOWING)")
+                assert panel.evaluate("p => !!(p.compareDocumentPosition(document.querySelector('.collection-progress')) & Node.DOCUMENT_POSITION_PRECEDING)")
                 action = panel.get_by_role("button", name="打包 APK", exact=True)
                 assert action.is_enabled()
-                for width, height, name in [(1280, 1000, "desktop-before-build"), (375, 812, "mobile-before-build")]:
-                    page.set_viewport_size({"width": width, "height": height})
-                    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-                    page.screenshot(path=str(output / f"{name}.png"), full_page=True)
+                page.locator('#view-search').click()
+                assert_desktop_workspace(page, 'search')
+                page.locator('#show-tasks').click()
+                assert page.locator('#job-picker').input_value() == job_id
+                assert page.locator('#url').input_value() == ENTRY
+                assert not builds and builder.calls == 0
+                assert_same_page(page, original_url)
+                for name, viewport in DESKTOP_SIZES.items():
+                    page.set_viewport_size(viewport)
+                    assert_desktop_workspace(page)
+                    page.screenshot(path=str(output / f"{name}-before-build.png"), full_page=True)
                 with page.expect_download() as downloaded:
                     rejected.click()
                 original_copy = output / "rejected-original.apk"
@@ -196,19 +206,21 @@ def main() -> None:
                 generated_copy = output / "generated.apk"
                 generated_download.value.save_as(generated_copy)
                 assert generated_copy.read_bytes() == builder.data and generated_copy.read_bytes() != raw
-                for width, height, name in [(375, 812, "mobile-after-build"), (1280, 1000, "desktop-after-build")]:
-                    page.set_viewport_size({"width": width, "height": height})
-                    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-                    page.screenshot(path=str(output / f"{name}.png"), full_page=True)
+                for name, viewport in DESKTOP_SIZES.items():
+                    page.set_viewport_size(viewport)
+                    assert_desktop_workspace(page)
+                    page.screenshot(path=str(output / f"{name}-after-build.png"), full_page=True)
                 assert not external and transport.calls == [ENTRY, ENTRY + "original.apk"]
+                assert not errors, errors
                 assert len(builds) == builder.calls == 1
                 summary.update(passed=True, original_outcome="failed", validation_reason="archive_invalid",
                                rejected_sha256=hashlib.sha256(raw).hexdigest(), rejected_bytes=len(raw),
                                generated_sha256=hashlib.sha256(builder.data).hexdigest(),
                                build_posts=1, synthetic_builds=1, external_browser_requests=0,
-                               acquisition_requests=2, build_panel_before_progress=True,
+                               acquisition_requests=2, build_panel_after_progress=True,
                                bundled_original_identical=True, bundled_validation="failed",
-                               viewport_widths=[1280, 375])
+                               desktop_two_columns=True, same_page_task_preservation=True,
+                               viewport_widths=[1280, 1440, 1920])
                 context.close()
             finally:
                 browser.close()

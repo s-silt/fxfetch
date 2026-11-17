@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .core.errors import FxfetchError
+from .retention import initialize as initialize_retention
 
 TERMINAL = {"completed", "cancelled", "interrupted"}
 PROGRESS_TIMING = (
@@ -84,6 +85,7 @@ class Store:
                 db.execute("ALTER TABLE builds ADD COLUMN progress TEXT")
             if "used" not in {row[1] for row in db.execute("PRAGMA table_info(images)")}:
                 db.execute("ALTER TABLE images ADD COLUMN used INTEGER NOT NULL DEFAULT 0")
+            initialize_retention(db)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -285,7 +287,7 @@ class Store:
         result = dict(row)
         for key in ("input", "result", "progress"):
             result[key] = json.loads(result[key]) if result[key] else None
-        for key in ("request_hash", "idem"):
+        for key in ("request_hash", "idem", "purging", "retention_checked"):
             result.pop(key, None)
         return result
 

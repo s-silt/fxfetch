@@ -18,11 +18,14 @@ COMPOSE = PROJECT / "deploy/android-docker/compose.yaml"
 
 
 def run(arguments: list[str], timeout: float, *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    environment = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    if Path(arguments[0]).name.lower() == "powershell.exe":
+        environment = {key: value for key, value in environment.items() if key.casefold() != "psmodulepath"}
     result = subprocess.run(
         # WSL can emit localized UTF-16 diagnostics on stderr even when its
         # Linux stdout is UTF-8. Diagnostics are never used as readiness proof
         # or echoed; do not let a decoder thread abort a successful probe.
-        arguments, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+        arguments, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=environment,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if len(result.stdout) > 2 * 1024**2 or len(result.stderr) > 2 * 1024**2:
@@ -144,7 +147,7 @@ def main() -> None:
         if shell is None:
             raise ValueError("windows_powershell_required_for_firewall_verification")
         # VerifyOnly refuses missing/conflicting policy; never creates/relaxes rules.
-        run([shell, "-NoProfile", "-NonInteractive", "-File", str(PROJECT / "scripts/configure-docker-lan.ps1"),
+        run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(PROJECT / "scripts/configure-docker-lan.ps1"),
              "-LanIP", address, "-Subnet", args.lan_subnet, "-Port", str(port),
              "-PythonPath", sys.executable, "-VerifyOnly"], 45)
     print(json.dumps({"phase": "configuration_verified", "publication": f"{address}:{port}"}), flush=True)

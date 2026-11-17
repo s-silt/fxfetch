@@ -1,6 +1,7 @@
 """Version-one LAN API. All target access enters the explicit job action."""
 
 import asyncio
+import re
 import secrets
 import time
 from collections import defaultdict, deque
@@ -24,14 +25,17 @@ from ..core.errors import FxfetchError
 from ..core.lan import client_allowed
 from ..core.qr import decode_image
 from ..core.tls_policy import web_tls_policy
+from ..icon_search.service import IconSearchService
+from ..model_settings import ModelSettingsService
 from ..security import contained_path, password_matches, token_hash
 from ..service import JobService
 from ..store import Store
 
 
 class BoundaryMiddleware:
-    def __init__(self, app: ASGIApp, settings: Settings, store: Store):
+    def __init__(self, app: ASGIApp, settings: Settings, store: Store, jobs: JobService):
         self.app, self.settings, self.store = app, settings, store
+        self.jobs = jobs
         self.upload_busy = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -53,7 +57,8 @@ class BoundaryMiddleware:
                     scope, receive, send
                 )
                 return
-        maximum = self.settings.limits.max_upload_bytes if scope["path"] == "/api/qr-images" else 64 * 1024
+        image_upload = scope["path"] in ("/api/qr-images", "/api/icon-searches")
+        maximum = self.settings.limits.max_upload_bytes if image_upload else 64 * 1024
         try:
             if int(headers.get("content-length", "0")) > maximum:
                 raise ValueError
@@ -63,6 +68,7 @@ class BoundaryMiddleware:
             )
             return
         # Authenticate before multipart parsing/spooling, not only inside the endpoint.
+        current = None
         if scope["path"].startswith("/api/") and scope["path"] not in ("/api/login", "/api/session"):
             cookie = SimpleCookie()
             try:
@@ -80,7 +86,7 @@ class BoundaryMiddleware:
                     scope, receive, send
                 )
                 return
-        uploading = scope["path"] == "/api/qr-images" and scope["method"] == "POST"
+        uploading = image_upload and scope["method"] == "POST"
         if uploading:
             if self.upload_busy:
                 await JSONResponse({"detail": "decoder_busy"}, status_code=429)(scope, receive, send)
@@ -150,6 +156,18 @@ class BoundaryMiddleware:
                 message["headers"] = list(message.get("headers", [])) + extra
             await send(message)
 
+        retained = None
+        download = re.fullmatch(
+            r"/api/jobs/([0-9a-f]{32})/(?:data-package|artifacts/[^/]+|rejected-files/[^/]+|analyses/[^/]+/report\.zip)",
+            scope["path"],
+        )
+        if download and current and scope["method"] in ("GET", "HEAD"):
+            try:
+                await run_in_threadpool(self.jobs.retain_download, current["id"], download[1])
+                retained = download[1]
+            except FxfetchError:
+                await JSONResponse({"detail": "not_found"}, status_code=404)(scope, receive, send)
+                return
         try:
             await self.app(scope, bounded_receive, guarded_send)
         except HTTPException as exc:
@@ -159,6 +177,8 @@ class BoundaryMiddleware:
                 scope, receive, send
             )
         finally:
+            if retained:
+                self.jobs.release_download(retained)
             if uploading:
                 self.upload_busy = False
 
@@ -183,6 +203,7 @@ class TLSInput(StrictModel):
 
 
 class JobInput(TLSInput):
+    gemini_select: StrictBool = False
     url: str | None = Field(default=None, max_length=8192)
     image_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     candidate_id: str | None = Field(default=None, max_length=80)
@@ -204,24 +225,35 @@ class EmptyInput(StrictModel):
     pass
 
 
+class ModelSelectionInput(StrictModel):
+    model: str = Field(min_length=1, max_length=200)
+    list_token: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_-]+$')
+
+
 def create_app(settings: Settings, *, service: JobService | None = None) -> FastAPI:
     jobs = service or JobService(settings)
+    icons = IconSearchService(jobs.store.root)
+    models = ModelSettingsService(jobs.store.root)
     decode_lock = asyncio.Lock()
     attempts: dict[str, deque[float]] = defaultdict(deque)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         jobs.start()
+        icons.start()
         try:
             yield
         finally:
+            await run_in_threadpool(icons.close)
             await run_in_threadpool(jobs.close)
 
     app = FastAPI(
         title="fxfetch", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
     )
     app.state.service = jobs
-    app.add_middleware(BoundaryMiddleware, settings=settings, store=jobs.store)
+    app.state.icon_search = icons
+    app.state.model_settings = models
+    app.add_middleware(BoundaryMiddleware, settings=settings, store=jobs.store, jobs=jobs)
 
     @app.exception_handler(FxfetchError)
     async def domain_error(request: Request, exc: FxfetchError):
@@ -249,7 +281,11 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
             if exc.code in {"build_unavailable", "analysis_unavailable"}
             else 400
         )
-        return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=status)
+        detail: dict = {"code": exc.code, "message": exc.message}
+        upstream_status = getattr(exc, 'http_status', None)
+        if type(upstream_status) is int and 100 <= upstream_status <= 599:
+            detail['http_status'] = upstream_status
+        return JSONResponse({"error": detail}, status_code=status)
 
     async def session(request: Request) -> dict:
         token = request.cookies.get("fxfetch_session", "")
@@ -318,7 +354,86 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
 
     @app.get("/api/capabilities")
     async def capabilities(current: Annotated[dict, Depends(session)]):
-        return await run_in_threadpool(jobs.capabilities)
+        value = await run_in_threadpool(jobs.capabilities)
+        value['icon_search'] = await run_in_threadpool(icons.capability)
+        return value
+
+    @app.get('/api/model-settings')
+    async def model_settings(current: Annotated[dict, Depends(session)]):
+        return await run_in_threadpool(models.current)
+
+    @app.post('/api/model-settings/refresh')
+    async def refresh_models(value: EmptyInput, current: Annotated[dict, Depends(session)]):
+        return await run_in_threadpool(models.refresh, current['id'])
+
+    @app.post('/api/model-settings')
+    async def select_model(value: ModelSelectionInput, current: Annotated[dict, Depends(session)]):
+        return await run_in_threadpool(models.select, current['id'], value.model, value.list_token)
+
+    @app.post('/api/icon-searches', status_code=202)
+    async def icon_search(
+        current: Annotated[dict, Depends(session)], file: Annotated[UploadFile, File()],
+        idempotency_key: Annotated[str | None, Header()] = None,
+    ):
+        try:
+            key = idem(idempotency_key)
+            data = await file.read(settings.limits.max_image_bytes + 1)
+            if len(data) > settings.limits.max_image_bytes:
+                raise HTTPException(413, detail='image_too_large')
+            return await run_in_threadpool(icons.submit, current['id'], key, data)
+        finally:
+            await file.close()
+
+    @app.get('/api/icon-searches/{identifier}')
+    async def icon_result(identifier: str, current: Annotated[dict, Depends(session)]):
+        return await run_in_threadpool(icons.get, current['id'], identifier)
+
+    @app.get('/api/icon-searches/{identifier}/image/{kind}')
+    async def icon_image(identifier: str, kind: Literal['preview', 'icon'],
+                         current: Annotated[dict, Depends(session)]):
+        # Read the small sanitized JPEG under the same lock as expiry; no FileResponse race.
+        def read_image():
+            with icons.lock:
+                icons.get(current['id'], identifier)
+                path = contained_path(icons.root, f'icon-searches/{identifier}/{kind}.jpg')
+                return path.read_bytes()
+        from fastapi.responses import Response
+        try:
+            return Response(await run_in_threadpool(read_image), media_type='image/jpeg')
+        except (OSError, ValueError):
+            raise HTTPException(404, detail='not_found') from None
+
+    @app.post('/api/icon-searches/{identifier}/cancel')
+    async def icon_cancel(identifier: str, current: Annotated[dict, Depends(session)]):
+        return await run_in_threadpool(icons.cancel, current['id'], identifier)
+
+    @app.post('/api/icon-searches/{identifier}/collect', status_code=202)
+    async def icon_collect(identifier: str, value: ContinuationInput,
+                           current: Annotated[dict, Depends(session)],
+                           idempotency_key: Annotated[str | None, Header()] = None):
+        key = idem(idempotency_key)
+
+        def collect():
+            with icons.lock:
+                result = icons.get(current['id'], identifier)
+                if result['state'] not in ('completed', 'partial'):
+                    raise FxfetchError('invalid_selection', 'Search is not finished')
+                selected = next((item for item in result.get('candidates', [])
+                                 if item['id'] == value.candidate_id), None)
+                if selected is None:
+                    raise FxfetchError('invalid_selection', 'Unknown candidate')
+                directory = icons.directory / identifier
+                evidence = {'search_id': identifier, 'candidate': selected,
+                            'recognition': result.get('recognition'),
+                            'input_sha256': result.get('input_sha256'),
+                            'icon_sha256': result.get('icon_sha256'),
+                            'same_app_verified': False}
+                return jobs.create_job(current['id'], key, {
+                    'url': selected['url'], 'tls_policy': value.tls_policy,
+                    'icon_search_id': identifier, 'icon_candidate_id': value.candidate_id,
+                }, icon_evidence=(evidence, (directory / 'input.image').read_bytes(),
+                                  (directory / 'icon.jpg').read_bytes()))
+        return await run_in_threadpool(collect)
 
     @app.post("/api/preview")
     async def preview(value: PreviewInput, current: Annotated[dict, Depends(session)]):
@@ -405,6 +520,7 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
     @app.delete("/api/jobs")
     async def clear_jobs(current: Annotated[dict, Depends(session)]):
         async with decode_lock:
+            await run_in_threadpool(icons.clear, current['id'])
             return await run_in_threadpool(jobs.clear_jobs, current["id"])
 
     @app.get("/api/jobs")

@@ -3,50 +3,101 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="x-dns-prefetch-control" content="off">
-  <meta name="color-scheme" content="light"><title>fxfetch · 本地下载工作台</title>
-  <link rel="stylesheet" href="/static/app.css"><script src="/static/data-package.js" defer></script><script src="/static/analysis.js" defer></script><script src="/static/app.js" defer></script>
+  <meta name="color-scheme" content="light"><title>应用采集工作台</title>
+  <link rel="stylesheet" href="/static/app.css"><script src="/static/data-package.js" defer></script><script src="/static/analysis.js" defer></script><script src="/static/workspace.js" defer></script><script src="/static/icon-search.js" defer></script><script src="/static/model-settings.js" defer></script><script src="/static/app.js" defer></script>
 </head>
 <body>
-  <header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true">f</span><span>fxfetch <small>本地下载工作台</small></span></div><div class="session-actions"><span class="local-tag">本机处理</span><button id="logout" class="text-button" hidden>退出</button></div></header>
+  <header class="topbar"><div class="brand"><h1>应用采集工作台</h1></div><div class="session-actions"><span class="retention-note">文件在任务结束后保留 7 天</span><span class="local-tag">私有访问</span><button id="logout" class="text-button" hidden>退出</button></div></header>
   <main>
-    <section class="intro"><p class="eyebrow">获取 · 留存 · 打包</p><h1>从一个链接开始。</h1><p>粘贴网址或识别二维码，查看下载进度与取得的文件。</p></section>
     <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
     <section id="login-panel" class="card login-card" hidden>
-      <div class="section-heading"><span class="step">01</span><div><h2>连接本地工作台</h2><p>使用后端主机设置的服务密码。</p></div></div>
+      <div class="section-heading"><span class="step">01</span><div><h2>登录应用采集工作台</h2><p>使用后端主机设置的服务密码。</p></div></div>
       <form id="login-form"><label for="password">服务密码</label><div class="login-row"><input id="password" type="password" autocomplete="current-password" required maxlength="1024"><button type="submit" class="primary">登录</button></div></form>
     </section>
     <div id="workspace" hidden>
-      <div class="workspace-grid">
-        <section class="card input-card">
-          <div class="section-heading"><span class="step">01</span><div><h2>添加入口</h2><p>准备好网址后，点击开始采集。</p></div></div>
+      <div class="workspace-toolbar">
+        <div class="view-tabs" role="tablist" aria-label="工作区">
+          <button id="view-collect" type="button" role="tab" aria-controls="collect-workspace" aria-selected="true">链接采集</button>
+          <button id="view-search" type="button" role="tab" aria-controls="icon-search-panel" aria-selected="false" tabindex="-1">图标搜索 <span id="search-tab-status" class="tab-status"></span></button>
+        </div>
+        <div class="toolbar-actions"><button id="show-tasks" class="text-button" type="button">查看采集任务</button>
+          <details id="model-settings" class="model-settings"><summary>模型设置</summary><div id="model-settings-content" class="model-settings-content">
+            <div class="model-settings-heading"><h2>模型设置</h2><button id="model-settings-close" type="button" class="text-button">关闭</button></div>
+            <p class="model-current-label">当前模型<strong id="model-current">尚未读取</strong></p>
+            <p class="field-hint">服务共用设置，保存后用于之后的图标识别和 AI 辅助选择。</p>
+            <button id="model-refresh" type="button" class="secondary">获取模型列表</button>
+            <p id="model-list-count" class="field-hint"></p>
+            <label for="model-choice">选择模型</label><select id="model-choice" autocomplete="off" disabled><option value="">先获取模型列表，再选择</option></select>
+            <button id="model-save" type="button" class="primary wide" disabled>保存选择</button>
+            <p class="field-hint">仅点击获取时请求已配置的供应商，不提交截图或候选内容。列表不保证模型支持图像识别或可成功调用。</p>
+            <p id="model-settings-status" class="field-hint" role="status" aria-live="polite"></p>
+          </div></details>
+          <details id="service-status" class="service-status"><summary>运行状态</summary><div id="capabilities" class="capabilities" aria-live="polite"></div></details>
+        </div>
+      </div>
+      <div id="collect-workspace" class="workspace-grid" role="tabpanel" aria-labelledby="view-collect">
+        <section id="collect-panel" class="card input-card" aria-labelledby="collect-title">
+          <div class="section-heading"><div><h2 id="collect-title">添加采集入口</h2><p>选择输入方式，确认网址后开始。</p></div></div>
           <form id="download-form">
-            <label for="url">粘贴网址</label><textarea id="url" rows="3" placeholder="example.com/path 或 https://…" autocomplete="off" spellcheck="false" maxlength="8192" required aria-describedby="host-hint"></textarea>
-            <div id="host-hint" class="field-hint">未写协议时自动补齐 HTTPS；输入与扫码不会访问目标。</div>
-            <div class="separator"><span>或者从图片识别</span></div>
-            <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="选择、拖入或粘贴二维码图片">
-              <span class="upload-symbol" aria-hidden="true">＋</span><strong>添加二维码图片</strong><span>点击选择、拖入，或在此粘贴</span><small>支持手机截图与常用图片 · 最大 10 MiB</small>
+            <div class="input-scroll">
+            <div class="input-modes" role="group" aria-label="采集输入方式">
+              <button id="mode-url" type="button" aria-pressed="true">网址</button><button id="mode-qr" type="button" aria-pressed="false" aria-controls="qr-input-panel">二维码图片</button><button id="mode-scanner" type="button" aria-pressed="false" aria-controls="scanner-input-panel">扫码枪</button>
             </div>
-            <input id="image-file" type="file" accept="image/png,image/jpeg,image/webp,image/heic,image/heif,image/avif,image/bmp,image/gif,image/tiff,.heic,.heif,.avif,.bmp,.gif,.tif,.tiff,.jpg,.jpeg,.png,.webp" hidden>
-            <div id="image-result" class="image-result" hidden><img id="image-preview" alt="所选二维码图片的本地预览"><div><strong id="qr-status"></strong><p class="muted">识别图片不会打开其中的网址。</p><button id="clear-image" type="button" class="text-button">移除图片</button></div></div>
-            <fieldset id="qr-candidates" class="candidate-list" hidden><legend>选择二维码入口</legend></fieldset>
-            <button id="download-button" class="primary wide" type="submit">开始采集</button>
-            <div class="strategy"><span class="dot"></span><span>优先获取 APK；确认没有 APK 后再尝试 IPA。</span></div>
+            <div id="qr-input-panel" hidden>
+              <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="选择、拖入或粘贴二维码图片">
+                <span class="upload-symbol" aria-hidden="true">＋</span><strong>添加二维码图片</strong><span>点击选择、拖入，或在此粘贴</span><small>手机截图与常用图片 · 最大 10 MiB · 本机识别</small>
+              </div>
+              <input id="image-file" type="file" accept="image/png,image/jpeg,image/webp,image/heic,image/heif,image/avif,image/bmp,image/gif,image/tiff,.heic,.heif,.avif,.bmp,.gif,.tif,.tiff,.jpg,.jpeg,.png,.webp" hidden>
+              <div id="image-result" class="image-result" hidden><img id="image-preview" alt="所选二维码图片的本地预览"><div><strong id="qr-status"></strong><p class="muted">选择识别到的网址，再开始采集。</p><button id="clear-image" type="button" class="text-button">移除图片</button></div></div>
+              <fieldset id="qr-candidates" class="candidate-list" hidden><legend>选择二维码入口</legend></fieldset>
+            </div>
+            <div id="scanner-input-panel" class="scanner-panel" hidden>
+              <label for="scanner-input">扫码枪输入</label>
+              <input id="scanner-input" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="点此输入框后扫码" aria-describedby="scanner-help scanner-status">
+              <p id="scanner-help" class="field-hint">支持模拟键盘的 USB／蓝牙扫码枪。扫码后按回车回填；没有回车后缀可点击下方按钮。</p>
+              <button id="scanner-apply" type="button" class="secondary">回填网址</button>
+              <p id="scanner-status" class="field-hint" role="status" aria-live="polite">仅接收文字，不会自动访问网址。</p>
+            </div>
+            <div class="url-entry"><label for="url">采集网址</label><textarea id="url" rows="3" placeholder="example.com/path 或 https://…" autocomplete="off" spellcheck="false" maxlength="8192" required aria-describedby="host-hint"></textarea>
+            <div id="host-hint" class="field-hint">未写协议时自动补齐 HTTPS；输入与扫码不会访问目标。</div></div>
+
+
             <div id="direct-download" hidden><a id="direct-download-link" class="direct-download-link" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">直接下载到当前设备 ↗</a><p class="field-hint">此快捷方式由当前设备的浏览器下载，服务不保存或校验文件，也不生成数据包。需要后台材料时请点击开始采集。</p></div>
             <details id="advanced-settings" class="advanced-settings"><summary><span>高级设置</span><span id="tls-policy-summary" class="advanced-current">证书：自动处理</span></summary><div class="tls-option"><label for="tls-policy">证书处理</label><select id="tls-policy" autocomplete="off" aria-describedby="tls-risk"><option value="auto">自动：仅证书校验失败时继续</option><option value="strict">严格：证书校验失败时停止</option></select><p id="tls-risk">默认先验证 HTTPS 证书，仅证书校验失败时尝试继续。若发生降级，服务器身份未经验证，页面或文件可能被冒充、篡改；结果中会提示并保留记录。</p></div></details>
-            <a class="result-jump" href="#task-panel">查看任务与文件 <span aria-hidden="true">↓</span></a>
+
+            </div>
+            <div class="input-submit"><label class="ai-choice"><input id="ai-select" type="checkbox" checked>AI 辅助选择</label><p class="field-hint ai-choice-note">多个候选时向模型提交名称、域名和路径（不含查询参数），最多自动选择一次；不确定时由你选择。</p><button id="download-button" class="primary wide" type="submit">开始采集</button><div class="strategy"><span class="dot"></span><span>优先获取 APK；确认没有 APK 后再尝试 IPA。</span></div></div>
           </form>
-          <div id="capabilities" class="capabilities" aria-live="polite"></div>
         </section>
         <section id="task-panel" class="card result-card">
-          <div class="result-top"><div class="section-heading"><span class="step">02</span><div><h2>任务与文件</h2><p>查看进度，保存取得的文件。</p></div></div><button id="refresh" class="text-button" type="button" title="清空当前会话记录并停止未完成任务">刷新</button></div>
+          <div class="result-top"><div class="section-heading"><div><h2>任务与文件</h2><p>查看进度，保存取得的文件。</p></div></div><button id="refresh" class="text-button" type="button" title="清空当前会话记录并停止未完成任务">清空记录</button></div>
           <label for="job-picker" class="small-label">当前会话的任务</label><select id="job-picker"><option value="">还没有任务</option></select>
-          <div id="job-empty" class="empty-state"><div class="empty-icon" aria-hidden="true">↓</div><h3>文件将在这里就绪</h3><p>添加一个入口，点击开始采集。<br>刷新会清空当前会话的记录，后台材料保留。</p></div>
+          <div id="job-empty" class="empty-state"><div class="empty-icon" aria-hidden="true">↓</div><h3>文件将在这里就绪</h3><p>添加一个入口，点击开始采集。<br>刷新会清空当前会话的记录，后台材料在任务结束后保留 7 天。</p></div>
           <div id="job-content" hidden></div>
         </section>
       </div>
-      <p class="footnote">文件与任务保存在后端主机。二维码原文、目标链接均按纯文本展示。</p>
+      <section id="icon-search-panel" class="search-workspace" role="tabpanel" aria-labelledby="view-search" hidden>
+        <section class="card search-input">
+          <div class="section-heading"><div><h2>用截图找 Android 版本</h2><p>上传苹果手机截图或单个应用图标。</p></div></div>
+          <input id="icon-file" type="file" accept="image/*,.heic,.heif" hidden>
+          <button id="icon-upload" type="button" class="icon-dropzone"><span aria-hidden="true">＋</span><strong>添加截图 / 图标</strong><small>点击选择、拖入或粘贴图片</small></button>
+          <div class="icon-preview-wrap"><img id="icon-preview" class="icon-preview" alt="所选截图的本地预览" hidden></div>
+          <div class="icon-actions"><span>自动识别名称并裁取图标</span><button id="icon-remove" type="button" class="text-button">移除图片</button></div>
+          <p class="search-privacy">点击搜索将截图提交模型、图标提交 SerpApi / Google。请避开个人信息。</p>
+          <button id="icon-search-button" type="button" class="primary wide" disabled>一键识图搜索</button>
+          <p class="field-hint">每次最多 2 次搜索 · 执行限时 3 分钟</p>
+          <button id="icon-cancel" type="button" class="text-button" hidden>取消搜索</button>
+          <p id="icon-status" role="status" aria-live="polite"></p>
+        </section>
+        <section id="search-result-panel" class="card search-result-card" aria-labelledby="search-results-title">
+          <div class="section-heading"><div><h2 id="search-results-title">搜索候选</h2><p>查看匹配依据，选择地址后追踪下载。</p></div></div>
+          <div id="icon-search-progress" class="search-progress" role="status" aria-live="polite" hidden></div>
+          <div id="icon-result-empty" class="empty-state"><div class="empty-icon" aria-hidden="true">⌕</div><h3>从一张应用截图开始</h3><p>左侧添加图片并点击搜索，候选会显示在这里。</p><p>图标相似或标题同名，仍需核实是否为同一应用。</p></div>
+          <div id="icon-results" hidden></div>
+        </section>
+      </section>
+      <p class="footnote">原始文件、数据包与报告保留 7 天；进行中的任务不会清理。清空记录会取消未完成任务，保留期限不会因此延长。</p>
     </div>
   </main>
-  <footer><span>fxfetch</span><span>保持入口完整，保留结果边界。</span></footer>
 </body>
 </html>
