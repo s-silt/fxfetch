@@ -25,6 +25,7 @@ pillow_heif==1.8.1
 playwright==1.64.1
 pluggy==1.7.0
 pycparser==3.12
+pycryptodomex==3.24.2
 pydantic==2.14.1
 pydantic_core==2.50.1
 pyee==14.0.0
@@ -32,6 +33,7 @@ Pygments==2.21.0
 pyright==1.1.414
 pytest==9.2.0
 python-multipart==0.0.32
+pyzipper==0.4.0
 qrcode==8.2
 requests==2.34.2
 requests-file==3.0.1

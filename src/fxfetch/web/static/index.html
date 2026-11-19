@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="x-dns-prefetch-control" content="off">
   <meta name="color-scheme" content="light"><title>应用采集工作台</title>
-  <link rel="stylesheet" href="/static/app.css"><script src="/static/data-package.js" defer></script><script src="/static/analysis.js" defer></script><script src="/static/workspace.js" defer></script><script src="/static/icon-search.js" defer></script><script src="/static/model-settings.js" defer></script><script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/app.css"><script src="/static/data-package.js" defer></script><script src="/static/analysis.js" defer></script><script src="/static/workspace.js" defer></script><script src="/static/sample-sources.js" defer></script><script src="/static/icon-search.js" defer></script><script src="/static/model-settings.js" defer></script><script src="/static/app.js" defer></script>
 </head>
 <body>
   <header class="topbar"><div class="brand"><h1>应用采集工作台</h1></div><div class="session-actions"><span class="retention-note">文件在任务结束后保留 7 天</span><span class="local-tag">私有访问</span><button id="logout" class="text-button" hidden>退出</button></div></header>
@@ -18,7 +18,7 @@
       <div class="workspace-toolbar">
         <div class="view-tabs" role="tablist" aria-label="工作区">
           <button id="view-collect" type="button" role="tab" aria-controls="collect-workspace" aria-selected="true">链接采集</button>
-          <button id="view-search" type="button" role="tab" aria-controls="icon-search-panel" aria-selected="false" tabindex="-1">图标搜索 <span id="search-tab-status" class="tab-status"></span></button>
+          <button id="view-search" type="button" role="tab" aria-controls="icon-search-panel" aria-selected="false" tabindex="-1">应用搜索 <span id="search-tab-status" class="tab-status"></span></button>
         </div>
         <div class="toolbar-actions"><button id="show-tasks" class="text-button" type="button">查看采集任务</button>
           <details id="model-settings" class="model-settings"><summary>模型设置</summary><div id="model-settings-content" class="model-settings-content">
@@ -78,21 +78,35 @@
       </div>
       <section id="icon-search-panel" class="search-workspace" role="tabpanel" aria-labelledby="view-search" hidden>
         <section class="card search-input">
-          <div class="section-heading"><div><h2>用截图找 Android 版本</h2><p>上传苹果手机截图或单个应用图标。</p></div></div>
+          <div class="section-heading"><div><h2>按名称找应用</h2><p>直接输入名称，或先从截图中识别。</p></div></div>
+          <div class="input-modes search-input-modes" role="group" aria-label="应用搜索输入方式">
+            <button id="search-mode-image" type="button" aria-pressed="true" aria-controls="icon-recognition-input">截图识别</button>
+            <button id="search-mode-name" type="button" aria-pressed="false" aria-controls="name-search-input">名称搜索</button>
+          </div>
+          <div id="icon-recognition-input">
           <input id="icon-file" type="file" accept="image/*,.heic,.heif" hidden>
           <button id="icon-upload" type="button" class="icon-dropzone"><span aria-hidden="true">＋</span><strong>添加截图 / 图标</strong><small>点击选择、拖入或粘贴图片</small></button>
           <div class="icon-preview-wrap"><img id="icon-preview" class="icon-preview" alt="所选截图的本地预览" hidden></div>
-          <div class="icon-actions"><span>自动识别名称并裁取图标</span><button id="icon-remove" type="button" class="text-button">移除图片</button></div>
-          <p class="search-privacy">点击搜索将截图提交模型、图标提交 SerpApi / Google。请避开个人信息。</p>
-          <button id="icon-search-button" type="button" class="primary wide" disabled>一键识图搜索</button>
-          <p class="field-hint">每次最多 2 次搜索 · 执行限时 3 分钟</p>
+          <div class="icon-actions"><span>先识别名称，再确认搜索</span><button id="icon-remove" type="button" class="text-button">移除图片</button></div>
+          <p class="search-privacy">点击识别才将截图提交到所配置的模型。请避开个人信息。</p>
+          <button id="icon-search-button" type="button" class="secondary wide" disabled>识别名称</button>
+          </div>
+          <div id="name-search-input" class="name-search-input">
+            <label for="name-search-name">应用名称</label>
+            <input id="name-search-name" type="text" autocomplete="off" spellcheck="false" maxlength="100" placeholder="输入截图中显示的应用名称" aria-describedby="name-search-hint">
+            <p id="name-search-hint" class="field-hint">只需名称；识别结果可在这里修改。</p>
+            <button id="name-search-button" type="button" class="primary wide" disabled>定向搜索</button>
+          </div>
+          <p class="field-hint search-query-note">点击搜索将名称提交到已配置的样本库或搜索服务，查询样本记录和安卓下载页。候选不会自动访问。</p>
+          <p class="field-hint">每次名称搜索最多 2 次检索 · 单任务限时 3 分钟<br>识别与搜索分别计次，共享 24 小时内 20 次任务额度</p>
+          <p id="search-capability-note" class="field-hint" role="status"></p>
           <button id="icon-cancel" type="button" class="text-button" hidden>取消搜索</button>
           <p id="icon-status" role="status" aria-live="polite"></p>
         </section>
         <section id="search-result-panel" class="card search-result-card" aria-labelledby="search-results-title">
-          <div class="section-heading"><div><h2 id="search-results-title">搜索候选</h2><p>查看匹配依据，选择地址后追踪下载。</p></div></div>
+          <div class="section-heading"><div><h2 id="search-results-title">搜索候选</h2><p>查看匹配依据，再选择查看资料或追踪下载。</p></div></div>
           <div id="icon-search-progress" class="search-progress" role="status" aria-live="polite" hidden></div>
-          <div id="icon-result-empty" class="empty-state"><div class="empty-icon" aria-hidden="true">⌕</div><h3>从一张应用截图开始</h3><p>左侧添加图片并点击搜索，候选会显示在这里。</p><p>图标相似或标题同名，仍需核实是否为同一应用。</p></div>
+          <div id="icon-result-empty" class="empty-state"><div class="empty-icon" aria-hidden="true">⌕</div><h3>从名称或截图开始</h3><p>输入名称后搜索；有截图时可先识别，再确认名称。</p><p>标题同名或模板相似，仍需核实是否为同一应用。</p></div>
           <div id="icon-results" hidden></div>
         </section>
       </section>

@@ -89,6 +89,40 @@ def test_missing_config_or_non_selection_retains_manual_result(tmp_path):
     assert not provider.calls
 
 
+@pytest.mark.parametrize('catalog', [False, True])
+@pytest.mark.parametrize('bounded', [False, True])
+def test_candidate_advice_without_search_credentials(tmp_path, monkeypatch, catalog, bounded):
+    from fxfetch import candidate_advisor as module
+
+    config = {'vision_endpoint': 'https://provider.synthetic.test/v1/chat/completions',
+              'vision_model': 'requested', 'vision_key': 'synthetic-vision-secret'}
+    if catalog:
+        config['koodous_key'] = 'synthetic-catalog-secret'
+    path = tmp_path / 'icon-search.json'
+    path.write_text(json.dumps(config), encoding='utf-8')
+    before = path.read_bytes()
+    provider = FakeProvider({'id': 0, 'confidence': 'high'})
+
+    def model_provider(loaded):
+        assert set(loaded) == {'vision_endpoint', 'vision_model', 'vision_key'}
+        provider.config = loaded
+        return provider
+
+    def model_process(command, **kwargs):
+        request = json.loads(Path(command[-1]).read_text(encoding='utf-8'))
+        response = module._advise_rows(request['rows'], Path(request['root']))
+        return ProcessResult(0, stdout=json.dumps(response).encode())
+
+    monkeypatch.setattr(module, 'Provider', model_provider)
+    monkeypatch.setattr(module, 'run_limited', model_process)
+    advice = (module.advise_bounded(result(), tmp_path, tmp_path / 'task', deadline=time.monotonic() + 60)
+              if bounded else module.advise(result(), tmp_path))
+    assert advice['state'] == 'selected' and advice['candidate_index'] == 0
+    assert len(provider.calls) == 1
+    assert path.read_bytes() == before
+    assert not list((tmp_path / 'task').glob('.candidate-ai-*'))
+
+
 @pytest.mark.parametrize('opted,cancelled,archived', [(True, False, False), (False, False, False),
                                                    (True, True, False), (True, False, True)])
 def test_auto_child_is_once_and_never_restarted_or_reapplied(tmp_path, opted, cancelled, archived):
@@ -225,7 +259,7 @@ def test_private_worker_invokes_model_once_and_preserves_selection(tmp_path, mon
     provider = FakeProvider({'id': 0, 'confidence': 'high'})
     monkeypatch.setattr(task_worker, 'AcquisitionPolicy', Collector)
     monkeypatch.setattr(candidate_advisor, 'Provider', lambda config: provider)
-    monkeypatch.setattr(candidate_advisor, 'load_config', lambda root: {})
+    monkeypatch.setattr(candidate_advisor, 'load_config', lambda root, **kwargs: {})
 
     def bounded_model(command, **kwargs):
         payload = json.loads(Path(command[-1]).read_text(encoding='utf-8'))

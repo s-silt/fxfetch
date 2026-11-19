@@ -18,7 +18,7 @@ from .core.errors import FxfetchError
 from .core.process_limits import run_limited
 from .icon_search.providers import Provider, ProviderRequestError, fail, load_config, model_ids
 
-CONFIG_KEYS = ('vision_endpoint', 'vision_key', 'vision_model', 'serpapi_key')
+CONFIG_KEYS = ('vision_endpoint', 'vision_key', 'vision_model')
 PROVIDER_ERRORS = {'icon_search_unconfigured', 'icon_provider_auth', 'icon_provider_quota',
                    'icon_provider_failed', 'icon_provider_response_limit',
                    'icon_provider_forbidden', 'icon_provider_timeout', 'icon_provider_tls',
@@ -50,10 +50,10 @@ class ModelSettingsService:
         self.lists: dict[str, ModelList] = {}
 
     def current(self) -> dict:
-        return {'current_model': load_config(self.root)['vision_model']}
+        return {'current_model': load_config(self.root, require_search=False)['vision_model']}
 
     def fingerprint(self) -> str:
-        return config_fingerprint(load_config(self.root))
+        return config_fingerprint(load_config(self.root, require_search=False))
 
     def fetch_models(self) -> tuple[list[str], str]:
         process = run_limited([sys.executable, '-m', 'fxfetch.model_settings', str(self.root)],
@@ -81,7 +81,7 @@ class ModelSettingsService:
             now = time.monotonic()
             if now < self.next_refresh:
                 raise fail('model_list_cooldown')
-            fingerprint = config_fingerprint(load_config(self.root))
+            fingerprint = config_fingerprint(load_config(self.root, require_search=False))
             self.busy = True
             self.next_refresh = now + 10
         try:
@@ -151,7 +151,7 @@ class ModelSettingsService:
 def main() -> None:
     value: dict
     try:
-        config = load_config(Path(sys.argv[1]))
+        config = load_config(Path(sys.argv[1]), require_search=False)
         value = {'models': Provider(config).models(), 'fingerprint': config_fingerprint(config)}
     except FxfetchError as error:
         value = {'error': error.code if error.code in PROVIDER_ERRORS else 'icon_provider_failed'}

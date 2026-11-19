@@ -76,7 +76,7 @@ def _with_timing(value: dict, provider: Provider | None) -> dict:
 
 def _advise_rows(rows: list[dict], root: Path, provider: Provider | None = None) -> dict:
     try:
-        provider = provider or Provider(load_config(root))
+        provider = provider or Provider(load_config(root, require_search=False))
         response = provider.request(provider.config['vision_endpoint'], body=json.dumps({
             'model': provider.config['vision_model'], 'stream': False, 'max_tokens': 256,
             'messages': [

@@ -91,6 +91,7 @@
   });
   const iconSearch = globalThis.FxfetchIconSearch?.create({api, key:idempotencyKey,
     enabled:() => state.authenticated && !state.clearing,
+    capabilities:() => state.capabilities?.icon_search,
     collected:async job => {
       state.current = job.id; rememberJob(job.id); state.pollDelay = 1500;
       workspace?.showView("collect");
@@ -208,7 +209,8 @@
   }
   function api(path, options = {}) {
     const pending = request(path, options);
-    if ((options.method || "GET") === "POST" && path !== "/api/login" && path !== "/api/logout") {
+    if ((options.method || "GET") === "POST" && path !== "/api/login" && path !== "/api/logout" &&
+        !options.cancelOnClear) {
       state.mutations.add(pending);
       pending.then(() => state.mutations.delete(pending), () => state.mutations.delete(pending));
     }
@@ -220,7 +222,7 @@
     const abort = () => controller.abort();
     if (external) external.addEventListener("abort", abort, {once:true});
     if (external && external.aborted) controller.abort();
-    const timeout = setTimeout(abort, options.upload ? 30000 : options.timeoutMs === 35000 ? 35000 : 15000);
+    const timeout = setTimeout(abort, options.upload ? 30000 : options.timeoutMs ?? 15000);
     const headers = new Headers(options.headers || {});
     const method = options.method || "GET";
     if (method !== "GET" && state.csrf) headers.set("X-CSRF-Token", state.csrf);
@@ -1043,8 +1045,8 @@
     clearImage(); $("url").value = ""; updateHost(); rememberJob(null);
     $("job-picker").replaceChildren(new Option("还没有任务", "")); renderJob(); updateInput();
     try {
-      // Requests already submitted must settle before the server archives their
-      // records; late responses are ignored by the epoch checks above.
+      // Wait for submissions that create records. Sample provider operations belong to
+      // existing searches and the server cancels them when those records are cleared.
       await Promise.allSettled([...state.mutations]);
       await api("/api/jobs", {method:"DELETE"});
       if (showNotice) notice("当前会话记录已清空。后台文件仍按任务结束后 7 天的期限自动清理。");

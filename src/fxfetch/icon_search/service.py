@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,15 +21,17 @@ from ..core.errors import FxfetchError
 from ..core.process_limits import run_limited
 from ..retention import SECONDS, _safe_tree
 from ..security import contained_path
-from .providers import candidate_url, fail, load_config
+from .bazaar import malwarebazaar_configured
+from .malshare import malshare_configured
+from .providers import candidate_url, fail, load_config, normalize_name
 
 log = logging.getLogger(__name__)
-SEARCH_STAGES = ('validating', 'quota', 'recognizing', 'uploading', 'searching')
+SEARCH_STAGES = ('validating', 'quota', 'recognizing', 'uploading', 'searching', 'catalog_search')
 
 
 def saved_candidates(result: dict) -> list[dict]:
     rows = result.get('candidates')
-    if not isinstance(rows, list) or len(rows) > 20:
+    if not isinstance(rows, list) or len(rows) > 40:
         return []
     valid = []
     seen = set()
@@ -37,19 +40,44 @@ def saved_candidates(result: dict) -> list[dict]:
             continue
         identifier, evidence = row.get('id'), row.get('evidence')
         url = candidate_url(row.get('url'))
-        if (isinstance(identifier, str) and re.fullmatch(r'(?:[1-9]|1[0-9]|20)', identifier)
+        if (isinstance(identifier, str) and re.fullmatch(r'(?:[1-9]|[1-3][0-9]|40)', identifier)
                 and url is not None
                 and isinstance(row.get('title'), str) and len(row['title']) <= 300
                 and row.get('source') == urlsplit(url).hostname
-                and isinstance(evidence, list) and len(evidence) <= 4
-                and all(item in ('name_in_title', 'android_text', 'provider_exact_match', 'name_web_search')
+                and isinstance(evidence, list) and len(evidence) <= 7
+                and all(item in ('name_in_title', 'android_text', 'provider_exact_match', 'name_web_search',
+                                     'sample_index_search', 'targeted_download_search', 'koodous_api_record')
                         for item in evidence)
                 and row.get('verified') is False and row.get('downloadable') is None):
             if identifier in seen:
                 return []
             seen.add(identifier)
-            valid.append({key: row.get(key) for key in
-                          ('id', 'url', 'title', 'source', 'evidence', 'verified', 'downloadable')})
+            safe = {key: row.get(key) for key in
+                    ('id', 'url', 'title', 'source', 'evidence', 'verified', 'downloadable')}
+            category = row.get('category')
+            parsed = urlsplit(url)
+            host, path = (parsed.hostname or '').lower(), parsed.path
+            if category != 'sample_record' and (
+                    host in ('koodous.com', 'www.koodous.com') and path.startswith('/apks')
+                    or host in ('virustotal.com', 'www.virustotal.com') and path.startswith('/gui/file/')
+                    or host == 'bazaar.abuse.ch' and path.startswith('/sample/')):
+                category = 'sample_index'
+            if category in ('sample_index', 'download_page', 'web_candidate'):
+                safe.update(category=category, can_collect=category != 'sample_index')
+                if row.get('channel') in ('sample_index', 'targeted_download'):
+                    safe['channel'] = row['channel']
+            elif category == 'sample_record':
+                sha = row.get('sha256')
+                if (not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{64}', sha)
+                        or url != 'https://koodous.com/apks/' + sha
+                        or row.get('channel') != 'koodous_api'):
+                    continue
+                safe.update(category='sample_record', channel='koodous_api',
+                            catalog='Koodous', can_collect=False, sha256=sha)
+                for key in ('app_name', 'package_name', 'version'):
+                    if isinstance(row.get(key), str) and len(row[key]) <= 300:
+                        safe[key] = row[key]
+            valid.append(safe)
     return valid
 
 
@@ -60,6 +88,7 @@ class IconSearchService:
         self.directory.mkdir(exist_ok=True)
         self.lock = threading.RLock()
         self.active: dict[str, threading.Event] = {}
+        self.retained: Counter[str] = Counter()
         self.threads: list[threading.Thread] = []
         self.stop = threading.Event()
         with self.db() as db:
@@ -67,6 +96,8 @@ class IconSearchService:
                 id TEXT PRIMARY KEY, owner TEXT NOT NULL, idem TEXT NOT NULL, digest TEXT NOT NULL,
                 created REAL NOT NULL, finished REAL, state TEXT NOT NULL, hidden INTEGER DEFAULT 0,
                 result TEXT NOT NULL, UNIQUE(owner,idem))''')
+            if 'evidence_digest' not in {row[1] for row in db.execute('PRAGMA table_info(searches)')}:
+                db.execute('ALTER TABLE searches ADD COLUMN evidence_digest TEXT')
 
     @contextmanager
     def db(self) -> Iterator[sqlite3.Connection]:
@@ -79,12 +110,26 @@ class IconSearchService:
             db.close()
 
     def capability(self) -> dict:
-        try:
-            config = load_config(self.root)
-            return {'enabled': True, 'model': config['vision_model'], 'max_searches': 2,
-                    'timeout_seconds': 180, 'retention_days': 7}
-        except FxfetchError:
-            return {'enabled': False, 'reason_code': 'icon_search_unconfigured'}
+        result: dict = {'enabled': False, 'recognition_enabled': False, 'name_enabled': False,
+                        'max_searches': 2, 'timeout_seconds': 180, 'retention_days': 7,
+                        'daily_shared_tasks': 20, 'malshare_enabled': malshare_configured(self.root),
+                        'malwarebazaar_enabled': malwarebazaar_configured(self.root)}
+        for mode in ('recognize', 'name'):
+            try:
+                config = load_config(self.root, require_vision=mode == 'recognize',
+                                     require_search=mode == 'name', allow_catalog=mode == 'name')
+                result['recognition_enabled' if mode == 'recognize' else 'name_enabled'] = True
+                if mode == 'recognize':
+                    result['model'] = config['vision_model']
+                else:
+                    result['catalog_enabled'] = bool(config.get('koodous_key'))
+                    result['web_enabled'] = bool(config.get('serpapi_key'))
+            except FxfetchError:
+                pass
+        result['enabled'] = result['recognition_enabled'] and result['name_enabled']
+        if not result['enabled']:
+            result['reason_code'] = 'icon_search_unconfigured'
+        return result
 
     def start(self) -> None:
         with self.lock, self.db() as db:
@@ -107,18 +152,54 @@ class IconSearchService:
             thread.join(timeout=15)
 
     def submit(self, owner: str, idem: str, data: bytes) -> dict:
+        return self._submit(owner, idem, 'image', data=data)
+
+    def submit_recognition(self, owner: str, idem: str, data: bytes) -> dict:
+        return self._submit(owner, idem, 'recognize', data=data)
+
+    def submit_name(self, owner: str, idem: str, name: str,
+                    recognition_id: str | None = None) -> dict:
+        return self._submit(owner, idem, 'name', name=normalize_name(name),
+                            recognition_id=recognition_id)
+
+    def _submit(self, owner: str, idem: str, mode: str, *, data: bytes = b'',
+                name: str = '', recognition_id: str | None = None) -> dict:
         import secrets
 
-        digest = hashlib.sha256(data).hexdigest()
+        request: dict = {'mode': mode}
+        if mode == 'name':
+            request.update(name=name, recognition_id=recognition_id)
+            payload = json.dumps(request, ensure_ascii=False, sort_keys=True).encode('utf-8')
+        else:
+            if not data or len(data) > 10 * 1024 * 1024:
+                raise fail('icon_image_limit')
+            payload = data
+        digest = hashlib.sha256(payload if mode == 'image' else mode.encode() + b'\0' + payload).hexdigest()
         with self.lock, self.db() as db:
             row = db.execute('SELECT * FROM searches WHERE owner=? AND idem=?', (owner, idem)).fetchone()
             if row:
                 if row['digest'] != digest or row['hidden']:
                     raise fail('idempotency_conflict')
                 return self.get(owner, row['id'])
-            load_config(self.root)
-            if not data or len(data) > 10 * 1024 * 1024:
-                raise fail('icon_image_limit')
+            load_config(self.root, require_vision=mode != 'name', require_search=mode != 'recognize',
+                        allow_catalog=mode == 'name')
+            source_files: dict[str, bytes] = {}
+            if recognition_id is not None:
+                source = self.get(owner, recognition_id)
+                if (source.get('mode') != 'recognize' or source.get('state') != 'completed'
+                        or source.get('result') != 'recognized'):
+                    raise fail('recognition_unavailable')
+                try:
+                    for filename, maximum in (('input.image', 10 * 1024 * 1024),
+                                              ('icon.jpg', 500000), ('preview.jpg', 500000)):
+                        source_files[filename] = self.read_evidence_file(recognition_id, filename, maximum)
+                    for filename, key in (('input.image', 'input_sha256'), ('icon.jpg', 'icon_sha256')):
+                        if hashlib.sha256(source_files[filename]).hexdigest() != source.get(key):
+                            raise ValueError
+                except (FxfetchError, OSError, ValueError):
+                    raise fail('recognition_unavailable') from None
+                request.update(recognition=source.get('recognition'), input_sha256=source['input_sha256'],
+                               icon_sha256=source['icon_sha256'])
             if self.active or self.stop.is_set():
                 raise fail('icon_search_busy')
             if db.execute('SELECT COUNT(*) FROM searches WHERE created>?',
@@ -127,10 +208,19 @@ class IconSearchService:
             identifier = secrets.token_hex(16)
             directory = self.directory / identifier
             directory.mkdir()
-            (directory / 'input.image').write_bytes(data)
-            result = {'state': 'running', 'stage': 'validating', 'candidates': []}
-            db.execute('INSERT INTO searches(id,owner,idem,digest,created,state,result) VALUES(?,?,?,?,?,?,?)',
-                       (identifier, owner, idem, digest, time.time(), 'running', json.dumps(result)))
+            if mode != 'name':
+                (directory / 'input.image').write_bytes(data)
+            for filename, content in source_files.items():
+                (directory / filename).write_bytes(content)
+            request_bytes = json.dumps(request, ensure_ascii=False).encode('utf-8')
+            (directory / 'request.json').write_bytes(request_bytes)
+            result = {'state': 'running', 'stage': 'validating', 'mode': mode, 'candidates': []}
+            if mode == 'name':
+                result['query_name'] = name
+            db.execute('INSERT INTO searches(id,owner,idem,digest,created,state,result,evidence_digest) '
+                       'VALUES(?,?,?,?,?,?,?,?)',
+                       (identifier, owner, idem, digest, time.time(), 'running', json.dumps(result),
+                        hashlib.sha256(request_bytes).hexdigest()))
             db.commit()
             event = threading.Event()
             self.active[identifier] = event
@@ -202,11 +292,55 @@ class IconSearchService:
             icon = self.read_evidence_file(identifier, 'icon.jpg', 500_000)
         except (FxfetchError, OSError, ValueError):
             raise fail('invalid_selection') from None
-        if (result.get('crop_applied') is not True
+        if ((result.get('mode', 'image') == 'image' and result.get('crop_applied') is not True)
                 or hashlib.sha256(original).hexdigest() != result.get('input_sha256')
                 or hashlib.sha256(icon).hexdigest() != result.get('icon_sha256')):
             raise fail('invalid_selection')
         return original, icon
+
+    def validate_evidence(self, identifier: str, result: dict, digest: str | None = None) -> None:
+        """Bind retained results to the submitted request and original image, when present."""
+        mode = result.get('mode', 'image')
+        try:
+            if digest is None:
+                with self.db() as db:
+                    row = db.execute('SELECT digest FROM searches WHERE id=?', (identifier,)).fetchone()
+                if row is None:
+                    raise ValueError('missing_request')
+                digest = row['digest']
+            if mode == 'name':
+                request_bytes = self.read_evidence_file(identifier, 'request.json', 16_384)
+                with self.db() as db:
+                    evidence_row = db.execute('SELECT evidence_digest FROM searches WHERE id=?',
+                                              (identifier,)).fetchone()
+                if (evidence_row is None or hashlib.sha256(request_bytes).hexdigest()
+                        != evidence_row['evidence_digest']):
+                    raise ValueError('invalid_request_evidence')
+                request = json.loads(request_bytes)
+                name = normalize_name(request['name'])
+                recognition_id = request.get('recognition_id')
+                if (request.get('mode') != 'name' or name != result.get('query_name')
+                        or recognition_id != result.get('recognition_id')
+                        or recognition_id is not None and (not isinstance(recognition_id, str)
+                            or not re.fullmatch(r'[0-9a-f]{32}', recognition_id))):
+                    raise ValueError('invalid_name_evidence')
+                payload = json.dumps({'mode': 'name', 'name': name, 'recognition_id': recognition_id},
+                                     ensure_ascii=False, sort_keys=True).encode('utf-8')
+                actual_digest = hashlib.sha256(b'name\0' + payload).hexdigest()
+                if recognition_id is not None:
+                    self.evidence_files(identifier, result)
+                    if any(request.get(key) != result.get(key) for key in
+                           ('input_sha256', 'icon_sha256', 'recognition')):
+                        raise ValueError('invalid_image_evidence')
+            elif mode in ('image', 'recognize'):
+                original, _ = self.evidence_files(identifier, result)
+                actual_digest = hashlib.sha256(original if mode == 'image' else b'recognize\0' + original).hexdigest()
+            else:
+                raise ValueError('invalid_evidence_mode')
+            if digest is not None and actual_digest != digest:
+                raise ValueError('invalid_request_digest')
+        except (FxfetchError, OSError, ValueError, TypeError, KeyError):
+            raise fail('invalid_selection') from None
 
     def interrupted_result(self, identifier: str, digest: str) -> dict:
         snapshot = self.progress(identifier) or {}
@@ -218,15 +352,15 @@ class IconSearchService:
                 or type(recognition.get('ambiguous')) is not bool
                 or recognition.get('confidence') not in ('high', 'medium', 'low')):
             result.pop('recognition', None)
+        for key in ('mode', 'query_name', 'recognition_id', 'catalog_status'):
+            if key in snapshot:
+                result[key] = snapshot[key]
         recovered = saved_candidates(snapshot)
         if recovered:
-            if result.get('input_sha256') != digest:
+            try:
+                self.validate_evidence(identifier, result, digest)
+            except FxfetchError:
                 recovered = []
-            else:
-                try:
-                    self.evidence_files(identifier, result)
-                except FxfetchError:
-                    recovered = []
         stage = snapshot.get('stage')
         if stage not in SEARCH_STAGES:
             detail = snapshot.get('error_detail')
@@ -282,7 +416,7 @@ class IconSearchService:
                               ((time.time() if now is None else now) - SECONDS,)).fetchall()
             for row in rows:
                 identifier = row['id']
-                if identifier in self.active or not re.fullmatch(r'[0-9a-f]{32}', identifier):
+                if identifier in self.active or self.retained[identifier] or not re.fullmatch(r'[0-9a-f]{32}', identifier):
                     continue
                 path = _safe_tree(self.root, 'icon-searches/' + identifier)
                 if path.exists():

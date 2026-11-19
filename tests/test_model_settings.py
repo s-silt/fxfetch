@@ -86,6 +86,38 @@ def test_selection_preserves_private_fields_format_permissions_and_persists(conf
     assert load_config(service.root)['vision_key'] == 'synthetic-vision-secret'
 
 
+@pytest.mark.parametrize('catalog', [False, True])
+def test_model_settings_without_search_credentials(tmp_path, monkeypatch, capsys, provider_calls, catalog):
+    path = configure(tmp_path)
+    config = json.loads(path.read_text(encoding='utf-8-sig'))
+    del config['serpapi_key']
+    if catalog:
+        config['koodous_key'] = 'synthetic-catalog-secret'
+    path.write_text(json.dumps(config, indent=2), encoding='utf-8-sig')
+    before = path.read_bytes()
+    mode = stat.S_IMODE(path.stat().st_mode)
+    service = ModelSettingsService(tmp_path)
+    assert service.current() == {'current_model': CURRENT}
+    calls = []
+
+    def models(provider):
+        calls.append(dict(provider.config))
+        return [CURRENT, ALTERNATE]
+
+    monkeypatch.setattr(Provider, 'models', models)
+    monkeypatch.setattr(module.sys, 'argv', ['model_settings', str(tmp_path)])
+    module.main()
+    worker = json.loads(capsys.readouterr().out)
+    assert worker == {'models': [CURRENT, ALTERNATE], 'fingerprint': service.fingerprint()}
+    assert calls and set(calls[0]) == {'vision_endpoint', 'vision_key', 'vision_model'}
+    listing = service.refresh('owner')
+    assert service.select('owner', ALTERNATE, listing['list_token']) == {'current_model': ALTERNATE}
+    assert path.read_bytes() == before.replace(CURRENT.encode(), ALTERNATE.encode())
+    assert stat.S_IMODE(path.stat().st_mode) == mode
+    assert provider_calls == [CURRENT]
+    assert not list(tmp_path.glob('.model-settings-*'))
+
+
 def test_list_token_is_bound_to_session_and_cannot_select_unlisted_model(configured, provider_calls):
     listing = configured.refresh('owner-a')
     before = (configured.root / 'icon-search.json').read_bytes()

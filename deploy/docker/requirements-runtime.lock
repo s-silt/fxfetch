@@ -15,9 +15,11 @@ idna==3.20
 pillow==13.0.0
 pillow_heif==1.8.1
 pycparser==3.12
+pycryptodomex==3.24.2
 pydantic==2.14.1
 pydantic_core==2.50.1
 python-multipart==0.0.32
+pyzipper==0.4.0
 requests==2.34.2
 requests-file==3.0.1
 starlette==1.10.0

@@ -185,7 +185,8 @@ class JobService:
         }
 
     def create_job(self, owner: str, idem: str, value: dict, *,
-                   icon_evidence: tuple[dict, bytes, bytes] | None = None) -> dict:
+                   icon_evidence: tuple[dict, bytes, bytes] | None = None,
+                   name_evidence: dict | None = None) -> dict:
         try:
             tls_policy = web_tls_policy(value)
         except ValueError as error:
@@ -198,6 +199,8 @@ class JobService:
         source: dict = {"kind": "manual_url", "entry_url": value.get("url")}
         if icon_evidence:
             source.update(kind='icon_search', icon_search=icon_evidence[0])
+        if name_evidence:
+            source.update(kind='name_search', name_search=name_evidence)
         image = None
         if value.get("image_id"):
             image = self.store.image(owner, value["image_id"])
@@ -257,6 +260,8 @@ class JobService:
                         (directory / 'image.original').write_bytes(icon_evidence[1])
                         (directory / 'icon.jpg').write_bytes(icon_evidence[2])
                         atomic_json(directory / 'icon-search.json', icon_evidence[0])
+                    if name_evidence:
+                        atomic_json(directory / 'name-search.json', name_evidence)
                     atomic_json(directory / "input.json", source)
                     if image:
                         self.store.mark_image_used(owner, value["image_id"])
@@ -948,7 +953,6 @@ class JobService:
         try:
             self._auto_continue(job, terminal, cancel)
         except Exception as error:
-            # Follow-up scheduling cannot change the already committed collection result.
             log.error("candidate_auto_continue_failed id=%s exception_type=%s", job["id"], type(error).__name__)
         self._seal_data_package(job, terminal["result"])
 

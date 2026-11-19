@@ -164,7 +164,7 @@ def test_slow_model_is_killed_and_real_task_worker_saves_original_candidates(tmp
                 time.sleep(30)
                 Path(sys.argv[3]).write_text('late')
         advisor.Provider = SlowModel
-        advisor.load_config = lambda root: {}
+        advisor.load_config = lambda root, **kwargs: {}
         advisor.main()
     '''), encoding='utf-8')
     task_bootstrap = tmp_path / 'synthetic_task.py'
