@@ -14,7 +14,7 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, model_validator
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -30,6 +30,8 @@ from ..model_settings import ModelSettingsService
 from ..security import contained_path, password_matches, token_hash
 from ..service import JobService
 from ..store import Store
+from .malshare_service import SampleResponse, SampleService
+from .malshare_worker import SampleProvider
 
 
 class BoundaryMiddleware:
@@ -57,7 +59,7 @@ class BoundaryMiddleware:
                     scope, receive, send
                 )
                 return
-        image_upload = scope["path"] in ("/api/qr-images", "/api/icon-searches")
+        image_upload = scope["path"] in ("/api/qr-images", "/api/icon-searches", "/api/icon-recognitions")
         maximum = self.settings.limits.max_upload_bytes if image_upload else 64 * 1024
         try:
             if int(headers.get("content-length", "0")) > maximum:
@@ -230,9 +232,16 @@ class ModelSelectionInput(StrictModel):
     list_token: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_-]+$')
 
 
+class NameSearchInput(StrictModel):
+    name: StrictStr = Field(min_length=1, max_length=100)
+    recognition_id: StrictStr | None = Field(default=None, min_length=32, max_length=32,
+                                            pattern=r'^[0-9a-f]{32}$')
+
+
 def create_app(settings: Settings, *, service: JobService | None = None) -> FastAPI:
     jobs = service or JobService(settings)
     icons = IconSearchService(jobs.store.root)
+    samples = SampleService(icons)
     models = ModelSettingsService(jobs.store.root)
     decode_lock = asyncio.Lock()
     attempts: dict[str, deque[float]] = defaultdict(deque)
@@ -240,10 +249,12 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         jobs.start()
+        samples.recover()
         icons.start()
         try:
             yield
         finally:
+            samples.close()
             await run_in_threadpool(icons.close)
             await run_in_threadpool(jobs.close)
 
@@ -252,6 +263,7 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
     )
     app.state.service = jobs
     app.state.icon_search = icons
+    app.state.malshare = samples
     app.state.model_settings = models
     app.add_middleware(BoundaryMiddleware, settings=settings, store=jobs.store, jobs=jobs)
 
@@ -276,9 +288,15 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
                 "analysis_source_unavailable",
                 "analysis_queue_full",
                 "analysis_limit",
+                "malshare_busy",
+                "malshare_lookup_required",
+                "bazaar_busy",
+                "bazaar_lookup_required",
             }
+            else 429
+            if exc.code in {"malshare_daily_limit", "malshare_storage_limit", "bazaar_daily_limit", "bazaar_storage_limit"}
             else 503
-            if exc.code in {"build_unavailable", "analysis_unavailable"}
+            if exc.code in {"build_unavailable", "analysis_unavailable", "malshare_unconfigured", "bazaar_unconfigured"}
             else 400
         )
         detail: dict = {"code": exc.code, "message": exc.message}
@@ -371,8 +389,9 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
         return await run_in_threadpool(models.select, current['id'], value.model, value.list_token)
 
     @app.post('/api/icon-searches', status_code=202)
+    @app.post('/api/icon-recognitions', status_code=202)
     async def icon_search(
-        current: Annotated[dict, Depends(session)], file: Annotated[UploadFile, File()],
+        request: Request, current: Annotated[dict, Depends(session)], file: Annotated[UploadFile, File()],
         idempotency_key: Annotated[str | None, Header()] = None,
     ):
         try:
@@ -380,13 +399,33 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
             data = await file.read(settings.limits.max_image_bytes + 1)
             if len(data) > settings.limits.max_image_bytes:
                 raise HTTPException(413, detail='image_too_large')
-            return await run_in_threadpool(icons.submit, current['id'], key, data)
+            submit = icons.submit_recognition if request.url.path == '/api/icon-recognitions' else icons.submit
+            return await run_in_threadpool(submit, current['id'], key, data)
         finally:
             await file.close()
 
+    @app.post('/api/name-searches', status_code=202)
+    async def name_search(value: NameSearchInput, current: Annotated[dict, Depends(session)],
+                          idempotency_key: Annotated[str | None, Header()] = None):
+        return await run_in_threadpool(icons.submit_name, current['id'], idem(idempotency_key),
+                                       value.name, value.recognition_id)
+
     @app.get('/api/icon-searches/{identifier}')
     async def icon_result(identifier: str, current: Annotated[dict, Depends(session)]):
-        return await run_in_threadpool(icons.get, current['id'], identifier)
+        return await run_in_threadpool(samples.result, current['id'], identifier)
+
+    @app.get('/api/icon-searches/{identifier}/candidates/{candidate}/{provider}/file')
+    async def sample_file(identifier: str, candidate: str, provider: SampleProvider,
+                          current: Annotated[dict, Depends(session)]):
+        return SampleResponse(samples, current['id'], identifier, candidate, provider)
+
+    @app.post('/api/icon-searches/{identifier}/candidates/{candidate}/{provider}/{action}')
+    async def sample_action(identifier: str, candidate: str, provider: SampleProvider,
+                            action: Literal['lookup', 'download'], value: EmptyInput,
+                            current: Annotated[dict, Depends(session)],
+                            idempotency_key: Annotated[str | None, Header()] = None):
+        return await run_in_threadpool(samples.act, current['id'], identifier, candidate,
+                                       action, idem(idempotency_key), provider)
 
     @app.get('/api/icon-searches/{identifier}/image/{kind}')
     async def icon_image(identifier: str, kind: Literal['preview', 'icon'],
@@ -420,19 +459,30 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
                     raise FxfetchError('invalid_selection', 'Search is not finished')
                 if result['expires_at'] is None or result['expires_at'] <= time.time():
                     raise FxfetchError('not_found', 'Search has expired')
-                selected = next((item for item in saved_candidates(result) if item['id'] == value.candidate_id), None)
+                selected = next((item for item in saved_candidates(result)
+                                 if item['id'] == value.candidate_id), None)
                 if selected is None:
                     raise FxfetchError('invalid_selection', 'Unknown candidate')
-                original, icon = icons.evidence_files(identifier, result)
+                if selected.get('category') in ('sample_index', 'sample_record'):
+                    raise FxfetchError('invalid_selection', 'Sample index is a reference page, not a download entry')
+                icons.validate_evidence(identifier, result)
                 evidence = {'search_id': identifier, 'candidate': selected,
                             'recognition': result.get('recognition'),
                             'input_sha256': result.get('input_sha256'),
                             'icon_sha256': result.get('icon_sha256'),
                             'same_app_verified': False}
+                named = result.get('mode') == 'name'
+                if named:
+                    evidence.update(query_name=result['query_name'],
+                                    recognition_id=result.get('recognition_id'))
+                images = None
+                if not named or result.get('recognition_id'):
+                    original, icon = icons.evidence_files(identifier, result)
+                    images = (evidence, original, icon)
                 return jobs.create_job(current['id'], key, {
                     'url': selected['url'], 'tls_policy': value.tls_policy,
                     'icon_search_id': identifier, 'icon_candidate_id': value.candidate_id,
-                }, icon_evidence=(evidence, original, icon))
+                }, icon_evidence=images, name_evidence=evidence if named else None)
         return await run_in_threadpool(collect)
 
     @app.post("/api/preview")
@@ -520,7 +570,7 @@ def create_app(settings: Settings, *, service: JobService | None = None) -> Fast
     @app.delete("/api/jobs")
     async def clear_jobs(current: Annotated[dict, Depends(session)]):
         async with decode_lock:
-            await run_in_threadpool(icons.clear, current['id'])
+            await run_in_threadpool(samples.clear, current['id'])
             return await run_in_threadpool(jobs.clear_jobs, current["id"])
 
     @app.get("/api/jobs")

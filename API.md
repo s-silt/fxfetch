@@ -28,7 +28,7 @@
 
 建议可附 `elapsed_seconds`、`timeout_seconds`、安全的 `request_timing` 与 `error_detail`；后者仅含固定错误码和有效 HTTP 状态，不附供应商正文、密钥或端点。
 
-有效建议在 supervisor 提交原结果后，按原继续下载合同创建独立子任务，沿用该任务 TLS 策略，标记 `input.selection_method=ai`。子任务不继承自动选择，实际下载结果在子任务中查询；原结果不改写。自动创建或保存子任务输入失败时，父任务的数据包仍使用已提交的原结果；不自动重放。关闭、取消、清空、重启、模型失败或不确定时不自动创建新下载。
+有效建议在 supervisor 提交原结果后，按原继续下载合同创建独立子任务，沿用该任务 TLS 策略，标记 `input.selection_method=ai`。子任务不继承自动选择，实际下载结果在子任务中查询；原结果不改写。关闭、取消、清空、重启、模型失败或不确定时不自动创建新下载。
 
 本页是网页服务的接口约定；项目与部署入口见 [README](README.md)，实际验收范围见 [IMPLEMENTATION.md](IMPLEMENTATION.md)。后端执行采集、构建和分析，前端使用同源 JSON API；图片上传使用 multipart 的 `file` 字段，所有响应默认禁止缓存。计划接口不视为已提供。
 
@@ -205,19 +205,43 @@ HTTP 优先；需要动态处理或收到 403/429/502/503 时最多尝试一次�
 刷新按钮和整页刷新调用 `DELETE /api/jobs`，重置输入并取消当前会话未完成任务。记录在任务、构建、附件接口不可见，迟到写回不恢复显示；其他会话不受影响，后端原文件保留。演示文件接口已移除。
 
 
-## 图标截图搜索（可选）
+## 名称搜索与截图识别（可选）
+
+新网页只需应用显示名称。截图先读名、人工确认或修改后再搜索；包名、签名和哈希不作为输入前置。
+
+- `POST /api/icon-recognitions`：multipart `file`，必需 `Idempotency-Key`；仅识别截图并保留清理后的预览/图标，不检查SerpApi额度、不上传到搜图服务、不发起搜索。结果 `mode=recognize,result=recognized` 表示等用户确认名称，`search_attempts=0`。
+- `POST /api/name-searches`：JSON `{name, recognition_id?}`，必需 `Idempotency-Key`；名称是1–100字符纯文本，规范化空白，拒绝控制符、网址及可改变固定范围的搜索运算符。`recognition_id` 可选，须属于当前会话、识别成功且未隐藏；用于保留原图、模型识别原名和用户修改后的名称。无图片时只需搜索服务配置，不调用模型或Lens。
+- 两者共用 `GET /api/icon-searches/{id}`、取消、清空、所有权和7天保留；新增 `mode` 与名称任务的 `query_name`。同一个幂等键不能跨输入模式、名称或来源复用。识别和搜索分别计次，共用全服务单槽及滚动24小时20任务限制。
+- 名称任务配置 Koodous 时先执行一次按名称的 API 查询（单页、最多20条）；若同时配置 SerpApi，再查询一次安卓下载页。未配置 Koodous 时执行样本库网页索引和安卓下载页两次固定网页查询。`catalog_status` 区分 `hit/no_record/failed/unconfigured`，保留 `count,returned,page_returned,truncated,next_page_available,coverage_complete` 及安全错误码；游标响应未提供总数时 `count=null`，不能变为0或无记录。接口失败不能记作无记录。
+- API 样本候选 `category=sample_record,channel=koodous_api`，只投影名称、包名、版本、SHA-256与按SHA生成的固定详情URL。网页结果 `category=sample_index/download_page/web_candidate` 按实际域名、路径与文本依据分类；所有候选始终 `verified=false,downloadable=null`。API记录和资料页均不能直接 `collect`，不代表已取得原始APK或下载权限。
+- 纯名称追踪保存 `source/name-search.json`，输入类型 `name_search`；关联截图时另复制原图/图标，并保留 `recognition_id`、原识别名称和 `query_name`。只输入、读取、识别或显示候选都不访问目标网站。
+- `library_queries` 是供用户复制的库内名称检索式与官方外部入口，`queried=false`；不表明本服务有该库搜索/下载权限。平台未授权与未收录分开。
+
+以下旧 `/api/icon-searches` 单步图标搜索合同为兼容保留；新网页不再使用其Lens流程。
+
+MalShare 操作使用当前名称搜索的样本记录。能力 `icon_search.malshare_enabled` 表示已有私有配置。调用者提交候选 ID，服务从保留结果中取得哈希。
+
+- `POST /api/icon-searches/{id}/candidates/{candidate_id}/malshare/lookup` 接收空 JSON 对象，使用原会话、CSRF 和幂等键，查询所选 SHA-256。
+- 同一路径末尾改为 `download` 时，由用户显式请求取回已命中的样本。服务验证完整文件的 SHA-256 与 APK 结构后返回本地文件入口。下载权限、超时、校验和磁盘异常保留独立失败状态。
+- `GET /api/icon-searches/{id}` 附带已保存的 MalShare 操作结果。读取搜索、刷新网页和取回已保存附件仅访问本机状态。使用 `file_url` 时仍需所属搜索会话。
+
+MalwareBazaar 使用相同的会话、CSRF 和幂等规则。能力字段为 `icon_search.malwarebazaar_enabled`，本地查询或取回结果位于搜索结果的 `malwarebazaar` 字段。
+
+- `POST /api/icon-searches/{id}/candidates/{candidate_id}/malwarebazaar/lookup` 查询所选记录的 SHA-256。
+- `POST /api/icon-searches/{id}/candidates/{candidate_id}/malwarebazaar/download` 取回该库已命中的记录，校验从归档中解出的 APK。
+- `GET /api/icon-searches/{id}/candidates/{candidate_id}/malwarebazaar/file` 获取当前会话中已验证并保留的文件。
 
 所有接口沿用登录、CSRF、Host/Origin 与会话所有权检查。文件选择、预览和结果展示不访问第三方或候选站点；只有点击搜索的 POST 才授权本次第三方识图和搜索。扫码仍完全离线。
 
-- `POST /api/icon-searches`：multipart `file`，必需 `Idempotency-Key`，返回 202 和任务 ID。仅接收单张有效图片，10 MiB / 2500 万像素；支持 PNG/JPEG/WebP/HEIF/AVIF/BMP/GIF/TIFF，拒绝动画、多页与 SVG。原图经方向校正、去元数据、缩放后交给模型；仅裁出的图标交给搜图服务。没有有效裁剪框或裁剪结果仍为整图时，停止搜索，不向搜图服务上传图片。
+- `POST /api/icon-searches`：multipart `file`，必需 `Idempotency-Key`，返回 202 和任务 ID。仅接收单张有效图片，10 MiB / 2500 万像素；支持 PNG/JPEG/WebP/HEIF/AVIF/BMP/GIF/TIFF，拒绝动画、多页与 SVG。原图经方向校正、去元数据、缩放后交给模型；仅裁出的图标交给搜图服务。
 - `GET /api/icon-searches/{id}`：状态 `running/completed/partial/failed/cancelled`、阶段、识别名称、置信度、请求/返回模型名、候选、错误与到期时间。`completed` 只表示搜索过程完成；候选始终 `verified=false`、`downloadable=null`。
 
   新记录的 `timing` 含 `started_at,stage_started_at,stage_elapsed_seconds,total_seconds`、已结束的 `stages[{stage,elapsed_seconds}]` 与 `requests[{stage,route,response_wait_seconds,body_read_seconds,total_seconds,http_status,error_code}]`。`route` 仅为 `direct/configured_proxy`，不公开代理地址。等待响应包含网络和供应商处理；旧记录没有该字段时仍可读取。`error_detail` 保留失败阶段、固定 code 及可得的 HTTP 状态。父进程终止搜索时补结算当前阶段，保留已发现候选；网页的本地计时不自行判定任务结束。
 - `GET /api/icon-searches/{id}/image/{preview|icon}`：当前会话的干净 JPEG 预览。
 - `POST /api/icon-searches/{id}/cancel`：取消本次工作进程。
-- `POST /api/icon-searches/{id}/collect`：`candidate_id`、`tls_policy`，必需 `Idempotency-Key`。明确选择才进入既有有界 HTTP / Chrome 采集；复制截图、图标、哈希与搜索来源到任务 source。已取消搜索中保留且证据可验证的候选仍可手动选择，不重启原搜索。搜索本身不创建下载成功记录。
+- `POST /api/icon-searches/{id}/collect`：`candidate_id`、`tls_policy`，必需 `Idempotency-Key`。仅接受已结束且未过期、请求与来源校验通过的候选。明确选择才进入既有有界 HTTP / Chrome 采集；纯名称复制文本来源，有截图时另复制图像证据。搜索本身不创建下载成功记录。
 
 供应商错误区分 `icon_provider_auth`（401）、`icon_provider_forbidden`（403）、`icon_provider_quota`（429）、`icon_provider_http`（其他 HTTP）、`icon_provider_timeout`、`icon_provider_tls`、`icon_provider_proxy`、`icon_provider_connection`、`icon_provider_response_invalid`、`icon_provider_incomplete`。错误响应可附安全整数 `error.http_status`；不透传供应商正文或异常文本，不自动重试。
-- `DELETE /api/jobs` 同时取消并隐藏本会话搜索，不影响其他会话。重启标记中断；已有候选和截图、图标证据可验证时保留为 `partial`，否则记 `failed`。不重试搜索。
+- `DELETE /api/jobs` 同时取消并隐藏本会话搜索，不影响其他会话。重启只标记中断，不重试搜索。
 
 全服务一个搜索槽位、每 24 小时最多 20 次提交、单次 180 秒/768 MiB 工作进程预算。先检查 SerpApi 免费方案且至少余 2 次；每次最多 1 次 Google Lens 搜图和 1 次名称 Android/APK 网页搜索，不自动分页/重试/购买额度。低置信度无名称时只搜图一次。各任务结果及图片结束后保留 7 天；运行中不删，刷新不延长。选择下载时独立复制来源，后续按下载任务保留期限处理。

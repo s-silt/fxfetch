@@ -153,8 +153,8 @@ def main() -> None:
           window.setInterval=(fn,ms)=>{if(ms!==1000)throw new Error('Unexpected interval');const id=++t.serial;t.intervals.set(id,fn);return id;};
           window.clearInterval=id=>t.intervals.delete(id);
           t.tick=async()=>{const [id,fn]=t.timers.entries().next().value;t.timers.delete(id);await fn();};
-          t.api=async(path,options={})=>{t.calls.push({path,method:options.method||'GET'});return path==='/api/icon-searches'?{id:'synthetic-search'}:structuredClone(t.result);};
-          t.result={id:'synthetic-search',state:'running',stage:'recognizing',candidates:[],timing:{
+          t.api=async(path,options={})=>{t.calls.push({path,method:options.method||'GET'});return path==='/api/icon-recognitions'?{id:'synthetic-search'}:structuredClone(t.result);};
+          t.result={id:'synthetic-search',mode:'recognize',state:'running',stage:'recognizing',candidates:[],timing:{
             started_at:9000000000,stage_started_at:9000000000,total_seconds:20,stage_elapsed_seconds:17,
             stages:[],requests:[]}};
           t.search=FxfetchIconSearch.create({api:t.api,key:()=>'synthetic-key',collected:()=>{},enabled:()=>true});
@@ -175,7 +175,7 @@ def main() -> None:
         page.evaluate('test.tick()')
         page.evaluate('() => {test.clock+=2500;for(const tick of test.intervals.values())tick();}')
         assert '等待后台确认状态' in page.locator('.search-timing-total').inner_text()
-        assert page.locator('.search-progress-title').inner_text() == '搜索中'
+        assert page.locator('.search-progress-title').inner_text() == '识别中'
         assert page.locator('#icon-cancel').is_visible()
         page.screenshot(path=str(output / 'search-running-timing.png'), full_page=True)
         checks.append('one-second monotonic elapsed display makes no API calls and never declares a local timeout terminal')

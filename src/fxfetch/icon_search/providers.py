@@ -9,6 +9,7 @@ import re
 import secrets
 import ssl
 import time
+import unicodedata
 from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -24,7 +25,7 @@ def fail(code: str) -> FxfetchError:
 
 def contains_provider_secret(value: str, config: dict) -> bool:
     return any(isinstance(secret, str) and secret and secret in value
-               for secret in (config.get('vision_key'), config.get('serpapi_key')))
+               for secret in (config.get('vision_key'), config.get('serpapi_key'), config.get('koodous_key')))
 
 
 def returned_model_name(value: object, config: dict) -> str:
@@ -32,6 +33,26 @@ def returned_model_name(value: object, config: dict) -> str:
         return 'unknown'
     name = ''.join(char for char in value if char.isprintable())
     return 'unknown' if not name or contains_provider_secret(name, config) else name[:120]
+
+
+def search_metadata(result: dict, config: dict, channel: str) -> dict:
+    """Publish only search metadata, filtering credential echoes before truncation."""
+    safe: dict = {'_channel': channel}
+    for group in ('exact_matches', 'visual_matches', 'organic_results'):
+        entries = result.get(group)
+        if not isinstance(entries, list):
+            continue
+        safe[group] = []
+        for item in entries[:80]:
+            if not isinstance(item, dict) or not isinstance(link := item.get('link'), str):
+                continue
+            if contains_provider_secret(link, config) or contains_provider_secret(unquote(link), config):
+                continue
+            title = item.get('title')
+            if not isinstance(title, str) or contains_provider_secret(title, config):
+                title = ''
+            safe[group].append({'link': link, 'title': title})
+    return safe
 
 
 class ProviderRequestError(FxfetchError):
@@ -55,28 +76,55 @@ def vision_proxy(value: object) -> str | None:
     return value
 
 
-def load_config(root: Path) -> dict:
+def load_config(root: Path, *, require_vision: bool = True, require_search: bool = True,
+                allow_catalog: bool = False) -> dict:
     try:
         path = root / 'icon-search.json'
         if path.is_symlink() or path.stat().st_size > 16384:
             raise ValueError
         value = json.loads(path.read_text(encoding='utf-8-sig'))
-        endpoint = urlsplit(value['vision_endpoint'])
-        if (endpoint.scheme != 'https' or not endpoint.hostname or endpoint.username
-                or endpoint.password or endpoint.query or endpoint.fragment
-                or not endpoint.path.endswith('/chat/completions')):
+        if not isinstance(value, dict):
             raise ValueError
-        for key in ('vision_key', 'vision_model', 'serpapi_key'):
+        required = (['vision_endpoint', 'vision_key', 'vision_model'] if require_vision else [])
+        required += ['serpapi_key'] if require_search and not allow_catalog else []
+        for key in required:
             if not isinstance(value[key], str) or not 1 <= len(value[key]) <= 1024:
                 raise ValueError
-        config = {key: value[key] for key in
-                  ('vision_endpoint', 'vision_key', 'vision_model', 'serpapi_key')}
-        proxy = vision_proxy(value.get('vision_proxy'))
-        if 'vision_proxy' in value:
-            config['vision_proxy'] = proxy
+        config = {key: value[key] for key in required}
+        if require_search and allow_catalog:
+            for key in ('serpapi_key', 'koodous_key'):
+                secret = value.get(key)
+                if secret is None or secret == '':
+                    continue
+                if (not isinstance(secret, str) or not 1 <= len(secret) <= 1024
+                        or key == 'koodous_key' and re.fullmatch(r'[!-~]{1,1024}', secret) is None):
+                    raise ValueError
+                config[key] = secret
+            if not any(key in config for key in ('serpapi_key', 'koodous_key')):
+                raise ValueError
+        if require_vision:
+            endpoint = urlsplit(value['vision_endpoint'])
+            if (endpoint.scheme != 'https' or not endpoint.hostname or endpoint.username
+                    or endpoint.password or endpoint.query or endpoint.fragment
+                    or not endpoint.path.endswith('/chat/completions')):
+                raise ValueError
+            proxy = vision_proxy(value.get('vision_proxy'))
+            if 'vision_proxy' in value:
+                config['vision_proxy'] = proxy
         return config
     except (OSError, ValueError, KeyError, TypeError):
         raise fail('icon_search_unconfigured') from None
+
+
+def normalize_name(value: object) -> str:
+    if (not isinstance(value, str) or not 1 <= len(value) <= 100
+            or any(unicodedata.category(c).startswith('C') for c in value)):
+        raise fail('search_name_invalid')
+    name = ' '.join(unicodedata.normalize('NFKC', value).split())
+    if (not name or len(name) > 100 or re.search(r'["\\<>\x00-\x1f]', name)
+            or re.search(r'https?://|www\.|\b(?:site|filetype|intitle|inurl|cache|ext):', name, re.I)):
+        raise fail('search_name_invalid')
+    return name
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -91,6 +139,14 @@ class Provider:
         self.opener = build_opener(ProxyHandler({}), HTTPSHandler(context=ssl.create_default_context()),
                                    NoRedirect())
         self.last_timing: dict = {}
+
+    @property
+    def catalog_enabled(self) -> bool:
+        return bool(self.config.get('koodous_key'))
+
+    @property
+    def web_enabled(self) -> bool:
+        return bool(self.config.get('serpapi_key'))
 
     def _model_request(self, url: str) -> bool:
         target = urlsplit(url)
@@ -187,12 +243,15 @@ class Provider:
         # An echoed credential is not an ID the operator can see or select.
         return model_ids([item for item in ids if not contains_provider_secret(item, self.config)])
 
-    def quota(self) -> int:
+    def quota(self, minimum: int = 2) -> int:
+        if type(minimum) is not int or not 1 <= minimum <= 2:
+            raise fail('icon_free_quota_unavailable')
         result = self.request('https://serpapi.com/account.json?' +
                               urlencode({'api_key': self.config['serpapi_key']}))
         remaining = result.get('plan_searches_left', 0)
-        if (result.get('plan_monthly_price') != 0
-                or not isinstance(remaining, int) or remaining < 2):
+        price = result.get('plan_monthly_price')
+        if (type(price) not in (int, float) or price != 0
+                or type(remaining) is not int or remaining < minimum):
             raise fail('icon_free_quota_unavailable')
         return remaining
 
@@ -264,22 +323,69 @@ class Provider:
             query = {'api_key': self.config['serpapi_key'], 'engine': 'google', 'hl': 'zh-cn',
                      'q': f'"{safe_name}" (安卓 OR Android OR APK)'}
         result = self.request('https://serpapi.com/search.json?' + urlencode(query), empty_search_allowed=True)
-        safe: dict = {'_channel': 'name_web' if name else 'lens'}
-        for group in ('exact_matches', 'visual_matches', 'organic_results'):
-            entries = result.get(group)
-            if not isinstance(entries, list):
+        return search_metadata(result, self.config, 'name_web' if name else 'lens')
+
+    def search_name(self, name: str, scope: str) -> dict:
+        name = normalize_name(name)
+        if scope == 'sample_index':
+            query = f'"{name}" (site:koodous.com/apks/ OR site:virustotal.com/gui/file/)'
+        elif scope == 'download_page':
+            query = f'"{name}" (APK OR 安卓 OR Android) (下载 OR 安装 OR download)'
+        else:
+            raise fail('search_scope_invalid')
+        result = self.request('https://serpapi.com/search.json?' + urlencode({
+            'api_key': self.config['serpapi_key'], 'engine': 'google', 'hl': 'zh-cn', 'q': query,
+        }), empty_search_allowed=True)
+        return search_metadata(result, self.config,
+                               'sample_index' if scope == 'sample_index' else 'targeted_download')
+
+    def search_catalog(self, name: str) -> dict:
+        """Read one Koodous name-search page; never follow provider URLs or fetch APKs."""
+        name = normalize_name(name)
+        key = self.config.get('koodous_key')
+        if not isinstance(key, str) or re.fullmatch(r'[!-~]{1,1024}', key) is None:
+            raise fail('koodous_unconfigured')
+        payload = self.request('https://developer.koodous.com/apks/?' +
+                               urlencode({'search': f'app: "{name}"'}),
+                               headers={'Authorization': 'Token ' + key},
+                               timeout=15, max_response_bytes=1024 * 1024)
+        entries, count, next_page = payload.get('results'), payload.get('count'), payload.get('next')
+        if (not isinstance(entries, list) or len(entries) > 1000
+                or count is not None and (type(count) is not int or count < len(entries))
+                or 'next' not in payload
+                or next_page is not None and (not isinstance(next_page, str) or not next_page.strip())):
+            raise fail('koodous_response_invalid')
+
+        def public_text(value: object, maximum: int) -> str:
+            if not isinstance(value, str):
+                return ''
+            text = ''.join(c for c in value if c.isprintable()).strip()
+            return '' if contains_provider_secret(text, self.config) else text[:maximum]
+
+        records: list[dict] = []
+        seen: set[str] = set()
+        rejected = 0
+        for entry in entries[:20]:
+            sha256 = entry.get('sha256') if isinstance(entry, dict) else None
+            if not isinstance(sha256, str) or re.fullmatch(r'[0-9a-fA-F]{64}', sha256) is None:
+                rejected += 1
                 continue
-            safe[group] = []
-            for item in entries[:80]:
-                if not isinstance(item, dict) or not isinstance(link := item.get('link'), str):
-                    continue
-                if contains_provider_secret(link, self.config) or contains_provider_secret(unquote(link), self.config):
-                    continue
-                title = item.get('title')
-                if not isinstance(title, str) or contains_provider_secret(title, self.config):
-                    title = ''
-                safe[group].append({'link': link, 'title': title})
-        return safe
+            sha256 = sha256.lower()
+            if sha256 in seen or contains_provider_secret(sha256, self.config):
+                rejected += 1
+                continue
+            seen.add(sha256)
+            records.append({'sha256': sha256, 'app_name': public_text(entry.get('app'), 100),
+                            'package_name': public_text(entry.get('package_name'), 300),
+                            'version': public_text(entry.get('version'), 100),
+                            'url': 'https://koodous.com/apks/' + sha256})
+        truncated = len(entries) > 20
+        return {'records': records, 'count': count, 'returned': len(records),
+                'next_page_available': next_page is not None,
+                'coverage_complete': (next_page is None and not truncated and not rejected
+                                      and (count is None or count == len(records))),
+                'rejected_records': rejected, 'page_limit': 20,
+                'page_returned': len(entries), 'truncated': truncated}
 
 
 def model_ids(values: object) -> list[str]:
@@ -332,11 +438,28 @@ def candidates(responses: list[dict], name: str) -> list[dict]:
                     evidence.append('provider_exact_match')
                 if group == 'organic_results' and response.get('_channel') == 'name_web':
                     evidence.append('name_web_search')
+                directed = response.get('_channel') in ('sample_index', 'targeted_download')
+                if directed:
+                    evidence.append('sample_index_search' if response['_channel'] == 'sample_index'
+                                    else 'targeted_download_search')
                 if url not in found:
                     found[url] = {'url': url, 'title': title, 'source': urlsplit(url).hostname,
                                   'evidence': evidence, 'verified': False, 'downloadable': None}
                 else:
                     found[url]['evidence'] = sorted(set(found[url]['evidence'] + evidence))
+                if directed:
+                    parsed = urlsplit(url)
+                    host, path = (parsed.hostname or '').lower(), parsed.path
+                    sample_index = (
+                        host in ('koodous.com', 'www.koodous.com') and path.startswith('/apks')
+                        or host in ('virustotal.com', 'www.virustotal.com') and path.startswith('/gui/file/')
+                        or host == 'bazaar.abuse.ch' and path.startswith('/sample/')
+                    )
+                    category = ('sample_index' if sample_index else 'download_page'
+                                if 'name_in_title' in found[url]['evidence']
+                                and 'android_text' in found[url]['evidence'] else 'web_candidate')
+                    found[url].update(category=category, channel=response['_channel'],
+                                      can_collect=category != 'sample_index')
     ranked = sorted(found.values(), key=lambda v: (
         'name_in_title' in v['evidence'], 'android_text' in v['evidence'],
         'provider_exact_match' in v['evidence']), reverse=True)[:20]
